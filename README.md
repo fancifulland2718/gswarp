@@ -573,21 +573,4 @@ This Warp backend builds upon:
 - [NVIDIA Warp](https://nvidia.github.io/warp/) — the Python framework for high-performance GPU simulation and compute.
 - [PyTorch](https://pytorch.org/) — used for tensor management, autograd integration, and CUDA memory allocation.
 
----
 
-## Citation
-
-If you use the original 3D Gaussian Splatting in your research, please cite:
-
-```bibtex
-@article{kerbl3Dgaussians,
-    author    = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
-    title     = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
-    journal   = {ACM Transactions on Graphics},
-    number    = {4},
-    volume    = {42},
-    month     = {July},
-    year      = {2023},
-    url       = {https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/}
-}
-```
