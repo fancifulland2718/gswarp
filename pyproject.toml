@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gswarp"
+version = "0.1.0"
+description = "Pure-Python NVIDIA Warp rasterizer for 3D Gaussian Splatting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Non-commercial research use; follows upstream 3D Gaussian Splatting licensing terms." }
+authors = [
+  { name = "GSWarp contributors" }
+]
+keywords = ["3dgs", "gaussian-splatting", "warp", "rasterization", "pytorch"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0",
+  "warp-lang>=1.12.0",
+]
+
+[tool.setuptools]
+packages = ["gswarp", "gswarp.warp_backend"]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+"gswarp" = "."
+"gswarp.warp_backend" = "warp_backend"
