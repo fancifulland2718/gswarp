@@ -803,40 +803,32 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
 # C4: Warp launch cache — eliminates wp.from_torch + wp.launch Python overhead
 # -----------------------------------------------------------------------------
 
-# Per-call wp.from_torch wrapper cache.  Alive only during a single
-# rasterize_gaussians / rasterize_gaussians_backward invocation so that
-# warp array wrappers (which prevent PyTorch from freeing the underlying
-# CUDA storage) are released between training iterations.
-_WP_ARRAY_CACHE: dict[tuple[int, str], Any] | None = None
+# Cache wp.from_torch wrappers keyed by (data_ptr, dtype_str).
+# Only used for model-parameter tensors whose data_ptr is stable across
+# training iterations (updated in-place by the optimizer).  Ephemeral
+# tensors (gradients, intermediates allocated each backward pass) MUST
+# pass _cache=False (the default) to avoid unbounded cache growth that
+# pins old GPU memory and eventually causes OOM.
+_WP_ARRAY_CACHE: dict[tuple[int, str], Any] = {}
 
 
-def _begin_wp_cache() -> None:
-    """Activate a fresh per-call warp array cache."""
-    global _WP_ARRAY_CACHE
-    _WP_ARRAY_CACHE = {}
+def _cached_from_torch(tensor: torch.Tensor, dtype, *, _cache: bool = False) -> Any:
+    """Return a wp.array wrapping *tensor*.
 
-
-def _end_wp_cache() -> None:
-    """Release the per-call warp array cache so wrapped tensors can be freed."""
-    global _WP_ARRAY_CACHE
-    _WP_ARRAY_CACHE = None
-
-
-def _cached_from_torch(tensor: torch.Tensor, dtype) -> Any:
-    """Return a cached wp.array wrapping *tensor*, reusing the wrapper if the
-    data pointer and requested dtype haven't changed within this call."""
-    cache = _WP_ARRAY_CACHE
-    if cache is None:
-        # Fallback when called outside a managed scope (should not happen in
-        # normal operation, but be safe).
-        return wp.from_torch(tensor, dtype=dtype)
-    key = (tensor.data_ptr(), str(dtype))
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    arr = wp.from_torch(tensor, dtype=dtype)
-    cache[key] = arr
-    return arr
+    When *_cache* is True the wrapper is stored in ``_WP_ARRAY_CACHE`` and
+    reused on subsequent calls with the same ``data_ptr``.  Only enable
+    caching for tensors whose ``data_ptr`` is stable across iterations
+    (e.g. model parameters updated in-place by the optimiser).
+    """
+    if _cache:
+        key = (tensor.data_ptr(), str(dtype))
+        cached = _WP_ARRAY_CACHE.get(key)
+        if cached is not None:
+            return cached
+        arr = wp.from_torch(tensor, dtype=dtype)
+        _WP_ARRAY_CACHE[key] = arr
+        return arr
+    return wp.from_torch(tensor, dtype=dtype)
 
 
 def _require_warp() -> None:
@@ -3716,13 +3708,13 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
     clamped_i32 = clamped.to(torch.int32).contiguous()
     _dev = str(means3D.device)
 
-    _w_means = _cached_from_torch(means3D.contiguous(), wp.vec3)
+    _w_means = _cached_from_torch(means3D.contiguous(), wp.vec3, _cache=True)
     _w_campos = _cached_from_torch(campos.contiguous().reshape(-1), wp.float32)
     _w_grad_means = _cached_from_torch(grad_means, wp.vec3)
 
     if degree <= 1:
         # degree 0-1: use monolithic kernel (scalar arrays, no deg 2-3 work)
-        _w_shs = _cached_from_torch(shs.contiguous().reshape(-1), wp.float32)
+        _w_shs = _cached_from_torch(shs.contiguous().reshape(-1), wp.float32, _cache=True)
         _w_clamped = _cached_from_torch(clamped_i32.reshape(-1), wp.int32)
         _w_grad_color = _cached_from_torch(grad_color.contiguous().reshape(-1), wp.float32)
         _w_grad_sh = _cached_from_torch(grad_sh.reshape(-1), wp.float32)
@@ -3794,8 +3786,8 @@ def _backward_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations, 
     # C4: cache wp.from_torch wrappers + Launch object
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        _cached_from_torch(scales.contiguous(), wp.vec3),
-        _cached_from_torch(rotations.contiguous(), wp.vec4),
+        _cached_from_torch(scales.contiguous(), wp.vec3, _cache=True),
+        _cached_from_torch(rotations.contiguous(), wp.vec4, _cache=True),
         float(scale_modifier),
         _cached_from_torch(grad_cov3d.contiguous().reshape(-1), wp.float32),
     ]
@@ -4188,7 +4180,7 @@ def _backward_projected_means_warp(means3D, radii, projmatrix, viewmatrix,      
     # C4: cache wp.from_torch wrappers + Launch object
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        _cached_from_torch(means3D.contiguous(), wp.vec3),
+        _cached_from_torch(means3D.contiguous(), wp.vec3, _cache=True),
         _cached_from_torch(radii.contiguous(), wp.int32),
         _cached_from_torch(projmatrix.contiguous().reshape(-1), wp.float32),
         _cached_from_torch(viewmatrix.contiguous().reshape(-1), wp.float32),
@@ -4221,7 +4213,7 @@ def _backward_cov2d_warp(means3D, radii, cov3D, viewmatrix, tanfovx, tanfovy, fo
     # C4: cache wp.from_torch wrappers + Launch object
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        _cached_from_torch(means3D.contiguous(), wp.vec3),
+        _cached_from_torch(means3D.contiguous(), wp.vec3, _cache=True),
         _cached_from_torch(radii.contiguous(), wp.int32),
         _cached_from_torch(cov3D.contiguous().reshape(-1), wp.float32),
         _cached_from_torch(viewmatrix.reshape(-1), wp.float32),
@@ -4705,7 +4697,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
-                    _cached_from_torch(means3D.contiguous(), wp.vec3),
+                    _cached_from_torch(means3D.contiguous(), wp.vec3, _cache=True),
                     _cached_from_torch(preprocess_outputs["radii"].contiguous(), wp.int32),
                     _cached_from_torch(_proj_flat, wp.float32),
                     _cached_from_torch(_view_flat, wp.float32),
@@ -4719,8 +4711,8 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     float(focal_y),
                     _cached_from_torch(render_grad_conic_opacity, wp.vec4),
                     _cached_from_torch(_grad_conic_2d_flat, wp.float32),
-                    _cached_from_torch(_scales.contiguous(), wp.vec3),
-                    _cached_from_torch(_rotations.contiguous(), wp.vec4),
+                    _cached_from_torch(_scales.contiguous(), wp.vec3, _cache=True),
+                    _cached_from_torch(_rotations.contiguous(), wp.vec4, _cache=True),
                     float(_scale_modifier),
                     _cached_from_torch(_sh_grad, wp.vec3),
                     int(_has_sh),
@@ -4813,14 +4805,6 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
 def rasterize_gaussians(*args: Any):
         _require_warp()
-        _begin_wp_cache()
-        try:
-            return _rasterize_gaussians_forward_impl(*args)
-        finally:
-            _end_wp_cache()
-
-
-def _rasterize_gaussians_forward_impl(*args: Any):
         (
             _background,
             means3D,
@@ -4935,8 +4919,4 @@ def mark_visible(*args: Any):
 
 def rasterize_gaussians_backward(*args: Any):
     _require_warp()
-    _begin_wp_cache()
-    try:
-        return _rasterize_gaussians_backward_python(*args)
-    finally:
-        _end_wp_cache()
+    return _rasterize_gaussians_backward_python(*args)
