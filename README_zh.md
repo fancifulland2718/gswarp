@@ -179,7 +179,7 @@ color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weigh
 | `rasterize_gaussians(...)` | 完整前向传播：预处理 + 分箱 + 渲染 |
 | `rasterize_gaussians_backward(...)` | 完整反向传播：反向渲染 + 反向预处理 |
 | `mark_visible(positions, viewmatrix, projmatrix)` | 返回 3D 位置的可见性掩码 |
-| `preprocess_gaussians(...)` | 仅预处理（不渲染），用于调试/分析 |
+| `preprocess_gaussians(...)` | 仅预处理（不渲染），用于分析 |
 
 ### 运行时配置
 
@@ -461,7 +461,7 @@ active-set 差异还呈现出明显的不对称性：`native_only_active_count` 
 
 测试方法：
 
-- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）进行多次单迭代测量，`debug=False`、`enable_flow_grad=False`，并丢弃预热迭代。
+- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）进行多次单迭代测量，，并丢弃预热迭代。
 - **显存占用**：先预热，再分别测一次 forward 阶段和 backward 阶段，记录 CUDA 分配器的峰值增量（`peak_allocated_delta_mib`）。
 - **阶段计时 / 阶段显存**：仅为分析热点，使用内部 `_warp_backend` 辅助函数做诊断性测量；这些阶段数据**不保证**与公共 API 的端到端时间或峰值显存逐项严格相加一致。
 
@@ -601,5 +601,5 @@ Warp 未暴露 CUDA warp 级原语（`__shfl_sync`、`__ballot_sync`、`__any_sy
 - [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)，作者 Bernhard Kerbl、Georgios Kopanas、Thomas Leimkühler 和 George Drettakis（INRIA, MPII）。原始 CUDA 光栅化器是参考实现。
 - [Fast Converging 3D Gaussian Splatting for 1-Minute Reconstruction](https://arxiv.org/abs/2601.19489)，作者 Ziyu Zhang、Tianle Liu、Diantao Tu 和 Shuhan Shen。本项目使用的紧凑 AABB 包围盒技术受该工作启发。
 - [NVIDIA Warp](https://nvidia.github.io/warp/)——用于高性能 GPU 仿真和计算的 Python 框架。
-- [PyTorch](https://pytorch.org/)——用于张量管理、autograd 集成和 CUDA 内存分配。
+- [PyTorch](https://pytorch.org/)——用于张量管理和 CUDA 内存分配。
 

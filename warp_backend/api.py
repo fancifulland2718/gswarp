@@ -259,6 +259,8 @@ class GaussianRasterizationSettings(NamedTuple):
     sh_degree: int
     campos: torch.Tensor
     prefiltered: bool
+    debug: bool = False
+    antialiasing: bool = False
     backward_mode: str | None = None
     binning_sort_mode: str | None = None
     auto_tune: bool = True
@@ -286,6 +288,7 @@ class GaussianRasterizer(nn.Module):
         means3D,
         means2D,
         opacities,
+        dc=None,
         shs=None,
         colors_precomp=None,
         scales=None,
@@ -293,6 +296,14 @@ class GaussianRasterizer(nn.Module):
         cov3D_precomp=None,
     ):
         raster_settings = self.raster_settings
+
+        # When dc (0th-order SH) is provided separately, concatenate with
+        # the remaining SH coefficients so the warp backend receives a
+        # single contiguous SH tensor.
+        if dc is not None and shs is not None:
+            shs = torch.cat([dc, shs], dim=1)
+        elif dc is not None and shs is None:
+            shs = dc
 
         if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
             raise Exception("Please provide excatly one of either SHs or precomputed colors!")
@@ -312,7 +323,7 @@ class GaussianRasterizer(nn.Module):
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([])
 
-        return rasterize_gaussians(
+        color, radii, depth, *_extra = rasterize_gaussians(
             means3D,
             means2D,
             shs,
@@ -323,6 +334,7 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             raster_settings,
         )
+        return color, radii, depth
 
 
 __all__ = [

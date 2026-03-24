@@ -1815,12 +1815,6 @@ if wp is not None:
         hom_w = proj_flat[3] * mean[0] + proj_flat[7] * mean[1] + proj_flat[11] * mean[2] + proj_flat[15]
         inv_w = 1.0 / (hom_w + 0.0000001)
 
-        # ======== Part A: backward_projected_means ========
-        hom_x = proj_flat[0] * mean[0] + proj_flat[4] * mean[1] + proj_flat[8] * mean[2] + proj_flat[12]
-        hom_y = proj_flat[1] * mean[0] + proj_flat[5] * mean[1] + proj_flat[9] * mean[2] + proj_flat[13]
-        hom_w = proj_flat[3] * mean[0] + proj_flat[7] * mean[1] + proj_flat[11] * mean[2] + proj_flat[15]
-        inv_w = 1.0 / (hom_w + 0.0000001)
-
         grad_xy = grad_mean2d[tid]
         inv_w2 = inv_w * inv_w
         if rad > 0:
@@ -3167,7 +3161,7 @@ if wp is not None:
             if alpha < (1.0 / 255.0):
                 continue
 
-            one_minus_alpha = wp.max(one_minus_alpha, ONE_MINUS_ALPHA_MIN)
+            one_minus_alpha = wp.max(1.0 - alpha, ONE_MINUS_ALPHA_MIN)
             T = T / one_minus_alpha
             dchannel_dcolor = alpha * T
 
@@ -3941,6 +3935,8 @@ def _build_binning_state(
                     wp.from_torch(points_xy_image_vec2, dtype=wp.vec2),
                     wp.from_torch(point_offsets_i32, dtype=wp.int32),
                     wp.from_torch(radii_i32, dtype=wp.int32),
+                    conic_opacity_wp,
+                    cov2d_inv_wp,
                     wp.from_torch(depths_f32, dtype=wp.float32),
                     int(grid_x),
                     int(grid_y),
@@ -3966,6 +3962,7 @@ def _build_binning_state(
                     wp.from_torch(points_xy_image_vec2, dtype=wp.vec2),
                     wp.from_torch(radii_i32, dtype=wp.int32),
                     conic_opacity_wp,
+                    cov2d_inv_wp,
                     wp.from_torch(sorted_point_ids_i32, dtype=wp.int32),
                     wp.from_torch(point_offsets_i32, dtype=wp.int32),
                     int(grid_x),
@@ -3995,6 +3992,8 @@ def _build_binning_state(
                     wp.from_torch(points_xy_image_vec2, dtype=wp.vec2),
                     wp.from_torch(point_offsets_i32, dtype=wp.int32),
                     wp.from_torch(radii_i32, dtype=wp.int32),
+                    conic_opacity_wp,
+                    cov2d_inv_wp,
                     int(grid_x),
                     int(grid_y),
                 ],
@@ -4537,6 +4536,10 @@ def _rasterize_gaussians_backward_python(*args: Any):
             grad_alpha,
             grad_proj_2D,
             grad_conic_2D,
+            _grad_conic_2D_inv,
+            _dummy_gs_per_pixel,
+            _dummy_weight_per_gs_pixel,
+            _grad_x_mu,
             _sh,
             _degree,
             _campos,
@@ -4567,35 +4570,15 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
         if cached_forward_state is not None:
             preprocess_outputs, binning_state, n_contrib = cached_forward_state
-            preprocess_outputs["radii"] = _radii
-            feature_ptr = preprocess_outputs["rgb"]
+            # Shallow copy to avoid mutating the cached dict
+            preprocess_outputs = {**preprocess_outputs, "radii": _radii}
             cov3d_all = preprocess_outputs["cov3d_all"]
-            render_alpha = _alphas
-        elif _cov3D_precomp.numel() != 0:
-            cov3d_all = _cov3D_precomp.detach().clone()
-            preprocess_outputs = preprocess_gaussians(
-                    means3D,
-                    _viewmatrix,
-                    _projmatrix,
-                    image_height,
-                    image_width,
-                    _tan_fovx,
-                    _tan_fovy,
-                    cov3D_precomp=cov3d_all,
-                    shs=_sh.reshape(point_count, -1, NUM_CHANNELS) if _sh.numel() != 0 else None,
-                    degree=_degree,
-                    campos=_campos,
-                    colors_precomp=_colors if _colors.numel() != 0 else None,
-                    opacities=_opacities,
-                    prefiltered=False,
-                    exact_contract=False,
-                )
-            feature_ptr = _colors.reshape(point_count, NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs["rgb"]
-            binning_state = None
-            n_contrib = None
-            render_alpha = None
         else:
-            cov3d_all = _compute_cov3d_from_scale_rotation_warp(_scales, _scale_modifier, _rotations)
+            # Only the cov3d source differs between precomp and scale/rotation paths
+            if _cov3D_precomp.numel() != 0:
+                cov3d_all = _cov3D_precomp
+            else:
+                cov3d_all = _compute_cov3d_from_scale_rotation_warp(_scales, _scale_modifier, _rotations)
             preprocess_outputs = preprocess_gaussians(
                     means3D,
                     _viewmatrix,
@@ -4613,22 +4596,30 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     prefiltered=False,
                     exact_contract=False,
                 )
-            feature_ptr = _colors.reshape(point_count, NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs["rgb"]
-            binning_state = None
-            n_contrib = None
-            render_alpha = None
+            # Build binning unconditionally — num_rendered (Python int) avoids
+            # the host sync that bool((radii > 0).any()) would trigger.
+            binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
+            # Recover n_contrib from the saved img buffer instead of re-running
+            # the full forward render (which allocates unused per-pixel outputs).
+            _expected_img_bytes = image_height * image_width * 4  # int32 element_size
+            if _imgBuffer.numel() == _expected_img_bytes:
+                n_contrib = _imgBuffer.view(torch.int32).reshape(image_height, image_width)
+            else:
+                n_contrib = None
 
+        # Unified: preprocess_gaussians already stores the correct rgb
+        # (colors_precomp when provided, SH-evaluated colors otherwise).
+        feature_ptr = preprocess_outputs["rgb"]
+        # Always use the saved alpha tensor from forward.
+        render_alpha = _alphas
         background_float = _background.to(dtype=torch.float32)
-        has_active_points = False
-        if binning_state is not None and n_contrib is not None and render_alpha is not None:
-            has_active_points = bool(int(binning_state["num_rendered"]) != 0)
-        else:
-            has_active_points = bool((preprocess_outputs["radii"] > 0).any())
+        # num_rendered is a Python int — no device sync.
+        has_active_points = binning_state["num_rendered"] != 0
 
         if has_active_points:
-            if binning_state is None or n_contrib is None or render_alpha is None:
-                binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
-                _render_color, _render_depth, render_alpha, _gs_per_pixel, _weight_per_gs_pixel, _x_mu, n_contrib = _render_tiles_warp(
+            # Fallback: if n_contrib could not be recovered, re-render.
+            if n_contrib is None:
+                _, _, _, _, _, _, n_contrib = _render_tiles_warp(
                         preprocess_outputs,
                         binning_state,
                         feature_ptr,
@@ -4636,19 +4627,19 @@ def _rasterize_gaussians_backward_python(*args: Any):
                         image_height,
                         image_width,
                     )
-                render_grad_points, render_grad_depths, render_grad_conic_opacity, render_grad_feature = _backward_render_tiles_warp(
-                    preprocess_outputs,
-                    binning_state,
-                    feature_ptr,
-                    background_float,
-                    image_height,
-                    image_width,
-                    render_alpha,
-                    n_contrib.reshape(image_height, image_width),
-                    grad_color,
-                    grad_depth,
-                    grad_alpha,
-                )
+            render_grad_points, render_grad_depths, render_grad_conic_opacity, render_grad_feature = _backward_render_tiles_warp(
+                preprocess_outputs,
+                binning_state,
+                feature_ptr,
+                background_float,
+                image_height,
+                image_width,
+                render_alpha,
+                n_contrib.reshape(image_height, image_width),
+                grad_color,
+                grad_depth,
+                grad_alpha,
+            )
         else:
             render_grad_points = torch.zeros((point_count, 2), dtype=torch.float32, device=device)
             render_grad_depths = torch.zeros((point_count,), dtype=torch.float32, device=device)
@@ -4663,8 +4654,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
         focal_y = image_height / (2.0 * _tan_fovy)
 
         # C6: Fuse cov2d + cov3d into single kernel when scales/rotations are available
-        _use_fused_cov = (wp is not None
-                          and _cov3D_precomp.numel() == 0
+        _use_fused_cov = (_cov3D_precomp.numel() == 0
                           and _scales.numel() != 0
                           and _rotations.numel() != 0)
 
@@ -4687,14 +4677,13 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 grad_sh = grad_sh_local.reshape_as(_sh)
         
         if _use_fused_cov:
-                grad_means3D = torch.empty_like(means3D)
+                grad_means3D = torch.empty(means3D.shape, dtype=means3D.dtype, device=device)
                 grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
-                grad_scales = torch.empty_like(_scales)
-                grad_rotations = torch.empty_like(_rotations)
+                grad_scales = torch.empty(_scales.shape, dtype=_scales.dtype, device=device)
+                grad_rotations = torch.empty(_rotations.shape, dtype=_rotations.dtype, device=device)
                 _sh_grad = _grad_mean_sh if _has_sh else means3D.new_zeros(means3D.shape)
                 _proj_flat = _projmatrix.contiguous().reshape(-1)
                 _view_flat = _viewmatrix.contiguous().reshape(-1)
-                _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
                 _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
@@ -4702,22 +4691,22 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     _cached_from_torch(preprocess_outputs["radii"].contiguous(), wp.int32),
                     _cached_from_torch(_proj_flat, wp.float32),
                     _cached_from_torch(_view_flat, wp.float32),
-                    _cached_from_torch(render_grad_points.contiguous(), wp.vec2),
+                    _cached_from_torch(render_grad_points, wp.vec2),
                     _cached_from_torch(grad_proj_2d_active.contiguous(), wp.vec2),
-                    _cached_from_torch(render_grad_depths.contiguous(), wp.float32),
+                    _cached_from_torch(render_grad_depths, wp.float32),
                     _cached_from_torch(_cov3d_flat, wp.float32),
                     float(_tan_fovx),
                     float(_tan_fovy),
                     float(focal_x),
                     float(focal_y),
-                    _cached_from_torch(render_grad_conic_opacity.contiguous(), wp.vec4),
+                    _cached_from_torch(render_grad_conic_opacity, wp.vec4),
                     _cached_from_torch(_grad_conic_2d_flat, wp.float32),
                     _cached_from_torch(_scales.contiguous(), wp.vec3),
                     _cached_from_torch(_rotations.contiguous(), wp.vec4),
                     float(_scale_modifier),
-                    _cached_from_torch(_sh_grad.contiguous(), wp.vec3),
+                    _cached_from_torch(_sh_grad, wp.vec3),
                     int(_has_sh),
-                    _cached_from_torch(render_grad_points.contiguous(), wp.vec2),
+                    _cached_from_torch(render_grad_points, wp.vec2),
                 ]
                 _e2_out = [
                     _cached_from_torch(grad_means3D, wp.vec3),
@@ -4759,36 +4748,36 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     grad_conic_2d_active,
                 )
 
+                # C3: Fused accumulation — replaces 2 torch.zeros + 3 torch.add + 1 slice-assign
+                grad_means3D = torch.empty(means3D.shape, dtype=means3D.dtype, device=device)
+                grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
+                _sh_grad_input = _grad_mean_sh if _has_sh else _grad_projected
+                # C4: cache wp.from_torch + Launch object
+                _acc_inp = [
+                    _cached_from_torch(_grad_projected, wp.vec3),
+                    _cached_from_torch(_grad_means_cov, wp.vec3),
+                    _cached_from_torch(_sh_grad_input, wp.vec3),
+                    int(_has_sh),
+                    _cached_from_torch(render_grad_points, wp.vec2),
+                ]
+                _acc_out = [
+                    _cached_from_torch(grad_means3D, wp.vec3),
+                    _cached_from_torch(grad_means2D, wp.vec3),
+                ]
+                _acc_key = (str(device), point_count, int(_has_sh))
+                _acc_cmd = _C4_LAUNCH_CACHE_ACCUM.get(_acc_key)
+                if _acc_cmd is None:
+                    _acc_cmd = wp.launch(kernel=_fused_backward_accumulate_warp_kernel, dim=point_count,
+                                         inputs=_acc_inp, outputs=_acc_out, device=str(device), record_cmd=True)
+                    _C4_LAUNCH_CACHE_ACCUM[_acc_key] = _acc_cmd
+                else:
+                    for _i, _v in enumerate(_acc_inp + _acc_out):
+                        _acc_cmd.set_param_at_index(_i, _v)
+                _acc_cmd.launch()
 
-        # C3: Fused accumulation — replaces 2 torch.zeros + 3 torch.add + 1 slice-assign
-        grad_means3D = torch.empty_like(means3D)
-        grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
-        _sh_grad_input = _grad_mean_sh if _has_sh else _grad_projected
-            # C4: cache wp.from_torch + Launch object
-        _acc_inp = [
-                _cached_from_torch(_grad_projected.contiguous(), wp.vec3),
-                _cached_from_torch(_grad_means_cov.contiguous(), wp.vec3),
-                _cached_from_torch(_sh_grad_input.contiguous(), wp.vec3),
-                int(_has_sh),
-                _cached_from_torch(render_grad_points.contiguous(), wp.vec2),
-            ]
-        _acc_out = [
-                _cached_from_torch(grad_means3D, wp.vec3),
-                _cached_from_torch(grad_means2D, wp.vec3),
-            ]
-        _acc_key = (str(device), point_count, int(_has_sh))
-        _acc_cmd = _C4_LAUNCH_CACHE_ACCUM.get(_acc_key)
-        if _acc_cmd is None:
-                _acc_cmd = wp.launch(kernel=_fused_backward_accumulate_warp_kernel, dim=point_count,
-                                     inputs=_acc_inp, outputs=_acc_out, device=str(device), record_cmd=True)
-                _C4_LAUNCH_CACHE_ACCUM[_acc_key] = _acc_cmd
-        else:
-                for _i, _v in enumerate(_acc_inp + _acc_out):
-                    _acc_cmd.set_param_at_index(_i, _v)
-        _acc_cmd.launch()
-        if _cov3D_precomp.numel() != 0:
-                grad_cov3D = grad_cov_from_cov2d
-        elif _scales.numel() != 0 and _rotations.numel() != 0:
+                if _cov3D_precomp.numel() != 0:
+                    grad_cov3D = grad_cov_from_cov2d
+                elif _scales.numel() != 0 and _rotations.numel() != 0:
                     grad_scales, grad_rotations = _backward_cov3d_from_scale_rotation_warp(
                         _scales,
                         _scale_modifier,

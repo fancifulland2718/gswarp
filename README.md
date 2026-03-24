@@ -179,7 +179,7 @@ color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weigh
 | `rasterize_gaussians(...)` | Full forward pass: preprocess + binning + rendering |
 | `rasterize_gaussians_backward(...)` | Full backward pass: backward render + backward preprocess |
 | `mark_visible(positions, viewmatrix, projmatrix)` | Returns the visibility mask of 3D positions |
-| `preprocess_gaussians(...)` | Preprocess only (without rendering), useful for debugging/analysis |
+| `preprocess_gaussians(...)` | Preprocess only (without rendering), useful for analysis |
 
 ### Runtime Configuration
 
@@ -462,7 +462,7 @@ The following data also comes from the **current code state**. The test platform
 
 Methodology:
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with repeated single-iteration runs, `debug=False`, `enable_flow_grad=False`, and warmup iterations discarded.
+- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with repeated single-iteration runs, and warmup iterations discarded.
 - **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
 - **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; these stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
 
@@ -606,6 +606,6 @@ This Warp backend builds upon the following projects:
 - [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), by Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler, and George Drettakis (INRIA, MPII). The original CUDA rasterizer is the reference implementation.
 - [Fast Converging 3D Gaussian Splatting for 1-Minute Reconstruction](https://arxiv.org/abs/2601.19489), by Ziyu Zhang, Tianle Liu, Diantao Tu, and Shuhan Shen. The tight AABB bounding-box technique used in this project is inspired by this work.
 - [NVIDIA Warp](https://nvidia.github.io/warp/) — the Python framework for high-performance GPU simulation and compute.
-- [PyTorch](https://pytorch.org/) — used for tensor management, autograd integration, and CUDA memory allocation.
+- [PyTorch](https://pytorch.org/) — used for tensor management and CUDA memory allocation.
 
 
