@@ -1753,7 +1753,7 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(p_proj_x, image_width)
         point_y = _ndc_to_pix_wp(p_proj_y, image_height)
 
-        rect = _compute_tile_rect_wp(point_x, point_y, radius, grid_x, grid_y)
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_a, cov_c, opacities[idx], grid_x, grid_y)
         rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
         if rect_area == 0:
             return
@@ -1814,21 +1814,30 @@ if wp is not None:
         hom_y = proj_flat[1] * mean[0] + proj_flat[5] * mean[1] + proj_flat[9] * mean[2] + proj_flat[13]
         hom_w = proj_flat[3] * mean[0] + proj_flat[7] * mean[1] + proj_flat[11] * mean[2] + proj_flat[15]
         inv_w = 1.0 / (hom_w + 0.0000001)
-        mul1 = hom_x * inv_w * inv_w
-        mul2 = hom_y * inv_w * inv_w
+
+        # ======== Part A: backward_projected_means ========
+        hom_x = proj_flat[0] * mean[0] + proj_flat[4] * mean[1] + proj_flat[8] * mean[2] + proj_flat[12]
+        hom_y = proj_flat[1] * mean[0] + proj_flat[5] * mean[1] + proj_flat[9] * mean[2] + proj_flat[13]
+        hom_w = proj_flat[3] * mean[0] + proj_flat[7] * mean[1] + proj_flat[11] * mean[2] + proj_flat[15]
+        inv_w = 1.0 / (hom_w + 0.0000001)
 
         grad_xy = grad_mean2d[tid]
+        inv_w2 = inv_w * inv_w
         if rad > 0:
             grad_xy = grad_xy + grad_proj_2d[tid]
-        pm_x = (proj_flat[0] * inv_w - proj_flat[3] * mul1) * grad_xy[0] + (proj_flat[1] * inv_w - proj_flat[3] * mul2) * grad_xy[1]
-        pm_y = (proj_flat[4] * inv_w - proj_flat[7] * mul1) * grad_xy[0] + (proj_flat[5] * inv_w - proj_flat[7] * mul2) * grad_xy[1]
-        pm_z = (proj_flat[8] * inv_w - proj_flat[11] * mul1) * grad_xy[0] + (proj_flat[9] * inv_w - proj_flat[11] * mul2) * grad_xy[1]
-
-        mul3 = view_flat[2] * mean[0] + view_flat[6] * mean[1] + view_flat[10] * mean[2] + view_flat[14]
+        gx = grad_xy[0]
+        gy = grad_xy[1]
+        gh = hom_x * gx + hom_y * gy
+        pm_x = inv_w * (proj_flat[0] * gx + proj_flat[1] * gy) - proj_flat[3] * inv_w2 * gh
+        pm_y = inv_w * (proj_flat[4] * gx + proj_flat[5] * gy) - proj_flat[7] * inv_w2 * gh
+        pm_z = inv_w * (proj_flat[8] * gx + proj_flat[9] * gy) - proj_flat[11] * inv_w2 * gh
+        
+        # z should be defined in Part B, but for fused kernel, it can be here 
+        z = view_flat[2] * mean[0] + view_flat[6] * mean[1] + view_flat[10] * mean[2] + view_flat[14]
         depth_grad = grad_depths[tid]
-        pm_x = pm_x + (view_flat[2] - view_flat[3] * mul3) * depth_grad
-        pm_y = pm_y + (view_flat[6] - view_flat[7] * mul3) * depth_grad
-        pm_z = pm_z + (view_flat[10] - view_flat[11] * mul3) * depth_grad
+        pm_x = pm_x + (view_flat[2] - view_flat[3] * z) * depth_grad
+        pm_y = pm_y + (view_flat[6] - view_flat[7] * z) * depth_grad
+        pm_z = pm_z + (view_flat[10] - view_flat[11] * z) * depth_grad
         grad_projected = wp.vec3(pm_x, pm_y, pm_z)
 
         # ======== Part B: backward_cov2d_cov3d_fused ========
@@ -1844,24 +1853,23 @@ if wp is not None:
             x = view_flat[0] * mean[0] + view_flat[4] * mean[1] + view_flat[8] * mean[2] + view_flat[12]
             y = view_flat[1] * mean[0] + view_flat[5] * mean[1] + view_flat[9] * mean[2] + view_flat[13]
             z = view_flat[2] * mean[0] + view_flat[6] * mean[1] + view_flat[10] * mean[2] + view_flat[14]
-
+            tz_inv = 1.0 / (z + 1.0e-7)
             limx = 1.3 * tanfovx
             limy = 1.3 * tanfovy
-            txtz = x / z
-            tytz = y / z
-            tx = wp.clamp(txtz, -limx, limx) * z
-            ty = wp.clamp(tytz, -limy, limy) * z
+            txtz = x * tz_inv
+            tytz = y * tz_inv
             x_grad_mul = float(1.0)
             y_grad_mul = float(1.0)
             if txtz < -limx or txtz > limx:
                 x_grad_mul = float(0.0)
             if tytz < -limy or tytz > limy:
                 y_grad_mul = float(0.0)
-
-            j00 = focal_x / z
-            j02 = -(focal_x * tx) / (z * z)
-            j11 = focal_y / z
-            j12 = -(focal_y * ty) / (z * z)
+            tx = wp.clamp(txtz, -limx, limx) 
+            ty = wp.clamp(tytz, -limy, limy)
+            j00 = focal_x * tz_inv
+            j02 = - j00 * tx
+            j11 = focal_y * tz_inv
+            j12 = - j11 * ty
 
             w00 = view_flat[0]
             w01 = view_flat[1]
@@ -1904,9 +1912,9 @@ if wp is not None:
             total_conic1 = _gc_v4[1] + grad_conic_2d_flat[grad_conic2_base + 1]
             total_conic2 = _gc_v4[2] + grad_conic_2d_flat[grad_conic2_base + 2]
 
-            dL_da = denom2inv * (-cc * cc * total_conic0 + 2.0 * bb * cc * total_conic1 + (denom - aa * cc) * total_conic2)
-            dL_dc = denom2inv * (-aa * aa * total_conic2 + 2.0 * aa * bb * total_conic1 + (denom - aa * cc) * total_conic0)
-            dL_db = denom2inv * 2.0 * (bb * cc * total_conic0 - (denom + 2.0 * bb * bb) * total_conic1 + aa * bb * total_conic2)
+            dL_da = denom2inv * (-cc * cc * total_conic0 + 2.0 * bb * cc * total_conic1 - bb * bb * total_conic2)
+            dL_dc = denom2inv * (-aa * aa * total_conic2 + 2.0 * aa * bb * total_conic1 - bb * bb  * total_conic0)
+            dL_db = denom2inv * 2.0 * (bb * cc * total_conic0 - (aa * cc + bb * bb) * total_conic1 + aa * bb * total_conic2)
 
             gc0 = t00 * t00 * dL_da + t00 * t01 * dL_db + t01 * t01 * dL_dc
             gc3 = t10 * t10 * dL_da + t10 * t11 * dL_db + t11 * t11 * dL_dc
@@ -1915,25 +1923,21 @@ if wp is not None:
             gc2 = 2.0 * t00 * t20 * dL_da + (t00 * t21 + t01 * t20) * dL_db + 2.0 * t01 * t21 * dL_dc
             gc4 = 2.0 * t10 * t20 * dL_da + (t10 * t21 + t11 * t20) * dL_db + 2.0 * t11 * t21 * dL_dc
 
-            dL_dT00 = 2.0 * (t00 * v00 + t10 * v01 + t20 * v02) * dL_da + (t01 * v00 + t11 * v01 + t21 * v02) * dL_db
-            dL_dT01 = 2.0 * (t00 * v01 + t10 * v11 + t20 * v12) * dL_da + (t01 * v01 + t11 * v11 + t21 * v12) * dL_db
-            dL_dT02 = 2.0 * (t00 * v02 + t10 * v12 + t20 * v22) * dL_da + (t01 * v02 + t11 * v12 + t21 * v22) * dL_db
-            dL_dT10 = 2.0 * (t01 * v00 + t11 * v01 + t21 * v02) * dL_dc + (t00 * v00 + t10 * v01 + t20 * v02) * dL_db
-            dL_dT11 = 2.0 * (t01 * v01 + t11 * v11 + t21 * v12) * dL_dc + (t00 * v01 + t10 * v11 + t20 * v12) * dL_db
-            dL_dT12 = 2.0 * (t01 * v02 + t11 * v12 + t21 * v22) * dL_dc + (t00 * v02 + t10 * v12 + t20 * v22) * dL_db
+            dL_dT00 = 2.0 * vt0x * dL_da + vt1x * dL_db
+            dL_dT01 = 2.0 * vt0y * dL_da + vt1y * dL_db
+            dL_dT02 = 2.0 * vt0z * dL_da + vt1z * dL_db
+            dL_dT10 = vt0x * dL_db + 2.0 * vt1x * dL_dc
+            dL_dT11 = vt0y * dL_db + 2.0 * vt1y * dL_dc
+            dL_dT12 = vt0z * dL_db + 2.0 * vt1z * dL_dc
 
             dL_dJ00 = w00 * dL_dT00 + w10 * dL_dT01 + w20 * dL_dT02
             dL_dJ02 = w02 * dL_dT00 + w12 * dL_dT01 + w22 * dL_dT02
             dL_dJ11 = w01 * dL_dT10 + w11 * dL_dT11 + w21 * dL_dT12
             dL_dJ12 = w02 * dL_dT10 + w12 * dL_dT11 + w22 * dL_dT12
 
-            tz_inv = 1.0 / z
-            tz2 = tz_inv * tz_inv
-            tz3 = tz2 * tz_inv
-            dL_dtx = x_grad_mul * -focal_x * tz2 * dL_dJ02
-            dL_dty = y_grad_mul * -focal_y * tz2 * dL_dJ12
-            dL_dtz = -focal_x * tz2 * dL_dJ00 - focal_y * tz2 * dL_dJ11 + (2.0 * focal_x * tx) * tz3 * dL_dJ02 + (2.0 * focal_y * ty) * tz3 * dL_dJ12
-
+            dL_dtx = x_grad_mul * - j00 * tz_inv * dL_dJ02
+            dL_dty = y_grad_mul * - j11 * tz_inv * dL_dJ12
+            dL_dtz = - ( j00 * dL_dJ00 + j11 * dL_dJ11+ 2.0 *  j02 * dL_dJ02 + 2.0 * j12 *dL_dJ12 ) * tz_inv 
             grad_cov_means = wp.vec3(
                 w00 * dL_dtx + w01 * dL_dty + w02 * dL_dtz,
                 w10 * dL_dtx + w11 * dL_dty + w12 * dL_dtz,
@@ -2180,7 +2184,7 @@ if wp is not None:
 
     @wp.func
     def _conic_denom2inv_wp(denom: wp.float32):
-        return 1.0 / (denom * denom + 1.0e-6)
+        return 1.0 / (denom * denom + 1.0e-7)
 
 
     @wp.kernel
@@ -2530,9 +2534,7 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(proj_value[0], image_width)
         point_y = _ndc_to_pix_wp(proj_value[1], image_height)
 
-        cov_xx = conic[2] / det
-        cov_yy = conic[0] / det
-        rect = _compute_tile_rect_tight_wp(point_x, point_y, cov_xx, cov_yy, grid_x, grid_y)
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_value[0], cov_value[2], opacities[idx], grid_x, grid_y)
         rect_area = ( rect[2] - rect[0] ) * ( rect[3] - rect[1] )
         if rect_area == 0:
             return
@@ -2595,25 +2597,21 @@ if wp is not None:
         x = view_flat[0] * p[0] + view_flat[4] * p[1] + view_flat[8] * p[2] + view_flat[12]
         y = view_flat[1] * p[0] + view_flat[5] * p[1] + view_flat[9] * p[2] + view_flat[13]
         z = view_flat[2] * p[0] + view_flat[6] * p[1] + view_flat[10] * p[2] + view_flat[14]
-
+        inv_z = 1.0 / (z + 1.0e-7)
         limx = 1.3 * tanfovx
         limy = 1.3 * tanfovy
-        txtz = x / z
-        tytz = y / z
-        x = wp.clamp(txtz, -limx, limx) * z
-        y = wp.clamp(tytz, -limy, limy) * z
+        x = wp.clamp(x * inv_z, -limx, limx)
+        y = wp.clamp(y * inv_z, -limy, limy)
 
-        a = focal_x / z
-        b = focal_y / z
-        c = -(focal_x * x) / (z * z)
-        d = -(focal_y * y) / (z * z)
+        a = focal_x * inv_z
+        b = focal_y * inv_z
 
-        t00 = view_flat[0] * a + view_flat[2] * c
-        t10 = view_flat[4] * a + view_flat[6] * c
-        t20 = view_flat[8] * a + view_flat[10] * c
-        t01 = view_flat[1] * b + view_flat[2] * d
-        t11 = view_flat[5] * b + view_flat[6] * d
-        t21 = view_flat[9] * b + view_flat[10] * d
+        t00 = a * ( view_flat[0] - view_flat[2] * x )
+        t10 = a * ( view_flat[4] - view_flat[6] * x )
+        t20 = a * ( view_flat[8] - view_flat[10] * x )
+        t01 = b * ( view_flat[1] - view_flat[2] * y )
+        t11 = b * ( view_flat[5] - view_flat[6] * y )
+        t21 = b * ( view_flat[9] - view_flat[10] * y )
 
         cov_value = _cov2d_from_scale_rotation_gram_wp(
             scales[idx],
@@ -2643,9 +2641,7 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(proj_value[0], image_width)
         point_y = _ndc_to_pix_wp(proj_value[1], image_height)
 
-        cov_xx = conic[2] / det
-        cov_yy = conic[0] / det
-        rect = _compute_tile_rect_tight_wp(point_x, point_y, cov_xx, cov_yy, grid_x, grid_y)
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_value[0], cov_value[2], opacities[idx], grid_x, grid_y)
         rect_area = ( rect[2] - rect[0] ) * ( rect[3] - rect[1] )
         if rect_area == 0:
             return
@@ -2736,24 +2732,33 @@ if wp is not None:
 
 
     @wp.func
-    def _compute_tile_rect_tight_wp(
+    def _compute_tile_rect_snugbox_cov2d_wp(
         point_x: wp.float32,
         point_y: wp.float32,
-        cov_xx: wp.float32,
-        cov_yy: wp.float32,
+        cov2d_aa: wp.float32,
+        cov2d_cc: wp.float32,
+        opacity: wp.float32,
         grid_x: wp.int32,
         grid_y: wp.int32,
     ):
-        """Tight AABB using per-axis 3-sigma from cov2d diagonal elements."""
-        radius_x = wp.int32(wp.ceil(3.0 * wp.sqrt(wp.max(cov_xx, 0.01))))
-        radius_y = wp.int32(wp.ceil(3.0 * wp.sqrt(wp.max(cov_yy, 0.01))))
+        """Opacity-aware SnugBox directly from cov2d diagonal (b-insensitive).
+
+        Mathematically equivalent to the conic version:
+          r_x = ceil(sqrt(t * con_c / det_conic)) = ceil(sqrt(t * cov2d_aa))
+        but avoids the det_conic = con_a*con_c - con_b^2 denominator that
+        amplifies floating-point differences in the off-diagonal term b.
+        """
+        t = 2.0 * wp.log(wp.max(255.0 * opacity, 1.0))
+        if t <= 0.0:
+            return wp.vec4i(0, 0, 0, 0)
+        radius_x = wp.int32(wp.ceil(wp.sqrt(wp.max(t * cov2d_aa, 0.0))))
+        radius_y = wp.int32(wp.ceil(wp.sqrt(wp.max(t * cov2d_cc, 0.0))))
         rect_min_x = wp.min(grid_x, wp.max(0, wp.int32((point_x - float(radius_x)) / float(BLOCK_X))))
         rect_min_y = wp.min(grid_y, wp.max(0, wp.int32((point_y - float(radius_y)) / float(BLOCK_Y))))
         rect_max_x = wp.min(grid_x, wp.max(0, wp.int32((point_x + float(radius_x) + float(BLOCK_X - 1)) / float(BLOCK_X))))
         rect_max_y = wp.min(grid_y, wp.max(0, wp.int32((point_y + float(radius_y) + float(BLOCK_Y - 1)) / float(BLOCK_Y))))
         return wp.vec4i(rect_min_x, rect_min_y, rect_max_x, rect_max_y)
-    
-    
+      
     @wp.func
     def _preprocess_rect_visible_wp(
         proj_value: wp.vec3,
@@ -2872,6 +2877,7 @@ if wp is not None:
         point_offsets: wp.array(dtype=wp.int32),
         radii: wp.array(dtype=wp.int32),
         conic_opacity: wp.array(dtype=wp.vec4),
+        cov2d_inv: wp.array(dtype=wp.vec3),
         grid_x: wp.int32,
         grid_y: wp.int32,
         tile_ids_out: wp.array(dtype=wp.int32),
@@ -2892,10 +2898,9 @@ if wp is not None:
         con_b = co[1]
         con_c = co[2]
         opac = co[3]
-        det_co = con_a * con_c - con_b * con_b
-        cov_xx = con_c / det_co
-        cov_yy = con_a / det_co
-        rect = _compute_tile_rect_tight_wp(point[0], point[1], cov_xx, cov_yy, grid_x, grid_y)
+        
+        cov = cov2d_inv[idx]
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
 
         for tile_y in range(rect[1], rect[3]):
             for tile_x in range(rect[0], rect[2]):
@@ -2909,6 +2914,15 @@ if wp is not None:
                     tile_ids_out[off] = tile_y * grid_x + tile_x
                     point_list_out[off] = idx
                     off = off + 1
+        
+        # Sentinel-fill remaining slots (preprocess SnugBox AABB may be slightly larger
+        # than what per-tile alpha filter writes, due to AABB corner tiles)
+        end_off = point_offsets[idx]
+        sentinel_tile = grid_x * grid_y
+        while off < end_off:
+            tile_ids_out[off] = sentinel_tile
+            point_list_out[off] = 0
+            off = off + 1
 
     @wp.kernel
     def _duplicate_with_packed_keys_warp_kernel(
@@ -2916,6 +2930,7 @@ if wp is not None:
         point_offsets: wp.array(dtype=wp.int32),
         radii: wp.array(dtype=wp.int32),
         conic_opacity: wp.array(dtype=wp.vec4),
+        cov2d_inv: wp.array(dtype=wp.vec3),
         depths: wp.array(dtype=wp.float32),
         grid_x: wp.int32,
         grid_y: wp.int32,
@@ -2937,10 +2952,8 @@ if wp is not None:
         con_b = co[1]
         con_c = co[2]
         opac = co[3]
-        det_co = con_a * con_c - con_b * con_b
-        cov_xx = con_c / det_co
-        cov_yy = con_a / det_co
-        rect = _compute_tile_rect_tight_wp(point[0], point[1], cov_xx, cov_yy, grid_x, grid_y)
+        cov = cov2d_inv[idx]
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
         depth_bits = wp.cast(depths[idx], wp.int32)
         depth_key = wp.int64(depth_bits) & wp.int64(4294967295)
 
@@ -2957,13 +2970,20 @@ if wp is not None:
                     packed_keys_out[off] = (wp.int64(tile_id) << wp.int64(32)) | depth_key
                     point_list_out[off] = idx
                     off = off + 1
-
+        # Sentinel-fill remaining slots
+        end_off = point_offsets[idx]
+        sentinel_key = wp.int64(grid_x * grid_y) << wp.int64(32)
+        while off < end_off:
+            packed_keys_out[off] = sentinel_key
+            point_list_out[off] = 0
+            off = off + 1
 
     @wp.kernel
     def _duplicate_with_keys_from_order_warp_kernel(
         points_xy_image: wp.array(dtype=wp.vec2),
         radii: wp.array(dtype=wp.int32),
         conic_opacity: wp.array(dtype=wp.vec4),
+        cov2d_inv: wp.array(dtype=wp.vec3),
         point_ids: wp.array(dtype=wp.int32),
         point_offsets: wp.array(dtype=wp.int32),
         grid_x: wp.int32,
@@ -2987,11 +3007,9 @@ if wp is not None:
         con_b = co[1]
         con_c = co[2]
         opac = co[3]
-        det_co = con_a * con_c - con_b * con_b
-        cov_xx = con_c / det_co
-        cov_yy = con_a / det_co
-        rect = _compute_tile_rect_tight_wp(point[0], point[1], cov_xx, cov_yy, grid_x, grid_y)
-
+        cov = cov2d_inv[point_id]
+        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
+        
         for tile_y in range(rect[1], rect[3]):
             for tile_x in range(rect[0], rect[2]):
                 dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
@@ -3004,7 +3022,12 @@ if wp is not None:
                     tile_ids_out[off] = tile_y * grid_x + tile_x
                     point_list_out[off] = point_id
                     off = off + 1
-
+        end_off = point_offsets[idx]
+        sentinel_tile = grid_x * grid_y
+        while off < end_off:
+            tile_ids_out[off] = sentinel_tile
+            point_list_out[off] = 0
+            off = off + 1
 
     @wp.kernel
     def _pack_binning_keys_warp_kernel(
@@ -3902,6 +3925,8 @@ def _build_binning_state(
         radii_i32 = _as_detached_contiguous_dtype(radii, torch.int32)
         conic_opacity_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
         conic_opacity_wp = wp.from_torch(conic_opacity_f32, dtype=wp.vec4)
+        cov2d_inv_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_2d_inv"], torch.float32)
+        cov2d_inv_wp = wp.from_torch(cov2d_inv_f32, dtype=wp.vec3)
         point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
         point_list = _allocate_scalar_tensor((num_rendered,), torch.int32, device)
         if sort_mode == "warp_radix":

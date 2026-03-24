@@ -1,0 +1,105 @@
+gswarp License
+==============
+
+Copyright (c) 2025 gswarp contributors.
+
+1. Usage
+
+gswarp is provided for non-commercial research and educational purposes only.
+Any other use, in particular any use for commercial purposes, is prohibited. This
+includes, without limitation, incorporation in a commercial product, use in a
+commercial service, or production of other artefacts for commercial purposes.
+
+This restriction is inherited from the upstream 3D Gaussian Splatting project
+(see "Third-Party Licenses" below). Users of gswarp must also comply with all
+third-party license terms listed in this file.
+
+2. Redistribution
+
+Redistribution is allowed only for non-commercial purposes and provided that:
+(a) no fee is charged to the person receiving the redistributed copy, and
+(b) this full license text, including the third-party license notices below,
+    is included with any redistribution.
+
+3. Disclaimer
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+================================================================================
+Third-Party Licenses
+================================================================================
+
+The following third-party projects are referenced, reimplemented, or used by
+gswarp. Users must comply with the respective license terms.
+
+
+--------------------------------------------------------------------------------
+1. 3D Gaussian Splatting for Real-Time Radiance Field Rendering
+   https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/
+   License: Gaussian-Splatting License (non-commercial research only)
+--------------------------------------------------------------------------------
+
+gswarp is a clean-room reimplementation of the differentiable Gaussian
+rasterization pipeline originally developed as part of the 3D Gaussian Splatting
+project. The algorithm design and pipeline structure follow the original CUDA
+implementation. Usage of gswarp is therefore subject to the upstream license
+terms reproduced below.
+
+  Inria and the Max Planck Institut for Informatik (MPII) hold all the ownership
+  rights on the Software named "3D Gaussian Splatting for Real-Time Radiance
+  Field Rendering".
+
+  The Software is provided for research purposes only. Any other use, in
+  particular any use for commercial purposes, is prohibited. This includes,
+  without limitation, incorporation in a commercial product, use in a commercial
+  service, or production of other artefacts for commercial purposes.
+
+  Authors:
+    Bernhard Kerbl (bernhard.kerbl@tugraz.at)
+    Georgios Kopanas (gkopanas@gmail.com)
+    Thomas Leimkühler (thomas.leimkuehler@mpi-inf.mpg.de)
+    George Drettakis (george.drettakis@inria.fr)
+
+
+--------------------------------------------------------------------------------
+2. NVIDIA Warp
+   https://nvidia.github.io/warp/
+   License: Apache License 2.0
+--------------------------------------------------------------------------------
+
+gswarp uses NVIDIA Warp as its GPU kernel runtime. Warp is distributed under the
+Apache License 2.0. A copy of the license is available at:
+https://www.apache.org/licenses/LICENSE-2.0
+
+
+--------------------------------------------------------------------------------
+3. PyTorch
+   https://pytorch.org/
+   License: BSD-style (PyTorch License)
+--------------------------------------------------------------------------------
+
+gswarp uses PyTorch for tensor management, autograd integration, and CUDA memory
+allocation. PyTorch is distributed under a BSD-style license. A copy of the
+license is available at:
+https://github.com/pytorch/pytorch/blob/main/LICENSE
+
+
+--------------------------------------------------------------------------------
+4. Fast Converging 3D Gaussian Splatting for 1-Minute Reconstruction
+   https://arxiv.org/abs/2601.19489
+   Authors: Ziyu Zhang, Tianle Liu, Diantao Tu, Shuhan Shen
+--------------------------------------------------------------------------------
+
+The tight AABB bounding-box technique used in gswarp is inspired by this work.
+Only the algorithmic idea is adopted; no source code from this project is
+included. The paper is available under CC BY-NC-SA 4.0.
