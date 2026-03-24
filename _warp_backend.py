@@ -803,21 +803,39 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
 # C4: Warp launch cache — eliminates wp.from_torch + wp.launch Python overhead
 # -----------------------------------------------------------------------------
 
-# Cache wp.from_torch wrappers keyed by (data_ptr, dtype_str).
-# Safe because wp.from_torch is zero-copy and the underlying CUDA pointer is the
-# same as long as the PyTorch tensor is alive and not reallocated.
-_WP_ARRAY_CACHE: dict[tuple[int, str], Any] = {}
+# Per-call wp.from_torch wrapper cache.  Alive only during a single
+# rasterize_gaussians / rasterize_gaussians_backward invocation so that
+# warp array wrappers (which prevent PyTorch from freeing the underlying
+# CUDA storage) are released between training iterations.
+_WP_ARRAY_CACHE: dict[tuple[int, str], Any] | None = None
+
+
+def _begin_wp_cache() -> None:
+    """Activate a fresh per-call warp array cache."""
+    global _WP_ARRAY_CACHE
+    _WP_ARRAY_CACHE = {}
+
+
+def _end_wp_cache() -> None:
+    """Release the per-call warp array cache so wrapped tensors can be freed."""
+    global _WP_ARRAY_CACHE
+    _WP_ARRAY_CACHE = None
 
 
 def _cached_from_torch(tensor: torch.Tensor, dtype) -> Any:
     """Return a cached wp.array wrapping *tensor*, reusing the wrapper if the
-    data pointer and requested dtype haven't changed."""
+    data pointer and requested dtype haven't changed within this call."""
+    cache = _WP_ARRAY_CACHE
+    if cache is None:
+        # Fallback when called outside a managed scope (should not happen in
+        # normal operation, but be safe).
+        return wp.from_torch(tensor, dtype=dtype)
     key = (tensor.data_ptr(), str(dtype))
-    cached = _WP_ARRAY_CACHE.get(key)
+    cached = cache.get(key)
     if cached is not None:
         return cached
     arr = wp.from_torch(tensor, dtype=dtype)
-    _WP_ARRAY_CACHE[key] = arr
+    cache[key] = arr
     return arr
 
 
@@ -4795,6 +4813,14 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
 def rasterize_gaussians(*args: Any):
         _require_warp()
+        _begin_wp_cache()
+        try:
+            return _rasterize_gaussians_forward_impl(*args)
+        finally:
+            _end_wp_cache()
+
+
+def _rasterize_gaussians_forward_impl(*args: Any):
         (
             _background,
             means3D,
@@ -4909,4 +4935,8 @@ def mark_visible(*args: Any):
 
 def rasterize_gaussians_backward(*args: Any):
     _require_warp()
-    return _rasterize_gaussians_backward_python(*args)
+    _begin_wp_cache()
+    try:
+        return _rasterize_gaussians_backward_python(*args)
+    finally:
+        _end_wp_cache()
