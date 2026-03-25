@@ -274,7 +274,6 @@ The entire Warp backend is contained in a single Python file (about 4400 lines),
 
 - all Warp kernel definitions (`@wp.kernel`)
 - all Warp helper functions (`@wp.func`)
-- buffer-cache management
 - runtime auto-tuning
 - public API functions
 
@@ -433,10 +432,10 @@ Across all four scales, the public forward outputs are exactly aligned within th
 
 | Points | Gradient fields above threshold | `grad_means3D` mismatches / max-diff | `grad_shs` mismatches / max-diff | Other sparse fields |
 |------|-------------------------------|--------------------------------------|----------------------------------|---------------------|
-| 4,096 | `means3D`, `rotations` | 1 / 4.69e-2 | 0 / 2.93e-3 | `rotations`: 1 / 6.10e-3 |
-| 16,384 | none | 0 / 4.88e-3 | 0 / 2.44e-3 | none |
-| 65,536 | `means3D`, `opacity`, `shs`, `scales`, `rotations` | 3 / 9.38e-2 | 1 / 6.84e-3 | `opacity`: 1 / 1.33e-1; `scales`: 1 / 7.93e-3; `rotations`: 1 / 7.81e-3 |
-| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 6 / 2.81e-1 | 63 / 4.88e-2 | `means2D`: 4 / 1.78e-2; `opacity`: 2 / 2.01e-1; `scales`: 3 / 6.17e-1; `rotations`: 7 / 8.01e-2 |
+| 4,096 | `means3D` | 1 / 4.30e-2 | 0 / 2.44e-3 | none |
+| 16,384 | none | 0 / 2.93e-3 | 0 / 1.95e-3 | none |
+| 65,536 | `means3D`, `opacity`, `shs`, `rotations` | 3 / 5.47e-2 | 2 / 6.35e-3 | `opacity`: 2 / 9.38e-2; `rotations`: 1 / 1.17e-2 |
+| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 6 / 3.44e-1 | 46 / 5.47e-2 | `means2D`: 4 / 8.30e-3; `opacity`: 2 / 7.03e-2; `scales`: 3 / 5.31e-1; `rotations`: 4 / 9.28e-2 |
 
 Conclusion:
 
@@ -462,19 +461,19 @@ For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 
 
 | Points | Resolution | `num_rendered` | Native FW | Warp FW | FW ratio | Native BW | Warp BW | BW ratio |
 |------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
-| 4,096 | 128×128 | 121,691 | 2.385 ms | 2.400 ms | 1.01× | 3.126 ms | 3.145 ms | 1.01× |
-| 16,384 | 128×128 | 493,767 | 2.457 ms | 2.511 ms | 1.02× | 3.111 ms | 3.017 ms | **0.97×** |
-| 65,536 | 256×256 | 7,497,291 | 7.329 ms | 6.831 ms | **0.93×** | 2.387 ms | 2.259 ms | **0.95×** |
-| 262,144 | 384×384 | 65,904,035 | 61.998 ms | 62.187 ms | 1.00× | 5.232 ms | 6.121 ms | 1.17× |
+| 4,096 | 128×128 | 121,691 | 3.019 ms | 2.614 ms | **0.87×** | 2.954 ms | 2.615 ms | **0.89×** |
+| 16,384 | 128×128 | 493,767 | 2.410 ms | 2.916 ms | 1.21× | 3.069 ms | 2.971 ms | **0.97×** |
+| 65,536 | 256×256 | 7,497,291 | 6.925 ms | 7.176 ms | 1.04× | 2.031 ms | 2.155 ms | 1.06× |
+| 262,144 | 384×384 | 65,904,035 | 60.030 ms | 57.033 ms | **0.95×** | 6.084 ms | 7.175 ms | 1.18× |
 
 ### Public API Peak Memory by Stage
 
 | Points | Resolution | Native FW peak increment | Native BW peak increment | Warp FW peak increment | Warp BW peak increment |
 |------|--------|------------------|------------------|-------------------|-------------------|
-| 4,096 | 128×128 | 1.57 MiB | 4.41 MiB | 1.57 MiB | 4.41 MiB |
-| 16,384 | 128×128 | 5.18 MiB | 17.63 MiB | 5.18 MiB | 17.63 MiB |
-| 65,536 | 256×256 | 41.79 MiB | 70.57 MiB | 41.79 MiB | 70.57 MiB |
-| 262,144 | 384×384 | 303.13 MiB | 283.00 MiB | 302.13 MiB | 282.32 MiB |
+| 4,096 | 128×128 | 1.57 MiB | 4.41 MiB | 1.57 MiB | 4.42 MiB |
+| 16,384 | 128×128 | 5.18 MiB | 17.63 MiB | 5.18 MiB | 17.69 MiB |
+| 65,536 | 256×256 | 41.79 MiB | 70.57 MiB | 41.79 MiB | 70.82 MiB |
+| 262,144 | 384×384 | 303.13 MiB | 283.00 MiB | 303.13 MiB | 284.00 MiB |
 
 Public API peak memory remains effectively at parity with native CUDA. Even at 262K, the stage-wise differences still stay within roughly **1 MiB**.
 
@@ -482,19 +481,19 @@ Public API peak memory remains effectively at parity with native CUDA. Even at 2
 
 | Points | Resolution | Preprocess | Binning | Render | Backward Render | Selected Sort Mode |
 |------|--------|--------|------|------|----------|--------------|
-| 4,096 | 128×128 | 1.004 ms | 4.214 ms | 0.385 ms | 0.773 ms | `warp_depth_stable_tile` |
-| 16,384 | 128×128 | 1.118 ms | 1.334 ms | 0.381 ms | 0.766 ms | `warp_depth_stable_tile` |
-| 65,536 | 256×256 | 1.031 ms | 9.142 ms | 0.413 ms | 1.625 ms | `warp_depth_stable_tile` |
-| 262,144 | 384×384 | 1.701 ms | 58.492 ms | 0.560 ms | 2.390 ms | `warp_depth_stable_tile` |
+| 4,096 | 128×128 | 0.905 ms | 1.060 ms | 0.324 ms | 0.611 ms | `warp_depth_stable_tile` |
+| 16,384 | 128×128 | 0.824 ms | 1.037 ms | 0.326 ms | 0.684 ms | `warp_depth_stable_tile` |
+| 65,536 | 256×256 | 0.972 ms | 5.211 ms | 0.387 ms | 6.111 ms | `warp_depth_stable_tile` |
+| 262,144 | 384×384 | 1.487 ms | 53.816 ms | 0.556 ms | 2.082 ms | `warp_depth_stable_tile` |
 
 ### Internal Stage Peak Memory (diagnostic only)
 
 | Points | Resolution | Preprocess peak increment | Binning peak increment | Render peak increment | Backward Render peak increment |
 |------|--------|----------------|--------------|--------------|------------------|
 | 4,096 | 128×128 | 0.53 MiB | 0.00 MiB | 0.38 MiB | 0.16 MiB |
-| 16,384 | 128×128 | 2.13 MiB | 0.00 MiB | 0.38 MiB | 0.63 MiB |
+| 16,384 | 128×128 | 2.12 MiB | 0.00 MiB | 0.38 MiB | 0.62 MiB |
 | 65,536 | 256×256 | 8.50 MiB | 0.00 MiB | 1.50 MiB | 2.50 MiB |
-| 262,144 | 384×384 | 34.56 MiB | 0.00 MiB | 3.38 MiB | 10.00 MiB |
+| 262,144 | 384×384 | 34.00 MiB | 0.00 MiB | 3.38 MiB | 10.00 MiB |
 
 Looking at the internal stages, binning is still the main hotspot, but **binning adds almost no new peak allocation**; the allocator peak is mainly moved by preprocess and backward-render-related work.
 
