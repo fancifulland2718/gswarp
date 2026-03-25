@@ -1294,209 +1294,6 @@ if wp is not None:
         out_alpha_flat[tid] = weight
         out_depth_flat[tid] = depth_acc
 
-    # ---- C6: Fused backward cov2d → cov3d (eliminates grad_cov global store/load + 1 kernel launch) ----
-    @wp.kernel
-    def _backward_cov2d_cov3d_fused_warp_kernel(
-        means3d: wp.array(dtype=wp.vec3),
-        radii: wp.array(dtype=wp.int32),
-        cov3d_flat: wp.array(dtype=wp.float32),
-        view_flat: wp.array(dtype=wp.float32),
-        tanfovx: wp.float32,
-        tanfovy: wp.float32,
-        focal_x: wp.float32,
-        focal_y: wp.float32,
-        grad_conic_flat: wp.array(dtype=wp.float32),
-        grad_conic_2d_flat: wp.array(dtype=wp.float32),
-        scales: wp.array(dtype=wp.vec3),
-        rotations: wp.array(dtype=wp.vec4),
-        scale_modifier: wp.float32,
-        grad_means_out: wp.array(dtype=wp.vec3),
-        grad_scales_out: wp.array(dtype=wp.vec3),
-        grad_rotations_out: wp.array(dtype=wp.vec4),
-    ):
-        tid = wp.tid()
-        if radii[tid] <= 0:
-            grad_means_out[tid] = wp.vec3(0.0, 0.0, 0.0)
-            grad_scales_out[tid] = wp.vec3(0.0, 0.0, 0.0)
-            grad_rotations_out[tid] = wp.vec4(0.0, 0.0, 0.0, 0.0)
-            return
-
-        # --- cov2d part: compute grad_cov locally (6 floats in registers) ---
-        mean = means3d[tid]
-        base = tid * 6
-        grad_conic_base = tid * 3
-        grad_conic2_base = tid * 3
-
-        x = view_flat[0] * mean[0] + view_flat[4] * mean[1] + view_flat[8] * mean[2] + view_flat[12]
-        y = view_flat[1] * mean[0] + view_flat[5] * mean[1] + view_flat[9] * mean[2] + view_flat[13]
-        z = view_flat[2] * mean[0] + view_flat[6] * mean[1] + view_flat[10] * mean[2] + view_flat[14]
-
-        limx = 1.3 * tanfovx
-        limy = 1.3 * tanfovy
-        txtz = x / z
-        tytz = y / z
-        tx = wp.clamp(txtz, -limx, limx) * z
-        ty = wp.clamp(tytz, -limy, limy) * z
-        x_grad_mul = float(1.0)
-        y_grad_mul = float(1.0)
-        if txtz < -limx or txtz > limx:
-            x_grad_mul = float(0.0)
-        if tytz < -limy or tytz > limy:
-            y_grad_mul = float(0.0)
-
-        j00 = focal_x / z
-        j02 = -(focal_x * tx) / (z * z)
-        j11 = focal_y / z
-        j12 = -(focal_y * ty) / (z * z)
-
-        w00 = view_flat[0]
-        w01 = view_flat[1]
-        w02 = view_flat[2]
-        w10 = view_flat[4]
-        w11 = view_flat[5]
-        w12 = view_flat[6]
-        w20 = view_flat[8]
-        w21 = view_flat[9]
-        w22 = view_flat[10]
-
-        t00 = w00 * j00 + w02 * j02
-        t10 = w10 * j00 + w12 * j02
-        t20 = w20 * j00 + w22 * j02
-        t01 = w01 * j11 + w02 * j12
-        t11 = w11 * j11 + w12 * j12
-        t21 = w21 * j11 + w22 * j12
-
-        v00 = cov3d_flat[base + 0]
-        v01 = cov3d_flat[base + 1]
-        v02 = cov3d_flat[base + 2]
-        v11 = cov3d_flat[base + 3]
-        v12 = cov3d_flat[base + 4]
-        v22 = cov3d_flat[base + 5]
-
-        vt0x = v00 * t00 + v01 * t10 + v02 * t20
-        vt0y = v01 * t00 + v11 * t10 + v12 * t20
-        vt0z = v02 * t00 + v12 * t10 + v22 * t20
-        vt1x = v00 * t01 + v01 * t11 + v02 * t21
-        vt1y = v01 * t01 + v11 * t11 + v12 * t21
-        vt1z = v02 * t01 + v12 * t11 + v22 * t21
-
-        a = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3
-        b = t00 * vt1x + t10 * vt1y + t20 * vt1z
-        c = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3
-        denom = a * c - b * b
-        denom2inv = _conic_denom2inv_wp(denom)
-
-        total_conic0 = grad_conic_flat[grad_conic_base + 0] + grad_conic_2d_flat[grad_conic2_base + 0]
-        total_conic1 = grad_conic_flat[grad_conic_base + 1] + grad_conic_2d_flat[grad_conic2_base + 1]
-        total_conic2 = grad_conic_flat[grad_conic_base + 2] + grad_conic_2d_flat[grad_conic2_base + 2]
-
-        dL_da = denom2inv * (-c * c * total_conic0 + 2.0 * b * c * total_conic1 + (denom - a * c) * total_conic2)
-        dL_dc = denom2inv * (-a * a * total_conic2 + 2.0 * a * b * total_conic1 + (denom - a * c) * total_conic0)
-        dL_db = denom2inv * 2.0 * (b * c * total_conic0 - (denom + 2.0 * b * b) * total_conic1 + a * b * total_conic2)
-
-        # grad_cov in registers (not written to global memory)
-        gc0 = t00 * t00 * dL_da + t00 * t01 * dL_db + t01 * t01 * dL_dc
-        gc3 = t10 * t10 * dL_da + t10 * t11 * dL_db + t11 * t11 * dL_dc
-        gc5 = t20 * t20 * dL_da + t20 * t21 * dL_db + t21 * t21 * dL_dc
-        gc1 = 2.0 * t00 * t10 * dL_da + (t00 * t11 + t01 * t10) * dL_db + 2.0 * t01 * t11 * dL_dc
-        gc2 = 2.0 * t00 * t20 * dL_da + (t00 * t21 + t01 * t20) * dL_db + 2.0 * t01 * t21 * dL_dc
-        gc4 = 2.0 * t10 * t20 * dL_da + (t10 * t21 + t11 * t20) * dL_db + 2.0 * t11 * t21 * dL_dc
-
-        # grad_means from cov2d
-        dL_dT00 = 2.0 * (t00 * v00 + t10 * v01 + t20 * v02) * dL_da + (t01 * v00 + t11 * v01 + t21 * v02) * dL_db
-        dL_dT01 = 2.0 * (t00 * v01 + t10 * v11 + t20 * v12) * dL_da + (t01 * v01 + t11 * v11 + t21 * v12) * dL_db
-        dL_dT02 = 2.0 * (t00 * v02 + t10 * v12 + t20 * v22) * dL_da + (t01 * v02 + t11 * v12 + t21 * v22) * dL_db
-        dL_dT10 = 2.0 * (t01 * v00 + t11 * v01 + t21 * v02) * dL_dc + (t00 * v00 + t10 * v01 + t20 * v02) * dL_db
-        dL_dT11 = 2.0 * (t01 * v01 + t11 * v11 + t21 * v12) * dL_dc + (t00 * v01 + t10 * v11 + t20 * v12) * dL_db
-        dL_dT12 = 2.0 * (t01 * v02 + t11 * v12 + t21 * v22) * dL_dc + (t00 * v02 + t10 * v12 + t20 * v22) * dL_db
-
-        dL_dJ00 = w00 * dL_dT00 + w10 * dL_dT01 + w20 * dL_dT02
-        dL_dJ02 = w02 * dL_dT00 + w12 * dL_dT01 + w22 * dL_dT02
-        dL_dJ11 = w01 * dL_dT10 + w11 * dL_dT11 + w21 * dL_dT12
-        dL_dJ12 = w02 * dL_dT10 + w12 * dL_dT11 + w22 * dL_dT12
-
-        tz_inv = 1.0 / z
-        tz2 = tz_inv * tz_inv
-        tz3 = tz2 * tz_inv
-        dL_dtx = x_grad_mul * -focal_x * tz2 * dL_dJ02
-        dL_dty = y_grad_mul * -focal_y * tz2 * dL_dJ12
-        dL_dtz = -focal_x * tz2 * dL_dJ00 - focal_y * tz2 * dL_dJ11 + (2.0 * focal_x * tx) * tz3 * dL_dJ02 + (2.0 * focal_y * ty) * tz3 * dL_dJ12
-
-        grad_means_out[tid] = wp.vec3(
-            view_flat[0] * dL_dtx + view_flat[1] * dL_dty + view_flat[2] * dL_dtz,
-            view_flat[4] * dL_dtx + view_flat[5] * dL_dty + view_flat[6] * dL_dtz,
-            view_flat[8] * dL_dtx + view_flat[9] * dL_dty + view_flat[10] * dL_dtz,
-        )
-
-        # --- cov3d part: uses local grad_cov (gc0..gc5) instead of global read ---
-        s = scales[tid] * scale_modifier
-        q = rotations[tid]
-
-        r = q[0]
-        xq = q[1]
-        yq = q[2]
-        zq = q[3]
-
-        r00 = 1.0 - 2.0 * (yq * yq + zq * zq)
-        r01 = 2.0 * (xq * yq + r * zq)
-        r02 = 2.0 * (xq * zq - r * yq)
-        r10 = 2.0 * (xq * yq - r * zq)
-        r11 = 1.0 - 2.0 * (xq * xq + zq * zq)
-        r12 = 2.0 * (yq * zq + r * xq)
-        r20 = 2.0 * (xq * zq + r * yq)
-        r21 = 2.0 * (yq * zq - r * xq)
-        r22 = 1.0 - 2.0 * (xq * xq + yq * yq)
-
-        m00 = s[0] * r00
-        m01 = s[0] * r01
-        m02 = s[0] * r02
-        m10 = s[1] * r10
-        m11 = s[1] * r11
-        m12 = s[1] * r12
-        m20 = s[2] * r20
-        m21 = s[2] * r21
-        m22 = s[2] * r22
-
-        sigma00 = gc0
-        sigma01 = 0.5 * gc1
-        sigma02 = 0.5 * gc2
-        sigma11 = gc3
-        sigma12 = 0.5 * gc4
-        sigma22 = gc5
-
-        dM00 = 2.0 * (m00 * sigma00 + m01 * sigma01 + m02 * sigma02)
-        dM01 = 2.0 * (m00 * sigma01 + m01 * sigma11 + m02 * sigma12)
-        dM02 = 2.0 * (m00 * sigma02 + m01 * sigma12 + m02 * sigma22)
-        dM10 = 2.0 * (m10 * sigma00 + m11 * sigma01 + m12 * sigma02)
-        dM11 = 2.0 * (m10 * sigma01 + m11 * sigma11 + m12 * sigma12)
-        dM12 = 2.0 * (m10 * sigma02 + m11 * sigma12 + m12 * sigma22)
-        dM20 = 2.0 * (m20 * sigma00 + m21 * sigma01 + m22 * sigma02)
-        dM21 = 2.0 * (m20 * sigma01 + m21 * sigma11 + m22 * sigma12)
-        dM22 = 2.0 * (m20 * sigma02 + m21 * sigma12 + m22 * sigma22)
-
-        grad_scales_out[tid] = wp.vec3(
-            scale_modifier * (dM00 * r00 + dM01 * r01 + dM02 * r02),
-            scale_modifier * (dM10 * r10 + dM11 * r11 + dM12 * r12),
-            scale_modifier * (dM20 * r20 + dM21 * r21 + dM22 * r22),
-        )
-
-        dR00 = dM00 * s[0]
-        dR01 = dM01 * s[0]
-        dR02 = dM02 * s[0]
-        dR10 = dM10 * s[1]
-        dR11 = dM11 * s[1]
-        dR12 = dM12 * s[1]
-        dR20 = dM20 * s[2]
-        dR21 = dM21 * s[2]
-        dR22 = dM22 * s[2]
-
-        grad_rotations_out[tid] = wp.vec4(
-            2.0 * zq * (dR01 - dR10) + 2.0 * yq * (dR20 - dR02) + 2.0 * xq * (dR12 - dR21),
-            2.0 * yq * (dR10 + dR01) + 2.0 * zq * (dR20 + dR02) + 2.0 * r * (dR12 - dR21) - 4.0 * xq * (dR22 + dR11),
-            2.0 * xq * (dR10 + dR01) + 2.0 * r * (dR20 - dR02) + 2.0 * zq * (dR12 + dR21) - 4.0 * yq * (dR22 + dR00),
-            2.0 * r * (dR01 - dR10) + 2.0 * xq * (dR20 + dR02) + 2.0 * yq * (dR12 + dR21) - 4.0 * zq * (dR11 + dR00),
-        )
-
     # ---- C3: Fused backward accumulation (replaces 3 torch.add + 1 slice-assign + 2 torch.zeros) ----
     @wp.kernel
     def _fused_backward_accumulate_warp_kernel(
@@ -3774,6 +3571,9 @@ def _build_binning_state(
             point_depth_keys.copy_(depths.view(torch.int32))
             sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
             point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(point_depth_key_buffer, point_id_buffer, point_count)
+            # Clone to avoid aliasing: step 2 reuses the same i32 cache buffers
+            # for tile-point duplicate sorting, which would overwrite sorted_point_ids.
+            sorted_point_ids = sorted_point_ids.clone()
 
             sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
@@ -3797,7 +3597,9 @@ def _build_binning_state(
             return state
 
         ranges_warp = None
-        ranges = torch.zeros((tile_count, 2), dtype=torch.int32, device=device)
+        # Allocate one extra row: sentinel tile_id (== tile_count) written by
+        # _duplicate_with_keys* kernels would cause OOB in _identify_tile_ranges*.
+        ranges = torch.zeros((tile_count + 1, 2), dtype=torch.int32, device=device)
 
         point_list_keys = _allocate_scalar_tensor((0,), torch.int64, device)
 
@@ -3952,7 +3754,7 @@ def _build_binning_state(
             "point_offsets": point_offsets,
             "point_list": point_list,
             "point_list_keys": point_list_keys,
-            "ranges": ranges,
+            "ranges": ranges[:tile_count],
             "num_rendered": int(point_list.numel()),
             "requested_sort_mode": requested_sort_mode,
             "selected_sort_mode": sort_mode,

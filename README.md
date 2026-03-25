@@ -360,11 +360,14 @@ con_x = conic_x[g_idx]
 
 **CUDA baseline** uses a single CUB `DeviceRadixSort` pass with a packed 64-bit key (`(tile_id << 32) | depth_bits`).
 
-**Warp backend** default mode (`warp_depth_stable_tile`) uses two sorts:
-1. First pass: sort by depth (Warp radix sort)
-2. Second pass: stable sort by tile ID (Warp radix sort)
+**Warp backend** provides four sort modes. They share the same **preprocess / render / backward-render** kernels, and differ only in **how the binning stage builds and sorts `(tile, point)` pairs**:
 
-This leads to different Gaussian ordering within each tile compared with the CUDA baseline, which in turn changes the floating-point accumulation order during alpha blending. Because floating-point arithmetic is non-associative, the pixel-level outputs differ slightly.
+- `warp_radix`: directly duplicates packed 64-bit `(tile_id, depth_bits)` keys inside Warp and runs a **single Warp radix sort**. This is the shortest path and uses the lightest scratch, but its tie-break behavior is not fully identical to CUDA/CUB.
+- `warp_depth_stable_tile`: first sorts points by depth with a **Warp i32 radix sort**, then duplicates `(tile_id, point_id)` in that depth order, and finally performs a **stable Warp radix sort by tile id**, preserving depth order inside each tile.
+- `torch`: first generates `tile_id / point_id` in Warp, then performs a **stable PyTorch argsort**. When `num_rendered <= TORCH_SINGLE_SORT_THRESHOLD`, it uses a single packed-key sort; above that threshold, it falls back to a two-stage stable sort (`depth`, then `tile`).
+- `torch_count`: also generates `tile_id / point_id` in Warp, but first stable-sorts by depth and then sorts by `tile_id` in PyTorch; when the tile count is small, it can take an `int16` fast path to reduce the key width of the second sort.
+
+In other words, the four Warp paths do not disagree on whether preprocess / render are mathematically correct. They differ in **the order in which the same Gaussians are fed into each tile**. That changes the floating-point accumulation order during alpha blending and backward `atomic_add`, which is why the remaining differences appear as sparse numeric residuals instead of large systematic errors.
 
 ### 4. Culling Parameters
 
@@ -399,49 +402,66 @@ The test configuration is as follows:
 
 - `mode = sh_scale_rotation`
 - `backward_mode="manual"`
-- `binning_sort_mode="warp_depth_stable_tile"`
+- `binning_sort_mode ∈ {"warp_radix", "torch", "warp_depth_stable_tile", "torch_count"}` (explicitly set per run)
 - `auto_tune=True`
-- `auto_tune_verbose=True`)
+- `auto_tune_verbose=True`
 - test scales: **4,096 / 16,384 / 65,536 / 262,144** particles
+- evaluation entry: `tests/evaluate_warp_backend_sort_modes.py --warp-backend-module-path diff_gaussian_rasterization/release.py`
 
-Correctness is still best analyzed in three layers: preprocess diagnostics, final rendered outputs, and backward gradients. Forward outputs still match exactly at the checked tolerance, the preprocess diagnostics also remain aligned, and the backward side still contains a small number of sparse outliers without showing a broader spread.
+Across the full 4-sort-mode sweep, the preprocess diagnostics stay aligned and the final forward outputs remain exact at the checked tolerance for all 16 combinations. The only remaining differences are sparse backward outliers, and their pattern depends on both the point count and the chosen sort backend.
 
-### Preprocess Diagnostics
+### How the four `release.py` sort backends work
 
-Across the current four test scales, the active set and the key preprocess tensors (`radii`, `proj_2D`, `conic_2D`, `conic_2D_inv`) all align.
+All four modes share the exact same **preprocess / render / backward-render** kernels. The only thing that changes is **how the binning stage builds and sorts `(tile, point)` pairs**:
 
-| Points | Native active | Warp active | Shared active | Shared `proj_2D` max-diff | Shared `conic_2D` max-diff | Shared `conic_2D_inv` max-diff |
-|------|---------------|-------------|---------------|---------------------------|----------------------------|---------------------------------|
-| 4,096 | 3,530 | 3,530 | 3,530 | 0.0 | 0.0 | 0.0 |
-| 16,384 | 14,204 | 14,204 | 14,204 | 0.0 | 0.0 | 0.0 |
-| 65,536 | 56,804 | 56,804 | 56,804 | 0.0 | 0.0 | 0.0 |
-| 262,144 | 227,220 | 227,220 | 227,220 | 0.0 | 0.0 | 0.0 |
+- `warp_radix`: duplicates packed 64-bit keys of the form `(tile_id, depth_bits)` inside Warp and runs a **single Warp radix sort**. This is the leanest path, but its tie-break behavior is not identical to CUDA/CUB.
+- `warp_depth_stable_tile`: first does a **Warp i32 radix sort by depth**, then duplicates `(tile_id, point_id)` in that depth order, and finally performs a **stable Warp radix sort by tile id**, preserving depth order inside each tile.
+- `torch`: generates `tile_id / point_id` in Warp and then switches to **stable PyTorch argsort**. Below `TORCH_SINGLE_SORT_THRESHOLD`, it uses one packed-key stable sort; above that threshold, it falls back to a two-pass stable sort (`depth`, then `tile`).
+- `torch_count`: also generates `tile_id / point_id` in Warp, but explicitly stable-sorts by depth first and then sorts by `tile_id` in PyTorch; when the tile count is small, it takes an `int16` fast path for the second sort.
 
-### Final Forward Pass (primary rendered outputs)
+So the four backends do **not** disagree on the preprocess math or the rendering formula. They only disagree on **the order in which the same Gaussians are fed into each tile**, which is why the remaining differences show up only in sparse backward outliers.
 
-| Points | Resolution | `color` max-diff | `depth` max-diff | `alpha` max-diff |
-|------|--------|--------------------|--------------------|--------------------|
-| 4,096 | 128×128 | 0.0 | 0.0 | 0.0 |
-| 16,384 | 128×128 | 0.0 | 0.0 | 0.0 |
-| 65,536 | 256×256 | 0.0 | 0.0 | 0.0 |
-| 262,144 | 384×384 | 0.0 | 0.0 | 0.0 |
+### `release.py` sort-mode sweep
 
-Across all four scales, the public forward outputs are exactly aligned within the checked tolerance.
+> In this experiment each run explicitly forces `binning_sort_mode`, so the requested mode and the actually executed mode would be redundant in the README tables.
 
-### Backward Pass (key gradients on the training path)
+<table>
+    <thead>
+        <tr>
+            <th>Points</th>
+            <th>Sort mode</th>
+            <th>Preprocess</th>
+            <th>Backward out-of-threshold coverage</th>
+            <th>Backward max-diff</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="4"><strong>4,096</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.037109</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td><strong>0.011719</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.039062</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>opacity</code>: 1 / 4,096 (0.024414%)</td><td>0.048828</td></tr>
+        <tr><td rowspan="4"><strong>16,384</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.014648</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.015625</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td>clean</td><td><strong>0.010742</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td>0.011230</td></tr>
+        <tr><td rowspan="4"><strong>65,536</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.375000</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>scales</code>: 2 / 196,608 (0.001017%)<br><code>rotations</code>: 4 / 262,144 (0.001526%)</td><td><strong>0.171875</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.343750</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 6 / 196,608 (0.003052%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 13 / 3,145,728 (0.000413%)<br><code>rotations</code>: 3 / 262,144 (0.001144%)</td><td>0.218750</td></tr>
+        <tr><td rowspan="4"><strong>262,144</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 6 / 786,432 (0.000763%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 49 / 12,582,912 (0.000389%)<br><code>scales</code>: 5 / 786,432 (0.000636%)<br><code>rotations</code>: 5 / 1,048,576 (0.000477%)</td><td>0.578125</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 786,432 (0.000381%)<br><code>means2D</code>: 2 / 786,432 (0.000254%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 7 / 12,582,912 (0.000056%)<br><code>scales</code>: 3 / 786,432 (0.000381%)<br><code>rotations</code>: 4 / 1,048,576 (0.000381%)</td><td><strong>0.156250</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 9 / 786,432 (0.001144%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 79 / 12,582,912 (0.000628%)<br><code>scales</code>: 6 / 786,432 (0.000763%)<br><code>rotations</code>: 9 / 1,048,576 (0.000858%)</td><td>0.429688</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 7 / 786,432 (0.000890%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 70 / 12,582,912 (0.000556%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.734375</td></tr>
+    </tbody>
+</table>
 
-| Points | Gradient fields above threshold | `grad_means3D` mismatches / max-diff | `grad_shs` mismatches / max-diff | Other sparse fields |
-|------|-------------------------------|--------------------------------------|----------------------------------|---------------------|
-| 4,096 | `means3D` | 1 / 4.30e-2 | 0 / 2.44e-3 | none |
-| 16,384 | none | 0 / 2.93e-3 | 0 / 1.95e-3 | none |
-| 65,536 | `means3D`, `opacity`, `shs`, `rotations` | 3 / 5.47e-2 | 2 / 6.35e-3 | `opacity`: 2 / 9.38e-2; `rotations`: 1 / 1.17e-2 |
-| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 6 / 3.44e-1 | 46 / 5.47e-2 | `means2D`: 4 / 8.30e-3; `opacity`: 2 / 7.03e-2; `scales`: 3 / 5.31e-1; `rotations`: 4 / 9.28e-2 |
+Attribution:
 
-Conclusion:
-
-- The preprocess active-set divergence still does not appear, and the preprocess diagnostics line up across all four scales.
-- The backward result at 16K is fully back within threshold, while 4K / 65K / 262K still retain a small number of above-threshold outliers with low coverage.
-- The main residual risk at the moment is still a handful of isolated backward outliers rather than any systematic forward or preprocess deviation.
+- All four modes keep preprocess tensors aligned and preserve exact forward outputs at the checked tolerance, so the remaining issue is **not** a preprocess or render-path bug.
+- The out-of-threshold backward coverage stays extremely small: the worst 4K case is only **1 / 4,096 = 0.024414%**, and most large-scale fields drop into the **$10^{-3}\%$ to $10^{-4}\%$** range.
+- The residuals track the sort path, which strongly suggests a **binning-order effect**: once the tile-local traversal order changes, alpha compositing and backward `atomic_add` accumulate floating-point terms in a different order, producing a few sparse gradient spikes.
+- `warp_radix` also keeps `WARP_RADIX_DETERMINISTIC_TIEBREAK = False`, so equal-key tie breaks are more likely to differ from the CUDA/CUB reference; `warp_depth_stable_tile` and `torch_count` add extra reorder steps that can also perturb a few boundary samples.
+- Empirically, `torch` gives the smallest residuals at 65K and 262K, suggesting that its stable-sort path stays closer to the CUDA baseline traversal order at large scale — but that is an observed trend, not a different preprocessing formula.
 
 ---
 
@@ -451,51 +471,92 @@ The following data also comes from the **current code state**. The test platform
 
 Methodology:
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the main table reports the mean over the measured runs.
+- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the table below reports both the native **CUDA baseline** and the four explicit Warp sort backends.
 - **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
-- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; these stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
+- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; therefore **binning-stage runtime / internal binning scratch** are only available for the Warp backend and are shown as `—` for the CUDA baseline. These stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
 
-For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively.
+For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively, for each sort mode.
 
-### Public API Steady-State Runtime
+### CUDA baseline + `release.py` sort-mode sweep
 
-| Points | Resolution | `num_rendered` | Native FW | Warp FW | FW ratio | Native BW | Warp BW | BW ratio |
-|------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
-| 4,096 | 128×128 | 121,691 | 3.019 ms | 2.614 ms | **0.87×** | 2.954 ms | 2.615 ms | **0.89×** |
-| 16,384 | 128×128 | 493,767 | 2.410 ms | 2.916 ms | 1.21× | 3.069 ms | 2.971 ms | **0.97×** |
-| 65,536 | 256×256 | 7,497,291 | 6.925 ms | 7.176 ms | 1.04× | 2.031 ms | 2.155 ms | 1.06× |
-| 262,144 | 384×384 | 65,904,035 | 60.030 ms | 57.033 ms | **0.95×** | 6.084 ms | 7.175 ms | 1.18× |
+<table>
+    <thead>
+        <tr>
+            <th>Points</th>
+            <th>Backend / sort mode</th>
+            <th>Warp FW</th>
+            <th>Warp BW</th>
+            <th>Binning stage</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>7.416 ms</td><td>8.270 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>7.020 ms</td><td>8.474 ms</td><td>2.256 ms</td></tr>
+        <tr><td><code>torch</code></td><td>4.178 ms</td><td>5.650 ms</td><td>3.967 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.533 ms</td><td>4.199 ms</td><td><strong>1.343 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>2.441 ms</strong></td><td><strong>3.162 ms</strong></td><td>6.255 ms</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.196 ms</td><td>2.638 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>3.748 ms</td><td><strong>1.811 ms</strong></td><td><strong>1.748 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.110 ms</td><td>2.325 ms</td><td>6.178 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.771 ms</td><td>2.292 ms</td><td>2.024 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>3.049 ms</strong></td><td>2.775 ms</td><td>2.691 ms</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>20.214 ms</td><td>5.024 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>20.506 ms</td><td>4.998 ms</td><td>22.415 ms</td></tr>
+        <tr><td><code>torch</code></td><td>21.709 ms</td><td>3.781 ms</td><td>34.787 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>19.999 ms</strong></td><td>5.035 ms</td><td><strong>13.537 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>22.914 ms</td><td><strong>3.532 ms</strong></td><td>34.513 ms</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>183.858 ms</td><td><strong>9.276 ms</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>183.562 ms</strong></td><td>10.957 ms</td><td>171.128 ms</td></tr>
+        <tr><td><code>torch</code></td><td>189.218 ms</td><td><strong>10.266 ms</strong></td><td>975.769 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>186.276 ms</td><td>10.895 ms</td><td><strong>110.787 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>316.262 ms</td><td>36.428 ms</td><td>1195.816 ms</td></tr>
+    </tbody>
+</table>
 
-### Public API Peak Memory by Stage
+### Public API peak memory + internal binning scratch
 
-| Points | Resolution | Native FW peak increment | Native BW peak increment | Warp FW peak increment | Warp BW peak increment |
-|------|--------|------------------|------------------|-------------------|-------------------|
-| 4,096 | 128×128 | 1.57 MiB | 4.41 MiB | 1.57 MiB | 4.42 MiB |
-| 16,384 | 128×128 | 5.18 MiB | 17.63 MiB | 5.18 MiB | 17.69 MiB |
-| 65,536 | 256×256 | 41.79 MiB | 70.57 MiB | 41.79 MiB | 70.82 MiB |
-| 262,144 | 384×384 | 303.13 MiB | 283.00 MiB | 303.13 MiB | 284.00 MiB |
+<table>
+    <thead>
+        <tr>
+            <th>Points</th>
+            <th>Backend / sort mode</th>
+            <th>Warp FW peak</th>
+            <th>Warp BW peak</th>
+            <th>Internal binning peak</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td><strong>1.57 MiB</strong></td><td><strong>4.41 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>4.69 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>0.02 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>5.34 MiB</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td><strong>5.18 MiB</strong></td><td><strong>17.63 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>18.98 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>0.06 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>22.13 MiB</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td><strong>41.79 MiB</strong></td><td><strong>70.57 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>348.00 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>0.25 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>330.50 MiB</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td><strong>302.13 MiB</strong></td><td><strong>282.00 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>303.13 MiB</td><td>284.00 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>3038.64 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>1.00 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>302.13 MiB</strong></td><td>284.32 MiB</td><td>2891.15 MiB</td></tr>
+    </tbody>
+</table>
 
-Public API peak memory remains effectively at parity with native CUDA. Even at 262K, the stage-wise differences still stay within roughly **1 MiB**.
+From the public-API perspective, CUDA and all four Warp sort modes still sit in roughly the same forward peak-memory range, while CUDA remains consistently lower on backward peak memory. The real spread is still the **diagnostic internal binning scratch**: `warp_radix` and `warp_depth_stable_tile` remain tiny, whereas `torch` / `torch_count` grow sharply at 65K and 262K.
 
-### Internal Stage Hotspots
+Looking jointly at the CUDA baseline and the four Warp sort modes, four observations stand out:
 
-| Points | Resolution | Preprocess | Binning | Render | Backward Render | Selected Sort Mode |
-|------|--------|--------|------|------|----------|--------------|
-| 4,096 | 128×128 | 0.905 ms | 1.060 ms | 0.324 ms | 0.611 ms | `warp_depth_stable_tile` |
-| 16,384 | 128×128 | 0.824 ms | 1.037 ms | 0.326 ms | 0.684 ms | `warp_depth_stable_tile` |
-| 65,536 | 256×256 | 0.972 ms | 5.211 ms | 0.387 ms | 6.111 ms | `warp_depth_stable_tile` |
-| 262,144 | 384×384 | 1.487 ms | 53.816 ms | 0.556 ms | 2.082 ms | `warp_depth_stable_tile` |
-
-### Internal Stage Peak Memory (diagnostic only)
-
-| Points | Resolution | Preprocess peak increment | Binning peak increment | Render peak increment | Backward Render peak increment |
-|------|--------|----------------|--------------|--------------|------------------|
-| 4,096 | 128×128 | 0.53 MiB | 0.00 MiB | 0.38 MiB | 0.16 MiB |
-| 16,384 | 128×128 | 2.12 MiB | 0.00 MiB | 0.38 MiB | 0.62 MiB |
-| 65,536 | 256×256 | 8.50 MiB | 0.00 MiB | 1.50 MiB | 2.50 MiB |
-| 262,144 | 384×384 | 34.00 MiB | 0.00 MiB | 3.38 MiB | 10.00 MiB |
-
-Looking at the internal stages, binning is still the main hotspot, but **binning adds almost no new peak allocation**; the allocator peak is mainly moved by preprocess and backward-render-related work.
+- **Tiny 4K case**: among the four Warp sort modes, `torch_count` is the fastest end-to-end, and in this run both its forward and backward times are clearly below the measured CUDA baseline; however, it also pays the heaviest internal binning scratch cost.
+- **Mid-scale 16K**: `torch_count` still gives the shortest forward pass, while `warp_radix` takes the shortest backward pass and the lightest binning stage; meanwhile, CUDA already matches Warp on forward peak memory and remains lower on backward peak memory.
+- **Large 65K / 262K workloads**: `warp_depth_stable_tile` still keeps the most stable Warp-side binning cost, while the **fastest 262K end-to-end backward time is the CUDA baseline** (9.276 ms), which means the current Warp implementation does not yet dominate the native backend on every large-scale path.
+- **Default-mode choice**: `warp_depth_stable_tile` is still kept as the default not because it is absolutely best on every metric, but because within the four Warp modes it offers the most balanced combination of binning performance, near-zero scratch memory, and relatively small correctness residuals.
 
 ---
 

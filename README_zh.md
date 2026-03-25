@@ -360,11 +360,15 @@ con_x = conic_x[g_idx]
 
 **CUDA 基线**使用单次 CUB `DeviceRadixSort`，键为 64 位打包格式（`(tile_id << 32) | depth_bits`）。
 
-**Warp 后端**默认模式（`warp_depth_stable_tile`）使用两次排序：
-1. 第一次：按深度排序（Warp 基数排序）
-2. 第二次：按瓦片 ID 稳定排序（Warp 基数排序）
+**Warp 后端**共有四种排序模式，共用同一套 **preprocess / render / backward-render** 内核，区别只在 **binning 阶段如何构造与排序 `(tile, point)` 对**：
 
-这导致每个瓦片内的高斯排序与 CUDA 基线不同，进而在 alpha 混合期间产生不同的浮点累积顺序。由于浮点运算的非结合性，像素级输出会有微小差异。
+- `warp_radix`：先在 Warp 内核里直接复制出 `(tile_id, depth_bits)` 的 64 位 packed key，再走 **单次 Warp radix sort**。路径最短、scratch 最轻，但 tie-break 与 CUDA/CUB 不完全一致；
+- `warp_depth_stable_tile`：先把点按深度做一次 **Warp i32 radix sort**，再按这个深度顺序复制 `(tile_id, point_id)`，最后只对 `tile_id` 做一次 **稳定的 Warp radix sort**，从而保留“tile 内深度顺序”；
+- `torch`：先用 Warp 内核生成 `tile_id / point_id`，再在 PyTorch 侧做 **stable argsort**。当 `num_rendered <= TORCH_SINGLE_SORT_THRESHOLD` 时走单次 packed-key 排序；超过阈值后退化成“先深度、后 tile”的两段 stable sort；
+- `torch_count`：同样先由 Warp 生成 `tile_id / point_id`，但会先按深度 stable sort，再按 `tile_id` 做第二次 PyTorch 排序；当 tile 数较小时还会走 `int16` 快路径，以减少第二次排序的键宽。
+
+换句话说，四条路径的差别不是“有没有算对 preprocess / render”，而是 **binning 阶段把同一批高斯以什么顺序送进每个 tile**。这导致每个瓦片内的高斯排序与 CUDA 基线不同，进而在 alpha 混合期间产生不同的浮点累积顺序。由于浮点运算的非结合性，像素级输出会有微小差异。
+
 
 ### 4. 剔除参数
 
@@ -397,49 +401,55 @@ wp.launch(kernel, dim=image_height * image_width, ...)
 
 - `mode = sh_scale_rotation`
 - `backward_mode="manual"`
-- `binning_sort_mode="warp_depth_stable_tile"`
+- `binning_sort_mode ∈ {"warp_radix", "torch", "warp_depth_stable_tile", "torch_count"}`（每次运行显式指定）
 - `auto_tune=True`
-- `auto_tune_verbose=True`）
+- `auto_tune_verbose=True`
 - 测试规模：**4,096 / 16,384 / 65,536 / 262,144** 个粒子
 
-这里仍然把正确性拆成三层来看：preprocess 诊断项、最终渲染输出、backward 梯度。前向输出在检查阈值内完全一致，preprocess 诊断项保持对齐；backward 侧仍然能看到少量稀疏离群点，但整体分布没有出现新的扩散。
+这次四种排序模式的全量扫描里，16 组组合的 preprocess 诊断项都保持对齐，最终 forward 输出也都在检查阈值内精确一致。剩余差异仍然只出现在稀疏的 backward outlier 上，而且它会随着粒子规模和排序后端而变化。
 
-### Preprocess 诊断项
 
-当前四个测试规模下，active set 与关键 preprocess 张量（`radii`、`proj_2D`、`conic_2D`、`conic_2D_inv`）全部对齐。
+### 四排序模式正确性汇总
 
-| 点数 | Native 激活数 | Warp 激活数 | 共享激活数 | shared `proj_2D` 最大误差 | shared `conic_2D` 最大误差 | shared `conic_2D_inv` 最大误差 |
-|------|---------------|-------------|------------|---------------------------|----------------------------|---------------------------------|
-| 4,096 | 3,530 | 3,530 | 3,530 | 0.0 | 0.0 | 0.0 |
-| 16,384 | 14,204 | 14,204 | 14,204 | 0.0 | 0.0 | 0.0 |
-| 65,536 | 56,804 | 56,804 | 56,804 | 0.0 | 0.0 | 0.0 |
-| 262,144 | 227,220 | 227,220 | 227,220 | 0.0 | 0.0 | 0.0 |
+> 这组实验里每次都显式指定 `binning_sort_mode`，因此“请求模式”和“实际执行模式”在文档表格里不再重复列出。
 
-### 最终前向传播（主要渲染输出）
+<table>
+    <thead>
+        <tr>
+            <th>点数</th>
+            <th>排序模式</th>
+            <th>Preprocess</th>
+            <th>Backward 超阈值占比</th>
+            <th>Backward 最大误差</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="4"><strong>4,096</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.037109</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td><strong>0.011719</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.039062</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>opacity</code>: 1 / 4,096 (0.024414%)</td><td>0.048828</td></tr>
+        <tr><td rowspan="4"><strong>16,384</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.014648</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.015625</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td>clean</td><td><strong>0.010742</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td>0.011230</td></tr>
+        <tr><td rowspan="4"><strong>65,536</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.375000</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>scales</code>: 2 / 196,608 (0.001017%)<br><code>rotations</code>: 4 / 262,144 (0.001526%)</td><td><strong>0.171875</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.343750</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 6 / 196,608 (0.003052%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 13 / 3,145,728 (0.000413%)<br><code>rotations</code>: 3 / 262,144 (0.001144%)</td><td>0.218750</td></tr>
+        <tr><td rowspan="4"><strong>262,144</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 6 / 786,432 (0.000763%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 49 / 12,582,912 (0.000389%)<br><code>scales</code>: 5 / 786,432 (0.000636%)<br><code>rotations</code>: 5 / 1,048,576 (0.000477%)</td><td>0.578125</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 786,432 (0.000381%)<br><code>means2D</code>: 2 / 786,432 (0.000254%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 7 / 12,582,912 (0.000056%)<br><code>scales</code>: 3 / 786,432 (0.000381%)<br><code>rotations</code>: 4 / 1,048,576 (0.000381%)</td><td><strong>0.156250</strong></td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 9 / 786,432 (0.001144%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 79 / 12,582,912 (0.000628%)<br><code>scales</code>: 6 / 786,432 (0.000763%)<br><code>rotations</code>: 9 / 1,048,576 (0.000858%)</td><td>0.429688</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 7 / 786,432 (0.000890%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 70 / 12,582,912 (0.000556%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.734375</td></tr>
+    </tbody>
+</table>
 
-| 点数 | 分辨率 | `color` 最大误差 | `depth` 最大误差 | `alpha` 最大误差 |
-|------|--------|------------------|------------------|------------------|
-| 4,096 | 128×128 | 0.0 | 0.0 | 0.0 |
-| 16,384 | 128×128 | 0.0 | 0.0 | 0.0 |
-| 65,536 | 256×256 | 0.0 | 0.0 | 0.0 |
-| 262,144 | 384×384 | 0.0 | 0.0 | 0.0 |
+结论与归因：
 
-四个规模下，公共前向输出在检查阈值内全部精确一致。
-
-### 反向传播（训练路径关键梯度）
-
-| 点数 | 超阈值梯度字段 | `grad_means3D` 不匹配个数 / 最大误差 | `grad_shs` 不匹配个数 / 最大误差 | 其他稀疏字段 |
-|------|----------------|--------------------------------------|----------------------------------|--------------|
-| 4,096 | `means3D` | 1 / 4.30e-2 | 0 / 2.44e-3 | 无 |
-| 16,384 | 无 | 0 / 2.93e-3 | 0 / 1.95e-3 | 无 |
-| 65,536 | `means3D`, `opacity`, `shs`, `rotations` | 3 / 5.47e-2 | 2 / 6.35e-3 | `opacity`: 2 / 9.38e-2；`rotations`: 1 / 1.17e-2 |
-| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 6 / 3.44e-1 | 46 / 5.47e-2 | `means2D`: 4 / 8.30e-3；`opacity`: 2 / 7.03e-2；`scales`: 3 / 5.31e-1；`rotations`: 4 / 9.28e-2 |
-
-结论：
-
-- preprocess active-set 分叉没有出现，四个规模下的 preprocess 诊断项全部对齐；
-- 16K 的 backward 结果已经完全落回阈值内，4K / 65K / 262K 仍有少量超阈值离群点，但覆盖率都不高；
-- 当前主要 residual 风险仍然是少量孤立的 backward outlier，而不是系统性的前向或 preprocess 偏差。
+- 四种排序模式都没有引入 preprocess 张量对不齐的问题，forward 输出也在阈值内完全一致，这说明问题 **不在 preprocess / render 主链路**；
+- backward 的超阈值覆盖率始终非常低：4K 最坏也只有 **1 / 4,096 = 0.024414%**，到 65K / 262K 时单字段通常已经降到 **$10^{-3}\%$ 到 $10^{-4}\%$** 量级，属于极稀疏 outlier；
+- 残差与排序路径强相关，说明它主要来自 **binning 改变了 tile 内遍历顺序**：一旦高斯进入每个 tile 的先后顺序变化，alpha 混合和 backward `atomic_add` 的浮点累积顺序也会变化，进而放大为少量离散梯度尖峰；
+- `warp_radix` 还显式关闭了 `WARP_RADIX_DETERMINISTIC_TIEBREAK`，因此相同 key 的 tie-break 更容易与 CUDA/CUB 参考实现不同；`warp_depth_stable_tile` 与 `torch_count` 的两阶段重排也会额外改变边界样本的相对次序；
+- 从结果上看，`torch` 在 65K 和 262K 时残差最小，说明它的 stable sort 路径在大规模下更接近 CUDA 基线的最终遍历顺序；但这是一种**经验性现象**，不是 preprocess 或公式层面的更改。
 
 ---
 
@@ -449,51 +459,92 @@ wp.launch(kernel, dim=image_height * image_width, ...)
 
 测试方法：
 
-- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）先做单独预热，再用 CUDA event 对正式采样段做批量计时，主表展示正式采样的平均值。
+- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）先做单独预热，再用 CUDA event 对正式采样段做批量计时；下表同时展示原生 **CUDA 基线** 与四种显式 Warp 排序后端的平均值。
 - **显存占用**：先预热，再分别测一次 forward 阶段和 backward 阶段，记录 CUDA 分配器的峰值增量（`peak_allocated_delta_mib`）。
-- **阶段计时 / 阶段显存**：仅为分析热点，使用内部 `_warp_backend` 辅助函数做诊断性测量；这些阶段数据**不保证**与公共 API 的端到端时间或峰值显存逐项严格相加一致。
+- **阶段计时 / 阶段显存**：仅为分析热点，使用内部 `_warp_backend` 辅助函数做诊断性测量；因此 **binning 阶段耗时 / 内部 binning scratch** 只对 Warp 后端可用，CUDA 基线在表中记为 `—`。这些阶段数据**不保证**与公共 API 的端到端时间或峰值显存逐项严格相加一致。
 
-其中 4K / 16K / 65K / 262K 四档规模分别采用 **12+24 / 10+20 / 6+12 / 4+8**（预热次数 + 正式采样次数）的配置。
+其中 4K / 16K / 65K / 262K 四档规模分别采用 **12+24 / 10+20 / 6+12 / 4+8**（预热次数 + 正式采样次数）的配置，并对每种排序模式分别执行。
 
-### 公共 API 稳态耗时
+### CUDA 基线 + 四排序模式性能汇总
 
-| 点数 | 分辨率 | `num_rendered` | 原生前向 | Warp 前向 | 前向比值 | 原生反向 | Warp 反向 | 反向比值 |
-|------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
-| 4,096 | 128×128 | 121,691 | 3.019 ms | 2.614 ms | **0.87×** | 2.954 ms | 2.615 ms | **0.89×** |
-| 16,384 | 128×128 | 493,767 | 2.410 ms | 2.916 ms | 1.21× | 3.069 ms | 2.971 ms | **0.97×** |
-| 65,536 | 256×256 | 7,497,291 | 6.925 ms | 7.176 ms | 1.04× | 2.031 ms | 2.155 ms | 1.06× |
-| 262,144 | 384×384 | 65,904,035 | 60.030 ms | 57.033 ms | **0.95×** | 6.084 ms | 7.175 ms | 1.18× |
+<table>
+    <thead>
+        <tr>
+            <th>点数</th>
+            <th>后端 / 排序模式</th>
+            <th>Warp 前向</th>
+            <th>Warp 反向</th>
+            <th>Binning 阶段</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA 基线</strong></td><td>7.416 ms</td><td>8.270 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>7.020 ms</td><td>8.474 ms</td><td>2.256 ms</td></tr>
+        <tr><td><code>torch</code></td><td>4.178 ms</td><td>5.650 ms</td><td>3.967 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.533 ms</td><td>4.199 ms</td><td><strong>1.343 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>2.441 ms</strong></td><td><strong>3.162 ms</strong></td><td>6.255 ms</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA 基线</strong></td><td>3.196 ms</td><td>2.638 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>3.748 ms</td><td><strong>1.811 ms</strong></td><td><strong>1.748 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.110 ms</td><td>2.325 ms</td><td>6.178 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.771 ms</td><td>2.292 ms</td><td>2.024 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>3.049 ms</strong></td><td>2.775 ms</td><td>2.691 ms</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA 基线</strong></td><td>20.214 ms</td><td>5.024 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>20.506 ms</td><td>4.998 ms</td><td>22.415 ms</td></tr>
+        <tr><td><code>torch</code></td><td>21.709 ms</td><td>3.781 ms</td><td>34.787 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>19.999 ms</strong></td><td>5.035 ms</td><td><strong>13.537 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>22.914 ms</td><td><strong>3.532 ms</strong></td><td>34.513 ms</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA 基线</strong></td><td>183.858 ms</td><td><strong>9.276 ms</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>183.562 ms</strong></td><td>10.957 ms</td><td>171.128 ms</td></tr>
+        <tr><td><code>torch</code></td><td>189.218 ms</td><td><strong>10.266 ms</strong></td><td>975.769 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>186.276 ms</td><td>10.895 ms</td><td><strong>110.787 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>316.262 ms</td><td>36.428 ms</td><td>1195.816 ms</td></tr>
+    </tbody>
+</table>
 
-### 公共 API 分阶段峰值显存
+### 公共 API 峰值显存 + 内部 binning scratch
 
-| 点数 | 分辨率 | 原生前向峰值增量 | 原生反向峰值增量 | Warp 前向峰值增量 | Warp 反向峰值增量 |
-|------|--------|------------------|------------------|-------------------|-------------------|
-| 4,096 | 128×128 | 1.57 MiB | 4.41 MiB | 1.57 MiB | 4.42 MiB |
-| 16,384 | 128×128 | 5.18 MiB | 17.63 MiB | 5.18 MiB | 17.69 MiB |
-| 65,536 | 256×256 | 41.79 MiB | 70.57 MiB | 41.79 MiB | 70.82 MiB |
-| 262,144 | 384×384 | 303.13 MiB | 283.00 MiB | 303.13 MiB | 284.00 MiB |
+<table>
+    <thead>
+        <tr>
+            <th>点数</th>
+            <th>后端 / 排序模式</th>
+            <th>Warp 前向峰值</th>
+            <th>Warp 反向峰值</th>
+            <th>内部 binning 峰值</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA 基线</strong></td><td><strong>1.57 MiB</strong></td><td><strong>4.41 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>4.69 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>0.02 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>5.34 MiB</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA 基线</strong></td><td><strong>5.18 MiB</strong></td><td><strong>17.63 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>18.98 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>0.06 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>22.13 MiB</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA 基线</strong></td><td><strong>41.79 MiB</strong></td><td><strong>70.57 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>348.00 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>0.25 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>330.50 MiB</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA 基线</strong></td><td><strong>302.13 MiB</strong></td><td><strong>282.00 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>303.13 MiB</td><td>284.00 MiB</td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>3038.64 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>1.00 MiB</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>302.13 MiB</strong></td><td>284.32 MiB</td><td>2891.15 MiB</td></tr>
+    </tbody>
+</table>
 
-公共 API 峰值显存仍然和原生 CUDA 基本同量级。到 262K 时，前向 / 反向阶段峰值差距仍然控制在约 **1 MiB** 内。
+从公共 API 视角看，CUDA 基线与四种 Warp 排序模式在前向峰值显存上整体仍处在同一量级；反向峰值显存则是 CUDA 基线 consistently 更低一些。真正拉开差距的仍然是**内部 binning scratch**：`warp_radix` 和 `warp_depth_stable_tile` 很轻，而 `torch` / `torch_count` 会在 65K 与 262K 时迅速放大。
 
-### 内部阶段热点
+综合 CUDA 基线与四种 Warp 排序模式，可以总结出四条更准确的观察：
 
-| 点数 | 分辨率 | 预处理 | 分箱 | 渲染 | 反向渲染 | 选定排序模式 |
-|------|--------|--------|------|------|----------|--------------|
-| 4,096 | 128×128 | 0.905 ms | 1.060 ms | 0.324 ms | 0.611 ms | `warp_depth_stable_tile` |
-| 16,384 | 128×128 | 0.824 ms | 1.037 ms | 0.326 ms | 0.684 ms | `warp_depth_stable_tile` |
-| 65,536 | 256×256 | 0.972 ms | 5.211 ms | 0.387 ms | 6.111 ms | `warp_depth_stable_tile` |
-| 262,144 | 384×384 | 1.487 ms | 53.816 ms | 0.556 ms | 2.082 ms | `warp_depth_stable_tile` |
-
-### 内部阶段峰值显存（仅作诊断解释）
-
-| 点数 | 分辨率 | 预处理峰值增量 | 分箱峰值增量 | 渲染峰值增量 | 反向渲染峰值增量 |
-|------|--------|----------------|--------------|--------------|------------------|
-| 4,096 | 128×128 | 0.53 MiB | 0.00 MiB | 0.38 MiB | 0.16 MiB |
-| 16,384 | 128×128 | 2.12 MiB | 0.00 MiB | 0.38 MiB | 0.62 MiB |
-| 65,536 | 256×256 | 8.50 MiB | 0.00 MiB | 1.50 MiB | 2.50 MiB |
-| 262,144 | 384×384 | 34.00 MiB | 0.00 MiB | 3.38 MiB | 10.00 MiB |
-
-从内部阶段看，binning 依然是主要热点，但**binning 几乎不引入新的峰值分配**，真正推动分配器峰值的是 preprocess 和 backward render 相关工作；
+- **4K 小规模**：四种 Warp 排序模式里 `torch_count` 端到端最快，且前向 / 反向都明显快于这次测得的 CUDA 基线；但它的内部 binning scratch 也是四者里最重的；
+- **16K 中规模**：`torch_count` 仍给出最短前向，`warp_radix` 拿到最短反向和最轻 binning；不过这一档 CUDA 基线的前向峰值显存与 Warp 基本持平、反向峰值显存仍更低；
+- **65K / 262K 大规模**：`warp_depth_stable_tile` 继续保持最稳的 Warp 侧 binning 耗时，而 **262K 反向端到端最快的是 CUDA 基线**（9.276 ms），说明 Warp 当前仍未在所有大规模路径上全面超越原生实现；
+- **默认模式选择**：`warp_depth_stable_tile` 之所以仍被保留为默认值，不是因为它在所有指标上绝对最优，而是因为它在 Warp 四模式里提供了**最平衡的 binning 性能、极低 scratch 显存、以及较小的 correctness residual**。
 
 ---
 
