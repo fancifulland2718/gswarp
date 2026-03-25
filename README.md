@@ -471,9 +471,9 @@ The following data also comes from the **current code state**. The test platform
 
 Methodology:
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the table below reports both the native **CUDA baseline** and the four explicit Warp sort backends.
+- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched **CUDA-event** timing pass over the measured iterations; the `Public API FW / Public API BW / Total iteration` columns below all come from this path and are the right numbers for end-to-end comparisons.
 - **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
-- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; therefore **binning-stage runtime / internal binning scratch** are only available for the Warp backend and are shown as `—` for the CUDA baseline. These stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
+
 
 For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively, for each sort mode.
 
@@ -484,32 +484,33 @@ For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 
         <tr>
             <th>Points</th>
             <th>Backend / sort mode</th>
-            <th>Warp FW</th>
-            <th>Warp BW</th>
-            <th>Binning stage</th>
+            <th>Public API FW</th>
+            <th>Public API BW</th>
+            <th>Total iteration</th>
+            <th>Internal binning GPU time</th>
         </tr>
     </thead>
     <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>7.416 ms</td><td>8.270 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>7.020 ms</td><td>8.474 ms</td><td>2.256 ms</td></tr>
-        <tr><td><code>torch</code></td><td>4.178 ms</td><td>5.650 ms</td><td>3.967 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.533 ms</td><td>4.199 ms</td><td><strong>1.343 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>2.441 ms</strong></td><td><strong>3.162 ms</strong></td><td>6.255 ms</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.196 ms</td><td>2.638 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>3.748 ms</td><td><strong>1.811 ms</strong></td><td><strong>1.748 ms</strong></td></tr>
-        <tr><td><code>torch</code></td><td>3.110 ms</td><td>2.325 ms</td><td>6.178 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.771 ms</td><td>2.292 ms</td><td>2.024 ms</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>3.049 ms</strong></td><td>2.775 ms</td><td>2.691 ms</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>20.214 ms</td><td>5.024 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>20.506 ms</td><td>4.998 ms</td><td>22.415 ms</td></tr>
-        <tr><td><code>torch</code></td><td>21.709 ms</td><td>3.781 ms</td><td>34.787 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>19.999 ms</strong></td><td>5.035 ms</td><td><strong>13.537 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>22.914 ms</td><td><strong>3.532 ms</strong></td><td>34.513 ms</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>183.858 ms</td><td><strong>9.276 ms</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>183.562 ms</strong></td><td>10.957 ms</td><td>171.128 ms</td></tr>
-        <tr><td><code>torch</code></td><td>189.218 ms</td><td><strong>10.266 ms</strong></td><td>975.769 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>186.276 ms</td><td>10.895 ms</td><td><strong>110.787 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>316.262 ms</td><td>36.428 ms</td><td>1195.816 ms</td></tr>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>4.421 ms</td><td>3.082 ms</td><td>7.503 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>3.829 ms</td><td>2.850 ms</td><td>6.679 ms</td><td><strong>1.046 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.896 ms</td><td><strong>2.554 ms</strong></td><td>6.449 ms</td><td>2.559 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>3.034 ms</strong></td><td>3.119 ms</td><td>6.153 ms</td><td>1.066 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td>3.150 ms</td><td>2.989 ms</td><td><strong>6.139 ms</strong></td><td>2.504 ms</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.647 ms</td><td>2.865 ms</td><td>6.511 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>4.084 ms</td><td>3.811 ms</td><td>7.894 ms</td><td><strong>1.774 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.796 ms</td><td><strong>2.522 ms</strong></td><td><strong>6.319 ms</strong></td><td>2.649 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.351 ms</td><td>3.738 ms</td><td>7.089 ms</td><td>2.047 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>3.312 ms</strong></td><td>3.413 ms</td><td>6.725 ms</td><td>2.836 ms</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>11.788 ms</td><td>3.343 ms</td><td>15.131 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>11.391 ms</strong></td><td>3.043 ms</td><td><strong>14.433 ms</strong></td><td>14.769 ms</td></tr>
+        <tr><td><code>torch</code></td><td>13.141 ms</td><td>3.046 ms</td><td>16.187 ms</td><td>27.256 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>14.015 ms</td><td><strong>3.019 ms</strong></td><td>17.034 ms</td><td><strong>11.108 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>13.211 ms</td><td>3.196 ms</td><td>16.408 ms</td><td>29.091 ms</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>94.492 ms</td><td><strong>7.900 ms</strong></td><td>102.392 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>94.002 ms</strong></td><td>8.143 ms</td><td><strong>102.145 ms</strong></td><td>138.323 ms</td></tr>
+        <tr><td><code>torch</code></td><td>96.775 ms</td><td>7.922 ms</td><td>104.697 ms</td><td>571.229 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>100.043 ms</td><td>8.416 ms</td><td>108.459 ms</td><td><strong>85.941 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>261.481 ms</td><td>597.331 ms</td><td>858.813 ms</td><td>689.049 ms</td></tr>
     </tbody>
 </table>
 
@@ -551,12 +552,9 @@ For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 
 
 From the public-API perspective, CUDA and all four Warp sort modes still sit in roughly the same forward peak-memory range, while CUDA remains consistently lower on backward peak memory. The real spread is still the **diagnostic internal binning scratch**: `warp_radix` and `warp_depth_stable_tile` remain tiny, whereas `torch` / `torch_count` grow sharply at 65K and 262K.
 
-Looking jointly at the CUDA baseline and the four Warp sort modes, four observations stand out:
 
-- **Tiny 4K case**: among the four Warp sort modes, `torch_count` is the fastest end-to-end, and in this run both its forward and backward times are clearly below the measured CUDA baseline; however, it also pays the heaviest internal binning scratch cost.
-- **Mid-scale 16K**: `torch_count` still gives the shortest forward pass, while `warp_radix` takes the shortest backward pass and the lightest binning stage; meanwhile, CUDA already matches Warp on forward peak memory and remains lower on backward peak memory.
-- **Large 65K / 262K workloads**: `warp_depth_stable_tile` still keeps the most stable Warp-side binning cost, while the **fastest 262K end-to-end backward time is the CUDA baseline** (9.276 ms), which means the current Warp implementation does not yet dominate the native backend on every large-scale path.
-- **Default-mode choice**: `warp_depth_stable_tile` is still kept as the default not because it is absolutely best on every metric, but because within the four Warp modes it offers the most balanced combination of binning performance, near-zero scratch memory, and relatively small correctness residuals.
+
+`warp_depth_stable_tile` is still kept as the default not because it is absolutely best on every metric, but because within the four Warp modes it continues to offer the most balanced mix of internal binning GPU time, near-zero scratch memory, and relatively small correctness residuals; if you only optimize end-to-end throughput, the best choice already changes with scale.
 
 ---
 

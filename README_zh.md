@@ -459,9 +459,10 @@ wp.launch(kernel, dim=image_height * image_width, ...)
 
 测试方法：
 
-- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）先做单独预热，再用 CUDA event 对正式采样段做批量计时；下表同时展示原生 **CUDA 基线** 与四种显式 Warp 排序后端的平均值。
+- **稳态耗时**：使用公共 API（`diff_gaussian_rasterization.GaussianRasterizer` 与 `diff_gaussian_rasterization.warp.GaussianRasterizer`）先做单独预热，再用 **CUDA event** 对正式采样段做批量计时；下表中的“公共 API 前向 / 公共 API 反向 / 总迭代”都属于这一路径，因此适合做端到端性能比较。
 - **显存占用**：先预热，再分别测一次 forward 阶段和 backward 阶段，记录 CUDA 分配器的峰值增量（`peak_allocated_delta_mib`）。
-- **阶段计时 / 阶段显存**：仅为分析热点，使用内部 `_warp_backend` 辅助函数做诊断性测量；因此 **binning 阶段耗时 / 内部 binning scratch** 只对 Warp 后端可用，CUDA 基线在表中记为 `—`。这些阶段数据**不保证**与公共 API 的端到端时间或峰值显存逐项严格相加一致。
+
+
 
 其中 4K / 16K / 65K / 262K 四档规模分别采用 **12+24 / 10+20 / 6+12 / 4+8**（预热次数 + 正式采样次数）的配置，并对每种排序模式分别执行。
 
@@ -472,32 +473,33 @@ wp.launch(kernel, dim=image_height * image_width, ...)
         <tr>
             <th>点数</th>
             <th>后端 / 排序模式</th>
-            <th>Warp 前向</th>
-            <th>Warp 反向</th>
-            <th>Binning 阶段</th>
+            <th>公共 API 前向</th>
+            <th>公共 API 反向</th>
+            <th>总迭代</th>
+            <th>内部 binning GPU 时间</th>
         </tr>
     </thead>
     <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA 基线</strong></td><td>7.416 ms</td><td>8.270 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>7.020 ms</td><td>8.474 ms</td><td>2.256 ms</td></tr>
-        <tr><td><code>torch</code></td><td>4.178 ms</td><td>5.650 ms</td><td>3.967 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.533 ms</td><td>4.199 ms</td><td><strong>1.343 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>2.441 ms</strong></td><td><strong>3.162 ms</strong></td><td>6.255 ms</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA 基线</strong></td><td>3.196 ms</td><td>2.638 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>3.748 ms</td><td><strong>1.811 ms</strong></td><td><strong>1.748 ms</strong></td></tr>
-        <tr><td><code>torch</code></td><td>3.110 ms</td><td>2.325 ms</td><td>6.178 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.771 ms</td><td>2.292 ms</td><td>2.024 ms</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>3.049 ms</strong></td><td>2.775 ms</td><td>2.691 ms</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA 基线</strong></td><td>20.214 ms</td><td>5.024 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>20.506 ms</td><td>4.998 ms</td><td>22.415 ms</td></tr>
-        <tr><td><code>torch</code></td><td>21.709 ms</td><td>3.781 ms</td><td>34.787 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>19.999 ms</strong></td><td>5.035 ms</td><td><strong>13.537 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>22.914 ms</td><td><strong>3.532 ms</strong></td><td>34.513 ms</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA 基线</strong></td><td>183.858 ms</td><td><strong>9.276 ms</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>183.562 ms</strong></td><td>10.957 ms</td><td>171.128 ms</td></tr>
-        <tr><td><code>torch</code></td><td>189.218 ms</td><td><strong>10.266 ms</strong></td><td>975.769 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>186.276 ms</td><td>10.895 ms</td><td><strong>110.787 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>316.262 ms</td><td>36.428 ms</td><td>1195.816 ms</td></tr>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA 基线</strong></td><td>4.421 ms</td><td>3.082 ms</td><td>7.503 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>3.829 ms</td><td>2.850 ms</td><td>6.679 ms</td><td><strong>1.046 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.896 ms</td><td><strong>2.554 ms</strong></td><td>6.449 ms</td><td>2.559 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>3.034 ms</strong></td><td>3.119 ms</td><td>6.153 ms</td><td>1.066 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td>3.150 ms</td><td>2.989 ms</td><td><strong>6.139 ms</strong></td><td>2.504 ms</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA 基线</strong></td><td>3.647 ms</td><td>2.865 ms</td><td>6.511 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>4.084 ms</td><td>3.811 ms</td><td>7.894 ms</td><td><strong>1.774 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>3.796 ms</td><td><strong>2.522 ms</strong></td><td><strong>6.319 ms</strong></td><td>2.649 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.351 ms</td><td>3.738 ms</td><td>7.089 ms</td><td>2.047 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>3.312 ms</strong></td><td>3.413 ms</td><td>6.725 ms</td><td>2.836 ms</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA 基线</strong></td><td>11.788 ms</td><td>3.343 ms</td><td>15.131 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>11.391 ms</strong></td><td>3.043 ms</td><td><strong>14.433 ms</strong></td><td>14.769 ms</td></tr>
+        <tr><td><code>torch</code></td><td>13.141 ms</td><td>3.046 ms</td><td>16.187 ms</td><td>27.256 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>14.015 ms</td><td><strong>3.019 ms</strong></td><td>17.034 ms</td><td><strong>11.108 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>13.211 ms</td><td>3.196 ms</td><td>16.408 ms</td><td>29.091 ms</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA 基线</strong></td><td>94.492 ms</td><td><strong>7.900 ms</strong></td><td>102.392 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>94.002 ms</strong></td><td>8.143 ms</td><td><strong>102.145 ms</strong></td><td>138.323 ms</td></tr>
+        <tr><td><code>torch</code></td><td>96.775 ms</td><td>7.922 ms</td><td>104.697 ms</td><td>571.229 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>100.043 ms</td><td>8.416 ms</td><td>108.459 ms</td><td><strong>85.941 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>261.481 ms</td><td>597.331 ms</td><td>858.813 ms</td><td>689.049 ms</td></tr>
     </tbody>
 </table>
 
@@ -539,12 +541,8 @@ wp.launch(kernel, dim=image_height * image_width, ...)
 
 从公共 API 视角看，CUDA 基线与四种 Warp 排序模式在前向峰值显存上整体仍处在同一量级；反向峰值显存则是 CUDA 基线 consistently 更低一些。真正拉开差距的仍然是**内部 binning scratch**：`warp_radix` 和 `warp_depth_stable_tile` 很轻，而 `torch` / `torch_count` 会在 65K 与 262K 时迅速放大。
 
-综合 CUDA 基线与四种 Warp 排序模式，可以总结出四条更准确的观察：
-
-- **4K 小规模**：四种 Warp 排序模式里 `torch_count` 端到端最快，且前向 / 反向都明显快于这次测得的 CUDA 基线；但它的内部 binning scratch 也是四者里最重的；
-- **16K 中规模**：`torch_count` 仍给出最短前向，`warp_radix` 拿到最短反向和最轻 binning；不过这一档 CUDA 基线的前向峰值显存与 Warp 基本持平、反向峰值显存仍更低；
-- **65K / 262K 大规模**：`warp_depth_stable_tile` 继续保持最稳的 Warp 侧 binning 耗时，而 **262K 反向端到端最快的是 CUDA 基线**（9.276 ms），说明 Warp 当前仍未在所有大规模路径上全面超越原生实现；
-- **默认模式选择**：`warp_depth_stable_tile` 之所以仍被保留为默认值，不是因为它在所有指标上绝对最优，而是因为它在 Warp 四模式里提供了**最平衡的 binning 性能、极低 scratch 显存、以及较小的 correctness residual**。
+综合 CUDA 基线与四种 Warp 排序模式，可以总结出结论：保留
+`warp_depth_stable_tile` 为默认值，它在 Warp 四模式里继续提供了**最平衡的内部 binning GPU 时间、极低 scratch 显存、以及较小的 correctness residual**；如果只追求某一档端到端吞吐，最佳模式已经会随规模变化。
 
 ---
 
