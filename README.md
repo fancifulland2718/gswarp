@@ -399,60 +399,50 @@ The tile index is derived inside the kernel using arithmetic on `wp.tid()`. The 
 The test configuration is as follows:
 
 - `mode = sh_scale_rotation`
-- Warp public default parameters remain unchanged (`backward_mode=None`, `binning_sort_mode=None`, `auto_tune=True`, `auto_tune_verbose=True`)
-- The backend default sort mode resolved at runtime is `warp_depth_stable_tile`
-- Test scales: **4,096 / 16,384 / 65,536 / 262,144** particles
+- `backward_mode="manual"`
+- `binning_sort_mode="warp_depth_stable_tile"`
+- `auto_tune=True`
+- `auto_tune_verbose=True`)
+- test scales: **4,096 / 16,384 / 65,536 / 262,144** particles
 
-Correctness is best analyzed in three layers. The core conclusion is that the currently observed mismatches are still concentrated mainly in the **preprocess stage**. Warp uses a tighter screen-space bounding box, so its active-set decision is stricter than native CUDA. This changes internal buffers such as `radii`, `proj_2D`, `conic_2D`, and `conic_2D_inv`, but in the current tests it **does not** evolve into visible regressions in the final `color` / `depth` / `alpha` outputs.
+Correctness is still best analyzed in three layers: preprocess diagnostics, final rendered outputs, and backward gradients. Forward outputs still match exactly at the checked tolerance, the preprocess diagnostics also remain aligned, and the backward side still contains a small number of sparse outliers without showing a broader spread.
 
-### Preprocess Diagnostics (this is where mismatches actually concentrate)
+### Preprocess Diagnostics
 
-Across all test scales, the mismatched preprocess fields are consistently the same four:
+Across the current four test scales, the active set and the key preprocess tensors (`radii`, `proj_2D`, `conic_2D`, `conic_2D_inv`) all align.
 
-- `radii`
-- `proj_2D`
-- `conic_2D`
-- `conic_2D_inv`
-
-The active-set difference also shows a clear asymmetry: `native_only_active_count` is always much larger than `warp_only_active_count`. This matches the expectation that “Warp uses tighter bounding boxes and therefore culls more boundary Gaussians”.
-
-| Points | Native-only active | Warp-only active | Shared active | Shared `proj_2D` max-diff | Shared `conic_2D` max-diff | Shared `conic_2D_inv` max-diff |
-|------|----------------|--------------|----------|------------------------------|-------------------------------|-----------------------------------|
-| 4,096 | 142 | 6 | 3,524 | 7.63e-6 | 1.73e-6 | 3.13e-2 |
-| 16,384 | 576 | 17 | 14,187 | 7.63e-6 | 2.56e-6 | 3.13e-2 |
-| 65,536 | 2,298 | 88 | 56,716 | 1.53e-5 | 2.77e-6 | 1.88e-1 |
-| 262,144 | 9,199 | 383 | 226,837 | 6.10e-5 | 2.64e-6 | 7.50e-1 |
-
-Note that:
-
-- On the **shared-active subset**, `proj_2D` and `conic_2D` still maintain very tight numerical consistency.
-- `conic_2D_inv` is more sensitive to active-set and threshold-boundary differences, but these differences are still confined to preprocess diagnostics and do not damage the final primary rendering outputs.
+| Points | Native active | Warp active | Shared active | Shared `proj_2D` max-diff | Shared `conic_2D` max-diff | Shared `conic_2D_inv` max-diff |
+|------|---------------|-------------|---------------|---------------------------|----------------------------|---------------------------------|
+| 4,096 | 3,530 | 3,530 | 3,530 | 0.0 | 0.0 | 0.0 |
+| 16,384 | 14,204 | 14,204 | 14,204 | 0.0 | 0.0 | 0.0 |
+| 65,536 | 56,804 | 56,804 | 56,804 | 0.0 | 0.0 | 0.0 |
+| 262,144 | 227,220 | 227,220 | 227,220 | 0.0 | 0.0 | 0.0 |
 
 ### Final Forward Pass (primary rendered outputs)
 
 | Points | Resolution | `color` max-diff | `depth` max-diff | `alpha` max-diff |
 |------|--------|--------------------|--------------------|--------------------|
-| 4,096 | 128×128 | 3.19e-5 | 7.26e-6 | 3.34e-5 |
-| 16,384 | 128×128 | 3.58e-7 | 4.47e-8 | 1.79e-7 |
-| 65,536 | 256×256 | 2.38e-7 | 5.96e-8 | 2.38e-7 |
-| 262,144 | 384×384 | 1.01e-6 | 8.94e-8 | 3.58e-7 |
+| 4,096 | 128×128 | 0.0 | 0.0 | 0.0 |
+| 16,384 | 128×128 | 0.0 | 0.0 | 0.0 |
+| 65,536 | 256×256 | 0.0 | 0.0 | 0.0 |
+| 262,144 | 384×384 | 0.0 | 0.0 | 0.0 |
 
-Across all four scales, the shared rendering outputs remain stably within FP32 noise level.
+Across all four scales, the public forward outputs are exactly aligned within the checked tolerance.
 
 ### Backward Pass (key gradients on the training path)
 
-| Points | Gradient fields above threshold | `grad_means3D` above-threshold ratio | Worst non-`means3D` ratio | `grad_means3D` mean / max-diff |
-|------|----------------|----------------------------|--------------------------|----------------------------------|
-| 4,096 | `means3D`, `shs` | 2.4251% | `shs`: 0.0081% | 1.22e-3 / 9.38e-2 |
-| 16,384 | `means3D` | 2.4129% | None | 1.21e-3 / 5.00e-2 |
-| 65,536 | `means3D`, `means2D`, `opacity`, `shs`, `rotations` | 2.4302% | `opacity`: 0.0015% | 1.23e-3 / 1.41e+0 |
-| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 2.4380% | `opacity`: 0.0015% | 1.22e-3 / 2.03e+0 |
+| Points | Gradient fields above threshold | `grad_means3D` mismatches / max-diff | `grad_shs` mismatches / max-diff | Other sparse fields |
+|------|-------------------------------|--------------------------------------|----------------------------------|---------------------|
+| 4,096 | `means3D`, `rotations` | 1 / 4.69e-2 | 0 / 2.93e-3 | `rotations`: 1 / 6.10e-3 |
+| 16,384 | none | 0 / 4.88e-3 | 0 / 2.44e-3 | none |
+| 65,536 | `means3D`, `opacity`, `shs`, `scales`, `rotations` | 3 / 9.38e-2 | 1 / 6.84e-3 | `opacity`: 1 / 1.33e-1; `scales`: 1 / 7.93e-3; `rotations`: 1 / 7.81e-3 |
+| 262,144 | `means3D`, `means2D`, `opacity`, `shs`, `scales`, `rotations` | 6 / 2.81e-1 | 63 / 4.88e-2 | `means2D`: 4 / 1.78e-2; `opacity`: 2 / 2.01e-1; `scales`: 3 / 6.17e-1; `rotations`: 7 / 8.01e-2 |
 
 Conclusion:
 
-- The only backward residual with **non-trivial coverage** remains `grad_means3D`, and its above-threshold ratio is very stable across all scales, around **2.41%–2.44%**.
-- Even when other gradients exceed the threshold, they remain extremely sparse: at 65K / 262K points, the worst ratio among non-`means3D` gradients is still only about **0.0015%**.
-- This is fully consistent with the preprocess active-set difference discussed above: the difference is local and sparse, not a large-area backward failure.
+- The preprocess active-set divergence still does not appear, and the preprocess diagnostics line up across all four scales.
+- The backward result at 16K is fully back within threshold, while 4K / 65K / 262K still retain a small number of above-threshold outliers with low coverage.
+- The main residual risk at the moment is still a handful of isolated backward outliers rather than any systematic forward or preprocess deviation.
 
 ---
 
@@ -462,59 +452,51 @@ The following data also comes from the **current code state**. The test platform
 
 Methodology:
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with repeated single-iteration runs, and warmup iterations discarded.
+- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the main table reports the mean over the measured runs.
 - **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
 - **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; these stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
+
+For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively.
 
 ### Public API Steady-State Runtime
 
 | Points | Resolution | `num_rendered` | Native FW | Warp FW | FW ratio | Native BW | Warp BW | BW ratio |
 |------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
-| 4,096 | 128×128 | 121,691 | 0.404 ms | 1.642 ms | 4.07× | 0.853 ms | 1.964 ms | 2.30× |
-| 16,384 | 128×128 | 493,767 | 0.570 ms | 1.760 ms | 3.09× | 1.472 ms | 2.194 ms | 1.49× |
-| 65,536 | 256×256 | 7,497,291 | 9.547 ms | 6.266 ms | **0.66×** | 10.276 ms | 2.946 ms | **0.29×** |
-| 262,144 | 384×384 | 65,904,035 | 1562.614 ms | 300.885 ms | **0.19×** | 1816.957 ms | 645.514 ms | **0.36×** |
+| 4,096 | 128×128 | 121,691 | 2.385 ms | 2.400 ms | 1.01× | 3.126 ms | 3.145 ms | 1.01× |
+| 16,384 | 128×128 | 493,767 | 2.457 ms | 2.511 ms | 1.02× | 3.111 ms | 3.017 ms | **0.97×** |
+| 65,536 | 256×256 | 7,497,291 | 7.329 ms | 6.831 ms | **0.93×** | 2.387 ms | 2.259 ms | **0.95×** |
+| 262,144 | 384×384 | 65,904,035 | 61.998 ms | 62.187 ms | 1.00× | 5.232 ms | 6.121 ms | 1.17× |
 
 ### Public API Peak Memory by Stage
 
 | Points | Resolution | Native FW peak increment | Native BW peak increment | Warp FW peak increment | Warp BW peak increment |
 |------|--------|------------------|------------------|-------------------|-------------------|
-| 4,096 | 128×128 | 11.14 MiB | 6.64 MiB | 6.57 MiB | 9.72 MiB |
-| 16,384 | 128×128 | 29.00 MiB | 11.63 MiB | 10.93 MiB | 19.68 MiB |
-| 65,536 | 256×256 | 355.19 MiB | 42.50 MiB | 63.79 MiB | 80.48 MiB |
-| 262,144 | 384×384 | 2937.99 MiB | 135.38 MiB | 347.63 MiB | 260.46 MiB |
+| 4,096 | 128×128 | 1.57 MiB | 4.41 MiB | 1.57 MiB | 4.41 MiB |
+| 16,384 | 128×128 | 5.18 MiB | 17.63 MiB | 5.18 MiB | 17.63 MiB |
+| 65,536 | 256×256 | 41.79 MiB | 70.57 MiB | 41.79 MiB | 70.57 MiB |
+| 262,144 | 384×384 | 303.13 MiB | 283.00 MiB | 302.13 MiB | 282.32 MiB |
 
-The overall trend can be summarized as:
-
-- **4K–16K**: Warp still has higher end-to-end public-API latency. Fundamentally, this comes from fixed orchestration overhead together with a binning-sort path that has not yet been amortized.
-- **65K and above**: Warp starts to outperform native CUDA in both forward and backward, especially after the binning overhead is amortized by a large number of splats.
-- Looking at forward-stage memory, Warp is clearly more memory-efficient across all tested scales. In the largest 262K / 384×384 test, Warp achieves about **8.45×** lower forward-stage peak memory and about **5.19×** forward acceleration compared with native CUDA.
-- Backward-stage memory is more nuanced: Warp may keep more forward intermediates alive into backward, so its backward-stage peak increment is not always lower than native CUDA, even when the overall pipeline is already much faster.
+Public API peak memory remains effectively at parity with native CUDA. Even at 262K, the stage-wise differences still stay within roughly **1 MiB**.
 
 ### Internal Stage Hotspots
 
 | Points | Resolution | Preprocess | Binning | Render | Backward Render | Selected Sort Mode |
 |------|--------|--------|------|------|----------|--------------|
-| 4,096 | 128×128 | 0.619 ms | 0.764 ms | 0.239 ms | 0.620 ms | `warp_depth_stable_tile` |
-| 16,384 | 128×128 | 0.580 ms | 0.937 ms | 0.236 ms | 0.677 ms | `warp_depth_stable_tile` |
-| 65,536 | 256×256 | 0.938 ms | 4.812 ms | 0.285 ms | 1.285 ms | `warp_depth_stable_tile` |
-| 262,144 | 384×384 | 44.752 ms | 70.106 ms | 3.462 ms | 3.170 ms | `warp_depth_stable_tile` |
+| 4,096 | 128×128 | 1.004 ms | 4.214 ms | 0.385 ms | 0.773 ms | `warp_depth_stable_tile` |
+| 16,384 | 128×128 | 1.118 ms | 1.334 ms | 0.381 ms | 0.766 ms | `warp_depth_stable_tile` |
+| 65,536 | 256×256 | 1.031 ms | 9.142 ms | 0.413 ms | 1.625 ms | `warp_depth_stable_tile` |
+| 262,144 | 384×384 | 1.701 ms | 58.492 ms | 0.560 ms | 2.390 ms | `warp_depth_stable_tile` |
 
 ### Internal Stage Peak Memory (diagnostic only)
 
 | Points | Resolution | Preprocess peak increment | Binning peak increment | Render peak increment | Backward Render peak increment |
 |------|--------|----------------|--------------|--------------|------------------|
-| 4,096 | 128×128 | 0.53 MiB | 0.00 MiB | 5.38 MiB | 0.16 MiB |
-| 16,384 | 128×128 | 2.13 MiB | 0.00 MiB | 6.13 MiB | 0.63 MiB |
-| 65,536 | 256×256 | 8.50 MiB | 0.00 MiB | 22.50 MiB | 2.50 MiB |
-| 262,144 | 384×384 | 35.00 MiB | 0.00 MiB | 48.44 MiB | 10.00 MiB |
+| 4,096 | 128×128 | 0.53 MiB | 0.00 MiB | 0.38 MiB | 0.16 MiB |
+| 16,384 | 128×128 | 2.13 MiB | 0.00 MiB | 0.38 MiB | 0.63 MiB |
+| 65,536 | 256×256 | 8.50 MiB | 0.00 MiB | 1.50 MiB | 2.50 MiB |
+| 262,144 | 384×384 | 34.56 MiB | 0.00 MiB | 3.38 MiB | 10.00 MiB |
 
-These stage timings are not the main metric, but they explain the public-API behavior above very well:
-
-- In the **4K–16K** range, public-API slowdown mainly comes from fixed end-to-end overhead that has not yet been amortized, while binning already accounts for about **34%–39%** of internal stage time.
-- By **65K**, binning rises to about **66%**, becoming the main reason Warp forward is faster than native CUDA while still being dominated internally by sorting / `range` identification.
-- By **262K**, binning still accounts for about **58%**, while preprocess also rises to about **37%**, showing that SH-color-related preprocessing is no longer negligible at that scale.
-- From the stage-memory perspective, there is also an additional signal: in these measurements, **binning introduces almost no new peak allocation** because it mainly reuses caches; the most obvious new allocation hotspot inside the Warp pipeline is actually **render-output materialization**.
+Looking at the internal stages, binning is still the main hotspot, but **binning adds almost no new peak allocation**; the allocator peak is mainly moved by preprocess and backward-render-related work.
 
 ---
 

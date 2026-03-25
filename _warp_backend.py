@@ -21,6 +21,7 @@ __all__ = [
 
 NUM_CHANNELS = 3
 TOP_K = 20
+_COMPUTE_AUX_FORWARD = False
 BLOCK_X = 16
 BLOCK_Y = 16
 sh_c0 = wp.constant(wp.float32(0.28209479177387814))
@@ -44,7 +45,6 @@ _BACKWARD_MODE = DEFAULT_BACKWARD_MODE
 BINNING_SORT_MODES = ("warp_radix", "torch", "warp_depth_stable_tile", "torch_count")
 DEFAULT_BINNING_SORT_MODE = "warp_depth_stable_tile"
 _BINNING_SORT_MODE = DEFAULT_BINNING_SORT_MODE
-DEFAULT_EXACT_CONTRACT = False
 WARP_RADIX_DETERMINISTIC_TIEBREAK = False
 TORCH_SINGLE_SORT_THRESHOLD = 1000000
 FORWARD_GEOM_FLOAT_WIDTH = 16
@@ -68,7 +68,6 @@ _PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch
 _SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = {}
 _RUNTIME_TUNING_CACHE: dict[str, dict[str, Any]] = {}
 _RUNTIME_TUNING_LOGGED_DEVICES: set[str] = set()
-_RUNTIME_EXACT_CONTRACT_DEFAULTS: dict[str, bool] = {}
 _RUNTIME_BINNING_POLICY_STATE: dict[str, dict[str, Any]] = {}
 _AUTO_TUNE_ENABLED = True
 _AUTO_TUNE_VERBOSE = True
@@ -163,13 +162,7 @@ def get_default_parameter_info() -> dict[str, dict[str, Any]]:
             "value": DEFAULT_BINNING_SORT_MODE,
             "category": "experimental",
             "auto_tunable": True,
-            "description": "Default Warp binning strategy. Unless the user explicitly overrides it, the backend now starts from 'warp_depth_stable_tile' as the mainline path.",
-        },
-        "DEFAULT_EXACT_CONTRACT": {
-            "value": DEFAULT_EXACT_CONTRACT,
-            "category": "experimental",
-            "auto_tunable": True,
-            "description": "Exact preprocess contraction flag. Performance-oriented default keeps this disabled unless overridden.",
+            "description": "Default Warp binning strategy. Unless the user explicitly overrides it, the backend uses 'torch' as the mainline path (benchmarked as best overall).",
         },
         "WARP_RADIX_DETERMINISTIC_TIEBREAK": {
             "value": WARP_RADIX_DETERMINISTIC_TIEBREAK,
@@ -199,6 +192,15 @@ def set_runtime_auto_tuning(enabled: bool | None = None, verbose: bool | None = 
         _AUTO_TUNE_ENABLED = bool(enabled)
     if verbose is not None:
         _AUTO_TUNE_VERBOSE = bool(verbose)
+
+
+def get_compute_aux_forward() -> bool:
+    return _COMPUTE_AUX_FORWARD
+
+
+def set_compute_aux_forward(enabled: bool) -> None:
+    global _COMPUTE_AUX_FORWARD
+    _COMPUTE_AUX_FORWARD = bool(enabled)
 
 
 def _normalize_runtime_device(device: torch.device | str | None = None) -> torch.device:
@@ -434,11 +436,6 @@ def _select_auto_binning_sort_mode(device: torch.device, point_count: int) -> tu
     return selected_mode, _build_binning_policy_snapshot(runtime_device)
 
 
-def _recommend_exact_contract_default(device: torch.device, device_props: Any | None) -> bool:
-    del device, device_props
-    return False
-
-
 def _build_runtime_tuning_report(device: torch.device | str | None = None) -> dict[str, Any]:
     runtime_device = _normalize_runtime_device(device)
     device_props, free_memory, total_memory, runtime_device = _query_runtime_device_info(runtime_device)
@@ -446,7 +443,6 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
 
     recommended_tile_x, recommended_tile_y = _recommend_tile_shape(device_props, free_memory)
     recommended_binning_sort_mode, binning_policy = _recommend_binning_sort_mode(runtime_device, device_props, free_memory)
-    recommended_exact_contract = _recommend_exact_contract_default(runtime_device, device_props)
 
     # Build comprehensive SM properties and occupancy-based block_dim plan.
     sm_props = _query_sm_properties(device_props)
@@ -478,7 +474,6 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
         "gs_fixed_parameters": ("TOP_K",),
         "applied_binning_sort_mode": _BINNING_SORT_MODE,
         "recommended_binning_sort_mode": recommended_binning_sort_mode,
-        "applied_exact_contract_default": recommended_exact_contract,
         "block_dim_plan": block_dim_plan,
         "occupancy_snapshot": occupancy_snapshot,
         "benchmark": {
@@ -489,7 +484,6 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
         "binning_policy": binning_policy,
         "applied_auto_tune": True,
     }
-    _RUNTIME_EXACT_CONTRACT_DEFAULTS[device_key] = recommended_exact_contract
     return report
 
 
@@ -566,9 +560,8 @@ def _print_runtime_tuning_report(report: dict[str, Any]) -> None:
     )
     print(
         _runtime_color(
-            "strategy: binning_sort={}, exact_contract={}".format(
+            "strategy: binning_sort={}".format(
                 report["applied_binning_sort_mode"],
-                report["applied_exact_contract_default"],
             ),
             _ANSI_STRATEGY,
         )
@@ -702,15 +695,6 @@ def _as_detached_contiguous_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> t
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return tensor
-
-
-def _get_exact_contract_default(device: torch.device) -> bool:
-    device_key = str(_normalize_runtime_device(device))
-    cached = _RUNTIME_EXACT_CONTRACT_DEFAULTS.get(device_key)
-    if cached is not None:
-        return cached
-    report = get_runtime_tuning_report(device)
-    return bool(report["applied_exact_contract_default"])
 
 
 def _pack_forward_aux_buffers(preprocess_outputs, binning_state, n_contrib):
@@ -1170,123 +1154,6 @@ if wp is not None:
 
 
     @wp.kernel
-    def _exact_cov2d_inplace_warp_kernel(
-        means3d: wp.array(dtype=wp.vec3),
-        cov3d_flat: wp.array(dtype=wp.float32),
-        radii: wp.array(dtype=wp.int32),
-        view_flat: wp.array(dtype=wp.float32),
-        tanfovx: wp.float32,
-        tanfovy: wp.float32,
-        focal_x: wp.float32,
-        focal_y: wp.float32,
-        out_cov2d: wp.array(dtype=wp.vec3),
-    ):
-        tid = wp.tid()
-        if radii[tid] <= 0:
-            return
-
-        p = means3d[tid]
-        base = tid * 6
-
-        x = view_flat[0] * p[0] + view_flat[4] * p[1] + view_flat[8] * p[2] + view_flat[12]
-        y = view_flat[1] * p[0] + view_flat[5] * p[1] + view_flat[9] * p[2] + view_flat[13]
-        z = view_flat[2] * p[0] + view_flat[6] * p[1] + view_flat[10] * p[2] + view_flat[14]
-
-        limx = 1.3 * tanfovx
-        limy = 1.3 * tanfovy
-        txtz = x / z
-        tytz = y / z
-        x = wp.clamp(txtz, -limx, limx) * z
-        y = wp.clamp(tytz, -limy, limy) * z
-
-        a = focal_x / z
-        b = focal_y / z
-        c = -(focal_x * x) / (z * z)
-        d = -(focal_y * y) / (z * z)
-
-        t00 = view_flat[0] * a + view_flat[2] * c
-        t10 = view_flat[4] * a + view_flat[6] * c
-        t20 = view_flat[8] * a + view_flat[10] * c
-        t01 = view_flat[1] * b + view_flat[2] * d
-        t11 = view_flat[5] * b + view_flat[6] * d
-        t21 = view_flat[9] * b + view_flat[10] * d
-
-        v00 = cov3d_flat[base + 0]
-        v01 = cov3d_flat[base + 1]
-        v02 = cov3d_flat[base + 2]
-        v11 = cov3d_flat[base + 3]
-        v12 = cov3d_flat[base + 4]
-        v22 = cov3d_flat[base + 5]
-
-        vt0x = v00 * t00 + v01 * t10 + v02 * t20
-        vt0y = v01 * t00 + v11 * t10 + v12 * t20
-        vt0z = v02 * t00 + v12 * t10 + v22 * t20
-        vt1x = v00 * t01 + v01 * t11 + v02 * t21
-        vt1y = v01 * t01 + v11 * t11 + v12 * t21
-        vt1z = v02 * t01 + v12 * t11 + v22 * t21
-
-        cov00 = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3
-        cov01 = t00 * vt1x + t10 * vt1y + t20 * vt1z
-        cov11 = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3
-        out_cov2d[tid] = wp.vec3(cov00, cov01, cov11)
-
-
-    @wp.kernel
-    def _exact_cov2d_from_scale_rotation_inplace_warp_kernel(
-        means3d: wp.array(dtype=wp.vec3),
-        scales: wp.array(dtype=wp.vec3),
-        rotations: wp.array(dtype=wp.vec4),
-        scale_modifier: wp.float32,
-        radii: wp.array(dtype=wp.int32),
-        view_flat: wp.array(dtype=wp.float32),
-        tanfovx: wp.float32,
-        tanfovy: wp.float32,
-        focal_x: wp.float32,
-        focal_y: wp.float32,
-        out_cov2d: wp.array(dtype=wp.vec3),
-    ):
-        tid = wp.tid()
-        if radii[tid] <= 0:
-            return
-
-        p = means3d[tid]
-        x = view_flat[0] * p[0] + view_flat[4] * p[1] + view_flat[8] * p[2] + view_flat[12]
-        y = view_flat[1] * p[0] + view_flat[5] * p[1] + view_flat[9] * p[2] + view_flat[13]
-        z = view_flat[2] * p[0] + view_flat[6] * p[1] + view_flat[10] * p[2] + view_flat[14]
-
-        limx = 1.3 * tanfovx
-        limy = 1.3 * tanfovy
-        txtz = x / z
-        tytz = y / z
-        x = wp.clamp(txtz, -limx, limx) * z
-        y = wp.clamp(tytz, -limy, limy) * z
-
-        a = focal_x / z
-        b = focal_y / z
-        c = -(focal_x * x) / (z * z)
-        d = -(focal_y * y) / (z * z)
-
-        t00 = view_flat[0] * a + view_flat[2] * c
-        t10 = view_flat[4] * a + view_flat[6] * c
-        t20 = view_flat[8] * a + view_flat[10] * c
-        t01 = view_flat[1] * b + view_flat[2] * d
-        t11 = view_flat[5] * b + view_flat[6] * d
-        t21 = view_flat[9] * b + view_flat[10] * d
-
-        out_cov2d[tid] = _cov2d_from_scale_rotation_gram_wp(
-            scales[tid],
-            rotations[tid],
-            scale_modifier,
-            t00,
-            t10,
-            t20,
-            t01,
-            t11,
-            t21,
-        )
-
-
-    @wp.kernel
     def _render_tiles_warp_kernel(
         ranges_flat: wp.array(dtype=wp.int32),
         point_list: wp.array(dtype=wp.int32),
@@ -1370,6 +1237,82 @@ if wp is not None:
                 x_mu_flat[(calc * 2 + 1) * total_pixels + tid] = d_y
 
             calc = calc + 1
+            last_contributor = contributor
+
+        n_contrib[tid] = last_contributor
+        out_color_flat[tid] = color0 + T * background[0]
+        out_color_flat[total_pixels + tid] = color1 + T * background[1]
+        out_color_flat[2 * total_pixels + tid] = color2 + T * background[2]
+        out_alpha_flat[tid] = weight
+        out_depth_flat[tid] = depth_acc
+
+    @wp.kernel
+    def _render_tiles_fast_warp_kernel(
+        ranges_flat: wp.array(dtype=wp.int32),
+        point_list: wp.array(dtype=wp.int32),
+        points_xy_image: wp.array(dtype=wp.vec2),
+        features_flat: wp.array(dtype=wp.float32),
+        depths: wp.array(dtype=wp.float32),
+        conic_opacity: wp.array(dtype=wp.vec4),
+        background: wp.array(dtype=wp.float32),
+        image_width: wp.int32,
+        image_height: wp.int32,
+        grid_x: wp.int32,
+        out_color_flat: wp.array(dtype=wp.float32),
+        out_depth_flat: wp.array(dtype=wp.float32),
+        out_alpha_flat: wp.array(dtype=wp.float32),
+        n_contrib: wp.array(dtype=wp.int32),
+    ):
+        tid = wp.tid()
+        total_pixels = image_width * image_height
+        if tid >= total_pixels:
+            return
+
+        pix_x = tid % image_width
+        pix_y = tid // image_width
+        tile_id = (pix_y // BLOCK_Y) * grid_x + (pix_x // BLOCK_X)
+        start = ranges_flat[tile_id * 2]
+        end = ranges_flat[tile_id * 2 + 1]
+
+        T = float(1.0)
+        contributor = int(0)
+        last_contributor = int(0)
+        color0 = float(0.0)
+        color1 = float(0.0)
+        color2 = float(0.0)
+        weight = float(0.0)
+        depth_acc = float(0.0)
+        pixf_x = float(pix_x)
+        pixf_y = float(pix_y)
+
+        for idx in range(start, end):
+            contributor = contributor + 1
+            coll_id = point_list[idx]
+            xy = points_xy_image[coll_id]
+            d_x = xy[0] - pixf_x
+            d_y = xy[1] - pixf_y
+            con_o = conic_opacity[coll_id]
+            power = -0.5 * (con_o[0] * d_x * d_x + con_o[2] * d_y * d_y) - con_o[1] * d_x * d_y
+            if power > 0.0:
+                continue
+
+            alpha = wp.min(float(0.99), con_o[3] * wp.exp(power))
+            if alpha < (1.0 / 255.0):
+                continue
+
+            test_T = T * (1.0 - alpha)
+            if test_T < 0.0001:
+                break
+
+            contribution = alpha * T
+            feature_base = coll_id * NUM_CHANNELS
+            color0 = color0 + features_flat[feature_base + 0] * contribution
+            color1 = color1 + features_flat[feature_base + 1] * contribution
+            color2 = color2 + features_flat[feature_base + 2] * contribution
+            weight = weight + contribution
+            depth_acc = depth_acc + depths[coll_id] * contribution
+            T = test_T
+
             last_contributor = contributor
 
         n_contrib[tid] = last_contributor
@@ -3459,9 +3402,14 @@ def _make_empty_forward_outputs(means3D, image_height, image_width):
     proj_2d = _allocate_scalar_tensor((point_count, 2), torch.float32, means3D.device, fill_value=0.0)
     conic_2d = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
     conic_2d_inv = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
-    gs_per_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=-1.0)
-    weight_per_gs_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
-    x_mu = _allocate_scalar_tensor((TOP_K, 2, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
+    if _COMPUTE_AUX_FORWARD:
+        gs_per_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=-1.0)
+        weight_per_gs_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
+        x_mu = _allocate_scalar_tensor((TOP_K, 2, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
+    else:
+        gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+        x_mu = torch.empty((0,), dtype=torch.float32, device=means3D.device)
     geom_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     binning_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     img_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
@@ -3482,73 +3430,6 @@ def _make_empty_forward_outputs(means3D, image_height, image_width):
         weight_per_gs_pixel,
         x_mu,
     )
-
-
-def _apply_exact_preprocess_contract(
-    means3D,
-    viewmatrix,
-    image_height,
-    image_width,
-    tanfovx,
-    tanfovy,
-    preprocess_outputs,
-    cov3D_precomp=None,
-    scales=None,
-    rotations=None,
-    scale_modifier=1.0,
-):
-    point_count = means3D.shape[0]
-    if point_count == 0:
-        return preprocess_outputs
-
-    radii = preprocess_outputs["radii"]
-    if not bool((radii > 0).any()):
-        return preprocess_outputs
-
-    focal_x = image_width / (2.0 * tanfovx)
-    focal_y = image_height / (2.0 * tanfovy)
-
-    if cov3D_precomp is not None and cov3D_precomp.numel() != 0:
-        wp.launch(
-            kernel=_exact_cov2d_inplace_warp_kernel,
-            dim=point_count,
-            inputs=[
-                wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                wp.from_torch(cov3D_precomp.detach().contiguous().reshape(-1), dtype=wp.float32),
-                wp.from_torch(radii.detach().contiguous(), dtype=wp.int32),
-                wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                float(tanfovx),
-                float(tanfovy),
-                float(focal_x),
-                float(focal_y),
-            ],
-            outputs=[wp.from_torch(preprocess_outputs["conic_2d_inv"], dtype=wp.vec3)],
-            device=str(means3D.device),
-        )
-        return preprocess_outputs
-
-    if scales is not None and rotations is not None and scales.numel() != 0 and rotations.numel() != 0:
-        wp.launch(
-            kernel=_exact_cov2d_from_scale_rotation_inplace_warp_kernel,
-            dim=point_count,
-            inputs=[
-                wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                wp.from_torch(scales.detach().contiguous(), dtype=wp.vec3),
-                wp.from_torch(rotations.detach().contiguous(), dtype=wp.vec4),
-                float(scale_modifier),
-                wp.from_torch(radii.detach().contiguous(), dtype=wp.int32),
-                wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                float(tanfovx),
-                float(tanfovy),
-                float(focal_x),
-                float(focal_y),
-            ],
-            outputs=[wp.from_torch(preprocess_outputs["conic_2d_inv"], dtype=wp.vec3)],
-            device=str(means3D.device),
-        )
-        return preprocess_outputs
-
-    return preprocess_outputs
 
 
 def _compute_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations):
@@ -3810,22 +3691,29 @@ def _backward_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations, 
 
 def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, background, image_height, image_width):
     device = feature_ptr.device
+    compute_aux = _COMPUTE_AUX_FORWARD
     total_pixels = image_height * image_width
     out_color = torch.empty((NUM_CHANNELS, image_height, image_width), dtype=torch.float32, device=device)
     out_depth = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     out_alpha = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
-    gs_per_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
-    weight_per_gs_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
-    x_mu = torch.empty((TOP_K, 2, image_height, image_width), dtype=torch.float32, device=device)
+    if compute_aux:
+        gs_per_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
+        weight_per_gs_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
+        x_mu = torch.empty((TOP_K, 2, image_height, image_width), dtype=torch.float32, device=device)
+    else:
+        gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=device)
+        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=device)
+        x_mu = torch.empty((0,), dtype=torch.float32, device=device)
     n_contrib = torch.empty((total_pixels,), dtype=torch.int32, device=device)
 
     if binning_state["num_rendered"] == 0:
         out_color.zero_()
         out_depth.zero_()
         out_alpha.zero_()
-        gs_per_pixel.fill_(-1.0)
-        weight_per_gs_pixel.zero_()
-        x_mu.zero_()
+        if compute_aux:
+            gs_per_pixel.fill_(-1.0)
+            weight_per_gs_pixel.zero_()
+            x_mu.zero_()
         n_contrib.zero_()
         return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
@@ -3837,33 +3725,49 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     ranges = binning_state["ranges"].detach().contiguous().reshape(-1)
     point_list = binning_state["point_list"].detach().contiguous()
 
-    wp.launch(
-        kernel=_render_tiles_warp_kernel,
-        dim=image_height * image_width,
-        inputs=[
-            wp.from_torch(ranges, dtype=wp.int32),
-            wp.from_torch(point_list, dtype=wp.int32),
-            wp.from_torch(points_xy_image, dtype=wp.vec2),
-            wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32),
-            wp.from_torch(depths, dtype=wp.float32),
-            wp.from_torch(conic_opacity, dtype=wp.vec4),
-            wp.from_torch(background.reshape(-1), dtype=wp.float32),
-            int(image_width),
-            int(image_height),
-            int(binning_state["grid_x"]),
-        ],
-        outputs=[
-            wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
-            wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
-            wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
-            wp.from_torch(gs_per_pixel.reshape(-1), dtype=wp.float32),
-            wp.from_torch(weight_per_gs_pixel.reshape(-1), dtype=wp.float32),
-            wp.from_torch(x_mu.reshape(-1), dtype=wp.float32),
-            wp.from_torch(n_contrib, dtype=wp.int32),
-        ],
-        device=str(device),
-        block_dim=_get_block_dim("render"),
-    )
+    _common_inputs = [
+        wp.from_torch(ranges, dtype=wp.int32),
+        wp.from_torch(point_list, dtype=wp.int32),
+        wp.from_torch(points_xy_image, dtype=wp.vec2),
+        wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32),
+        wp.from_torch(depths, dtype=wp.float32),
+        wp.from_torch(conic_opacity, dtype=wp.vec4),
+        wp.from_torch(background.reshape(-1), dtype=wp.float32),
+        int(image_width),
+        int(image_height),
+        int(binning_state["grid_x"]),
+    ]
+    if compute_aux:
+        wp.launch(
+            kernel=_render_tiles_warp_kernel,
+            dim=image_height * image_width,
+            inputs=_common_inputs,
+            outputs=[
+                wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
+                wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
+                wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
+                wp.from_torch(gs_per_pixel.reshape(-1), dtype=wp.float32),
+                wp.from_torch(weight_per_gs_pixel.reshape(-1), dtype=wp.float32),
+                wp.from_torch(x_mu.reshape(-1), dtype=wp.float32),
+                wp.from_torch(n_contrib, dtype=wp.int32),
+            ],
+            device=str(device),
+            block_dim=_get_block_dim("render"),
+        )
+    else:
+        wp.launch(
+            kernel=_render_tiles_fast_warp_kernel,
+            dim=image_height * image_width,
+            inputs=_common_inputs,
+            outputs=[
+                wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
+                wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
+                wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
+                wp.from_torch(n_contrib, dtype=wp.int32),
+            ],
+            device=str(device),
+            block_dim=_get_block_dim("render"),
+        )
     return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
 
@@ -4264,7 +4168,6 @@ def preprocess_gaussians(
     colors_precomp=None,
     opacities=None,
     prefiltered=False,
-    exact_contract=None,
 ):
         _require_warp()
         if means3D.ndim != 2 or means3D.shape[1] != 3:
@@ -4279,8 +4182,6 @@ def preprocess_gaussians(
             raise ValueError("Provide exactly one of cov3D_precomp or scales/rotations")
 
         device = means3D.device
-        if exact_contract is None:
-            exact_contract = _get_exact_contract_default(device)
 
         cov3d_all = None
         # E1: for scale_rotation Warp path, defer cov3d to fused kernel
@@ -4362,7 +4263,7 @@ def preprocess_gaussians(
               )
           p_proj_all = None
           p_view_z_all = None
-        if has_precomputed_cov:
+        elif has_precomputed_cov:
             visible_mask, p_proj_all, p_view_z_all = _project_preprocess_visible_points_warp(
                 means3D,
                 viewmatrix,
@@ -4410,7 +4311,9 @@ def preprocess_gaussians(
             }
             return outputs
 
-        if has_precomputed_cov:
+        if has_scale_rotation:
+            pass  # E1: preprocess already done by fused kernel
+        elif has_precomputed_cov:
             wp.launch(
                 kernel=_cov2d_preprocess_masked_pack_warp_kernel,
                 dim=point_count,
@@ -4443,7 +4346,7 @@ def preprocess_gaussians(
                 ],
                 device=str(device),
             )
-        else:
+        elif not has_scale_rotation:
             wp.launch(
                 kernel=_cov2d_preprocess_masked_pack_scale_rotation_warp_kernel,
                 dim=point_count,
@@ -4502,21 +4405,6 @@ def preprocess_gaussians(
             "conic_opacity": conic_opacity,
             "cov3d_all": cov3d_all.to(dtype=torch.float32),
         }
-
-        if exact_contract:
-            outputs = _apply_exact_preprocess_contract(
-                means3D,
-                viewmatrix,
-                image_height,
-                image_width,
-                tanfovx,
-                tanfovy,
-                outputs,
-                cov3D_precomp=cov3D_precomp,
-                scales=scales,
-                rotations=rotations,
-                scale_modifier=scale_modifier,
-            )
 
         return outputs
 
@@ -4604,7 +4492,6 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     colors_precomp=_colors if _colors.numel() != 0 else None,
                     opacities=_opacities,
                     prefiltered=False,
-                    exact_contract=False,
                 )
             # Build binning unconditionally — num_rendered (Python int) avoids
             # the host sync that bool((radii > 0).any()) would trigger.
