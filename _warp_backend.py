@@ -48,7 +48,8 @@ _BINNING_SORT_MODE = DEFAULT_BINNING_SORT_MODE
 WARP_RADIX_DETERMINISTIC_TIEBREAK = False
 TORCH_SINGLE_SORT_THRESHOLD = 1000000
 FORWARD_GEOM_FLOAT_WIDTH = 16
-FORWARD_GEOM_CLAMP_WIDTH = NUM_CHANNELS
+# L2: clamped stored as int32 in geom_buffer (eliminates backward bool→int32 conversion)
+FORWARD_GEOM_CLAMP_WIDTH = NUM_CHANNELS * 4
 BINNING_AUTO_TUNE_GROWTH_CAP = 4.0
 BINNING_AUTO_TUNE_SWITCH_RATIO = 2.5
 BINNING_AUTO_TUNE_KEEP_RATIO = 2.0
@@ -63,9 +64,11 @@ _RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, 
 _RADIX_SORT_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = {}
 _INDEX_GATHER_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = {}
 _INDEX_GATHER_I64_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = {}
-_SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = {}
+_SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, int]] = {}
 _PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = {}
+_DEPTH_SORT_ORDER_CACHE: dict[str, tuple[torch.Tensor, int]] = {}
+_DEPTH_SORT_CHECK_FLAG: dict[str, torch.Tensor] = {}
 _RUNTIME_TUNING_CACHE: dict[str, dict[str, Any]] = {}
 _RUNTIME_TUNING_LOGGED_DEVICES: set[str] = set()
 _RUNTIME_BINNING_POLICY_STATE: dict[str, dict[str, Any]] = {}
@@ -82,9 +85,12 @@ _C4_LAUNCH_CACHE_COV2D: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_ACCUM: dict[tuple[str, int, int], Any] = {}
 # C12: split SH backward caches
 _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS: dict[tuple[str, int, int], Any] = {}
-# F1: vec3 SH backward caches
-_C4_LAUNCH_CACHE_SH_DEG01_V3: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_SH_DEG23_V3: dict[tuple[str, int], Any] = {}
+# F1: merged vec3 SH backward cache (deg 0-3 single kernel)
+_C4_LAUNCH_CACHE_SH_V3: dict[tuple[str, int], Any] = {}
+# P1: forward hot-path launch caches
+_C4_LAUNCH_CACHE_FWD_SH: dict[tuple[str, int], Any] = {}
+_C4_LAUNCH_CACHE_FWD_PREPROCESS: dict[tuple[str, int], Any] = {}
+_C4_LAUNCH_CACHE_FWD_RENDER: dict[tuple[str, int], Any] = {}
 
 # One-shot initialization flag — after first _require_warp() succeeds, all
 # subsequent calls short-circuit immediately.
@@ -324,7 +330,7 @@ def _recommend_block_dim(sm_props: dict[str, Any], kernel_class: str = "default"
     regs = _KERNEL_REG_ESTIMATES.get(kernel_class, _KERNEL_REG_ESTIMATES["default"])
     best_dim = 256
     best_warps = 0
-    for candidate in (64, 128, 256):
+    for candidate in (64, 128, 192, 256):
         occ = _estimate_occupancy(regs, candidate, sm_props)
         warps = occ["active_warps_per_sm"]
         if warps > best_warps or (warps == best_warps and candidate > best_dim):
@@ -703,7 +709,8 @@ def _pack_forward_aux_buffers(preprocess_outputs, binning_state, n_contrib):
     conic_opacity_tensor = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
     rgb_tensor = _as_detached_contiguous_dtype(preprocess_outputs["rgb"], torch.float32)
     cov3d_tensor = _as_detached_contiguous_dtype(preprocess_outputs["cov3d_all"], torch.float32)
-    clamped_tensor = _as_detached_contiguous_dtype(preprocess_outputs["clamped"], torch.uint8)
+    # L2: store clamped as int32 — avoids backward int32 conversion allocation
+    clamped_tensor = _as_detached_contiguous_dtype(preprocess_outputs["clamped"], torch.int32)
     point_list_tensor = _as_detached_contiguous_dtype(binning_state["point_list"], torch.int32)
     ranges_tensor = _as_detached_contiguous_dtype(binning_state["ranges"].reshape(-1), torch.int32)
     img_tensor = _as_detached_contiguous_dtype(n_contrib.reshape(-1), torch.int32)
@@ -753,7 +760,8 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     offset = offset + rgb_bytes
     cov3d_tensor = geom_buffer[offset : offset + cov_bytes].view(torch.float32).reshape(point_count, 6)
     offset = offset + cov_bytes
-    clamped_tensor = geom_buffer[offset:].view(torch.uint8).reshape(point_count, FORWARD_GEOM_CLAMP_WIDTH)
+    # L2: clamped stored as int32 — direct view, no backward conversion needed
+    clamped_tensor = geom_buffer[offset:].view(torch.int32).reshape(point_count, NUM_CHANNELS)
     binning_tensor = binning_buffer.view(torch.int32)
     img_tensor = img_buffer.view(torch.int32)
 
@@ -905,16 +913,21 @@ def _get_scan_i32_buffer(device: torch.device, required_count: int):
     device_key = str(device)
     cached = _SCAN_I32_BUFFER_CACHE.get(device_key)
     if cached is not None:
-        warp_buffer, tensor_buffer = cached
+        warp_buffer, tensor_buffer, warp_size = cached
         if tensor_buffer.numel() >= required_count:
-            return tensor_buffer[:required_count], warp_buffer
+            sliced = tensor_buffer[:required_count]
+            if warp_buffer is not None and warp_size == required_count:
+                return sliced, warp_buffer
+            new_warp = wp.from_torch(sliced, dtype=wp.int32) if _can_use_warp_scalar_alloc(device) else None
+            _SCAN_I32_BUFFER_CACHE[device_key] = (new_warp, tensor_buffer, required_count)
+            return sliced, new_warp
 
     if _can_use_warp_scalar_alloc(device):
         warp_buffer, buffer = _allocate_warp_scalar_array(required_count, torch.int32, device)
     else:
         warp_buffer = None
         buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
-    _SCAN_I32_BUFFER_CACHE[device_key] = (warp_buffer, buffer)
+    _SCAN_I32_BUFFER_CACHE[device_key] = (warp_buffer, buffer, required_count)
     return buffer, warp_buffer
 
 
@@ -953,7 +966,7 @@ def _inclusive_scan_i32(src: torch.Tensor):
     scanned, scanned_warp = _get_scan_i32_buffer(src_i32.device, src_i32.shape[0])
     wp.utils.array_scan(
         wp.from_torch(src_i32, dtype=wp.int32),
-        scanned_warp if scanned_warp is not None and scanned_warp.size == src_i32.shape[0] else wp.from_torch(scanned, dtype=wp.int32),
+        scanned_warp if scanned_warp is not None else wp.from_torch(scanned, dtype=wp.int32),
         inclusive=True,
     )
     return scanned
@@ -1025,6 +1038,19 @@ if wp is not None:
     ):
         idx = wp.tid()
         out[idx] = src[indices[idx]]
+
+
+    @wp.kernel
+    def _check_depth_order_warp_kernel(
+        depths_i32: wp.array(dtype=wp.int32),
+        prev_order: wp.array(dtype=wp.int32),
+        flag: wp.array(dtype=wp.int32),
+    ):
+        i = wp.tid()
+        if i >= prev_order.shape[0] - 1:
+            return
+        if depths_i32[prev_order[i]] > depths_i32[prev_order[i + 1]]:
+            wp.atomic_max(flag, 0, wp.int32(1))
 
 
     @wp.kernel
@@ -1737,70 +1763,17 @@ if wp is not None:
         grad_means2D[tid] = wp.vec3(rp[0], rp[1], 0.0)
 
     # ---- F1: vec3-typed SH backward kernels for improved memory coalescing ----
-    # Uses wp.vec3 arrays with SoA (Structure of Arrays) layout for memory coalescing.
-    # SoA index: shs_v3[coeff_idx * point_count + tid] — adjacent threads access consecutive vec3,
-    # achieving ~100% L1 sector utilization vs ~9% with AoS stride.
-    # SoA layout for dRGBd intermediate: 3 separate vec3 arrays for perfect coalescing.
-    # Pre-masked grad_color eliminates clamped reads from kernel.
-
+    # Merged SH backward kernel (deg 0-3): vec3-typed AoS indexing, register-local dRGBd.
+    # Eliminates _dRGBd_buf intermediate (P×36 bytes) and saves one kernel launch.
     @wp.kernel
-    def _backward_rgb_from_sh_deg01_v3_warp_kernel(
+    def _backward_rgb_from_sh_v3_warp_kernel(
         means3d: wp.array(dtype=wp.vec3),
         campos_flat: wp.array(dtype=wp.float32),
         shs_v3: wp.array(dtype=wp.vec3),
         degree: wp.int32,
         coeff_count: wp.int32,
-        point_count: wp.int32,
-        masked_grad_color: wp.array(dtype=wp.vec3),
-        grad_sh_v3: wp.array(dtype=wp.vec3),
-        dRGBdx_v3: wp.array(dtype=wp.vec3),
-        dRGBdy_v3: wp.array(dtype=wp.vec3),
-        dRGBdz_v3: wp.array(dtype=wp.vec3),
-    ):
-        tid = wp.tid()
-
-        dir_orig = means3d[tid] - wp.vec3(campos_flat[0], campos_flat[1], campos_flat[2])
-        dir_len_sq = wp.dot(dir_orig, dir_orig)
-        inv_dir_len = 1.0 / wp.sqrt(wp.max(dir_len_sq, 1.0e-20))
-        direction = dir_orig * inv_dir_len
-        x = direction[0]
-        y = direction[1]
-        z = direction[2]
-
-        grad_rgb = masked_grad_color[tid]
-
-        acc_dx = wp.vec3(0.0, 0.0, 0.0)
-        acc_dy = wp.vec3(0.0, 0.0, 0.0)
-        acc_dz = wp.vec3(0.0, 0.0, 0.0)
-
-        if coeff_count > 0:
-            grad_sh_v3[tid] = sh_c0 * grad_rgb
-
-        if degree > 0 and coeff_count > 3:
-            grad_sh_v3[point_count + tid] = (-sh_c1 * y) * grad_rgb
-            grad_sh_v3[2 * point_count + tid] = (sh_c1 * z) * grad_rgb
-            grad_sh_v3[3 * point_count + tid] = (-sh_c1 * x) * grad_rgb
-
-            acc_dx = (-sh_c1) * shs_v3[3 * point_count + tid]
-            acc_dy = (-sh_c1) * shs_v3[point_count + tid]
-            acc_dz = sh_c1 * shs_v3[2 * point_count + tid]
-
-        dRGBdx_v3[tid] = acc_dx
-        dRGBdy_v3[tid] = acc_dy
-        dRGBdz_v3[tid] = acc_dz
-
-    @wp.kernel
-    def _backward_rgb_from_sh_deg23_v3_warp_kernel(
-        means3d: wp.array(dtype=wp.vec3),
-        campos_flat: wp.array(dtype=wp.float32),
-        shs_v3: wp.array(dtype=wp.vec3),
-        degree: wp.int32,
-        coeff_count: wp.int32,
-        point_count: wp.int32,
-        masked_grad_color: wp.array(dtype=wp.vec3),
-        dRGBdx_v3: wp.array(dtype=wp.vec3),
-        dRGBdy_v3: wp.array(dtype=wp.vec3),
-        dRGBdz_v3: wp.array(dtype=wp.vec3),
+        grad_color_v3: wp.array(dtype=wp.vec3),
+        clamped_flat: wp.array(dtype=wp.int32),
         grad_means: wp.array(dtype=wp.vec3),
         grad_sh_v3: wp.array(dtype=wp.vec3),
     ):
@@ -1814,11 +1787,32 @@ if wp is not None:
         y = direction[1]
         z = direction[2]
 
-        grad_rgb = masked_grad_color[tid]
+        # M2: inline clamp masking (avoids _masked_grad allocation)
+        _gc = grad_color_v3[tid]
+        grad_rgb = wp.vec3(
+            _gc[0] * (1.0 - wp.float32(clamped_flat[tid * 3])),
+            _gc[1] * (1.0 - wp.float32(clamped_flat[tid * 3 + 1])),
+            _gc[2] * (1.0 - wp.float32(clamped_flat[tid * 3 + 2])),
+        )
 
-        acc_dx = dRGBdx_v3[tid]
-        acc_dy = dRGBdy_v3[tid]
-        acc_dz = dRGBdz_v3[tid]
+        acc_dx = wp.vec3(0.0, 0.0, 0.0)
+        acc_dy = wp.vec3(0.0, 0.0, 0.0)
+        acc_dz = wp.vec3(0.0, 0.0, 0.0)
+
+        # M1: AoS indexing — base = tid * coeff_count
+        _base = tid * coeff_count
+
+        if coeff_count > 0:
+            grad_sh_v3[_base] = sh_c0 * grad_rgb
+
+        if degree > 0 and coeff_count > 3:
+            grad_sh_v3[_base + 1] = (-sh_c1 * y) * grad_rgb
+            grad_sh_v3[_base + 2] = (sh_c1 * z) * grad_rgb
+            grad_sh_v3[_base + 3] = (-sh_c1 * x) * grad_rgb
+
+            acc_dx = (-sh_c1) * shs_v3[_base + 3]
+            acc_dy = (-sh_c1) * shs_v3[_base + 1]
+            acc_dz = sh_c1 * shs_v3[_base + 2]
 
         if degree > 1 and coeff_count > 8:
             xx = x * x
@@ -1828,38 +1822,38 @@ if wp is not None:
             yz = y * z
             xz = x * z
 
-            grad_sh_v3[4 * point_count + tid] = (sh_c2_0 * xy) * grad_rgb
-            grad_sh_v3[5 * point_count + tid] = (sh_c2_1 * yz) * grad_rgb
-            grad_sh_v3[6 * point_count + tid] = (sh_c2_2 * (2.0 * zz - xx - yy)) * grad_rgb
-            grad_sh_v3[7 * point_count + tid] = (sh_c2_3 * xz) * grad_rgb
-            grad_sh_v3[8 * point_count + tid] = (sh_c2_4 * (xx - yy)) * grad_rgb
+            grad_sh_v3[_base + 4] = (sh_c2_0 * xy) * grad_rgb
+            grad_sh_v3[_base + 5] = (sh_c2_1 * yz) * grad_rgb
+            grad_sh_v3[_base + 6] = (sh_c2_2 * (2.0 * zz - xx - yy)) * grad_rgb
+            grad_sh_v3[_base + 7] = (sh_c2_3 * xz) * grad_rgb
+            grad_sh_v3[_base + 8] = (sh_c2_4 * (xx - yy)) * grad_rgb
 
-            s4 = shs_v3[4 * point_count + tid]
-            s5 = shs_v3[5 * point_count + tid]
-            s6 = shs_v3[6 * point_count + tid]
-            s7 = shs_v3[7 * point_count + tid]
-            s8 = shs_v3[8 * point_count + tid]
+            s4 = shs_v3[_base + 4]
+            s5 = shs_v3[_base + 5]
+            s6 = shs_v3[_base + 6]
+            s7 = shs_v3[_base + 7]
+            s8 = shs_v3[_base + 8]
 
             acc_dx = acc_dx + (sh_c2_0 * y) * s4 + (sh_c2_2 * (-2.0 * x)) * s6 + (sh_c2_3 * z) * s7 + (sh_c2_4 * (2.0 * x)) * s8
             acc_dy = acc_dy + (sh_c2_0 * x) * s4 + (sh_c2_1 * z) * s5 + (sh_c2_2 * (-2.0 * y)) * s6 + (sh_c2_4 * (-2.0 * y)) * s8
             acc_dz = acc_dz + (sh_c2_1 * y) * s5 + (sh_c2_2 * (4.0 * z)) * s6 + (sh_c2_3 * x) * s7
 
             if degree > 2 and coeff_count > 15:
-                grad_sh_v3[9 * point_count + tid] = (sh_c3_0 * y * (3.0 * xx - yy)) * grad_rgb
-                grad_sh_v3[10 * point_count + tid] = (sh_c3_1 * xy * z) * grad_rgb
-                grad_sh_v3[11 * point_count + tid] = (sh_c3_2 * y * (4.0 * zz - xx - yy)) * grad_rgb
-                grad_sh_v3[12 * point_count + tid] = (sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy)) * grad_rgb
-                grad_sh_v3[13 * point_count + tid] = (sh_c3_4 * x * (4.0 * zz - xx - yy)) * grad_rgb
-                grad_sh_v3[14 * point_count + tid] = (sh_c3_5 * z * (xx - yy)) * grad_rgb
-                grad_sh_v3[15 * point_count + tid] = (sh_c3_6 * x * (xx - 3.0 * yy)) * grad_rgb
+                grad_sh_v3[_base + 9] = (sh_c3_0 * y * (3.0 * xx - yy)) * grad_rgb
+                grad_sh_v3[_base + 10] = (sh_c3_1 * xy * z) * grad_rgb
+                grad_sh_v3[_base + 11] = (sh_c3_2 * y * (4.0 * zz - xx - yy)) * grad_rgb
+                grad_sh_v3[_base + 12] = (sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy)) * grad_rgb
+                grad_sh_v3[_base + 13] = (sh_c3_4 * x * (4.0 * zz - xx - yy)) * grad_rgb
+                grad_sh_v3[_base + 14] = (sh_c3_5 * z * (xx - yy)) * grad_rgb
+                grad_sh_v3[_base + 15] = (sh_c3_6 * x * (xx - 3.0 * yy)) * grad_rgb
 
-                s9 = shs_v3[9 * point_count + tid]
-                s10 = shs_v3[10 * point_count + tid]
-                s11 = shs_v3[11 * point_count + tid]
-                s12 = shs_v3[12 * point_count + tid]
-                s13 = shs_v3[13 * point_count + tid]
-                s14 = shs_v3[14 * point_count + tid]
-                s15 = shs_v3[15 * point_count + tid]
+                s9 = shs_v3[_base + 9]
+                s10 = shs_v3[_base + 10]
+                s11 = shs_v3[_base + 11]
+                s12 = shs_v3[_base + 12]
+                s13 = shs_v3[_base + 13]
+                s14 = shs_v3[_base + 14]
+                s15 = shs_v3[_base + 15]
 
                 acc_dx = acc_dx + (sh_c3_0 * (6.0 * xy)) * s9 + (sh_c3_1 * yz) * s10 + (sh_c3_2 * (-2.0 * xy)) * s11 + (sh_c3_3 * (-6.0 * xz)) * s12 + (sh_c3_4 * (-3.0 * xx + 4.0 * zz - yy)) * s13 + (sh_c3_5 * (2.0 * xz)) * s14 + (sh_c3_6 * (3.0 * (xx - yy))) * s15
                 acc_dy = acc_dy + (sh_c3_0 * (3.0 * (xx - yy))) * s9 + (sh_c3_1 * xz) * s10 + (sh_c3_2 * (-3.0 * yy + 4.0 * zz - xx)) * s11 + (sh_c3_3 * (-6.0 * yz)) * s12 + (sh_c3_4 * (-2.0 * xy)) * s13 + (sh_c3_5 * (-2.0 * yz)) * s14 + (sh_c3_6 * (-6.0 * xy)) * s15
@@ -3328,34 +3322,42 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
     clamped_int = torch.empty((point_count, NUM_CHANNELS), dtype=torch.int32, device=means3D.device)
 
     coeff_count = shs.shape[1]
-    wp.launch(
-        kernel=_forward_rgb_from_sh_warp_kernel,
-        dim=point_count,
-        inputs=[
-            wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-            wp.from_torch(campos.detach().contiguous().reshape(-1), dtype=wp.float32),
-            wp.from_torch(shs.detach().contiguous().reshape(-1), dtype=wp.float32),
-            int(degree),
-            int(coeff_count),
-        ],
-        outputs=[
-            wp.from_torch(rgb.reshape(-1), dtype=wp.float32),
-            wp.from_torch(clamped_int.reshape(-1), dtype=wp.int32),
-        ],
-        device=str(means3D.device),
-    )
+    _dev = str(means3D.device)
+    _inp = [
+        wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
+        wp.from_torch(campos.detach().contiguous().reshape(-1), dtype=wp.float32),
+        wp.from_torch(shs.detach().contiguous().reshape(-1), dtype=wp.float32),
+        int(degree),
+        int(coeff_count),
+    ]
+    _out = [
+        wp.from_torch(rgb.reshape(-1), dtype=wp.float32),
+        wp.from_torch(clamped_int.reshape(-1), dtype=wp.int32),
+    ]
+    _key = (_dev, point_count)
+    _cmd = _C4_LAUNCH_CACHE_FWD_SH.get(_key)
+    if _cmd is None:
+        _cmd = wp.launch(kernel=_forward_rgb_from_sh_warp_kernel, dim=point_count,
+                         inputs=_inp, outputs=_out, device=_dev, record_cmd=True)
+        _C4_LAUNCH_CACHE_FWD_SH[_key] = _cmd
+    else:
+        for _i, _v in enumerate(_inp + _out):
+            _cmd.set_param_at_index(_i, _v)
+    _cmd.launch()
     return rgb, clamped_int
 
 
 def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color):
     point_count = means3D.shape[0]
     grad_means = torch.empty(means3D.shape, dtype=means3D.dtype, device=means3D.device)
-    grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=shs.device)
+    # S1: grad_sh allocated per-branch to avoid peak overlap
     if point_count == 0 or shs.numel() == 0:
+        grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=shs.device)
         return grad_means, grad_sh
 
     coeff_count = shs.shape[1]
-    clamped_i32 = clamped.to(torch.int32).contiguous()
+    # L2: skip conversion when clamped already int32 (from geom_buffer unpack or SH forward)
+    clamped_i32 = clamped.contiguous() if clamped.dtype == torch.int32 else clamped.to(torch.int32).contiguous()
     _dev = str(means3D.device)
 
     _w_means = wp.from_torch(means3D.contiguous(), dtype=wp.vec3)
@@ -3364,6 +3366,7 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
 
     if degree <= 1:
         # degree 0-1: use monolithic kernel (scalar arrays, no deg 2-3 work)
+        grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=shs.device)
         _w_shs = wp.from_torch(shs.contiguous().reshape(-1), dtype=wp.float32)
         _w_clamped = wp.from_torch(clamped_i32.reshape(-1), dtype=wp.int32)
         _w_grad_color = wp.from_torch(grad_color.contiguous().reshape(-1), dtype=wp.float32)
@@ -3381,47 +3384,27 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
                 _cmd.set_param_at_index(_i, _v)
         _cmd.launch()
     else:
-        # F1: vec3-typed SoA split kernels for improved memory coalescing
-        # SoA transpose: (N, coeff, 3) -> (coeff, N, 3) -> flat (coeff*N, 3)
-        _shs_soa = shs.contiguous().permute(1, 0, 2).contiguous().reshape(-1, 3)
-        _w_shs_v3 = wp.from_torch(_shs_soa, dtype=wp.vec3)
-        _grad_sh_soa = torch.zeros(coeff_count, point_count, 3, dtype=shs.dtype, device=means3D.device)
-        _w_grad_sh_v3 = wp.from_torch(_grad_sh_soa.reshape(-1, 3), dtype=wp.vec3)
-        _masked_grad = (grad_color.contiguous().reshape(-1) * (1.0 - clamped_i32.reshape(-1).float())).reshape(-1, 3)
-        _w_masked_grad = wp.from_torch(_masked_grad, dtype=wp.vec3)
-        _dRGBd_buf = torch.empty(point_count * 9, dtype=means3D.dtype, device=means3D.device)
-        _w_dRGBdx = wp.from_torch(_dRGBd_buf[:point_count * 3].reshape(-1, 3), dtype=wp.vec3)
-        _w_dRGBdy = wp.from_torch(_dRGBd_buf[point_count * 3 : point_count * 6].reshape(-1, 3), dtype=wp.vec3)
-        _w_dRGBdz = wp.from_torch(_dRGBd_buf[point_count * 6 : point_count * 9].reshape(-1, 3), dtype=wp.vec3)
-        _pc = int(point_count)
+        # M1: AoS direct — no SoA transpose needed, kernels index shs as (P*coeff, 3)
+        _w_shs_v3 = wp.from_torch(shs.contiguous().reshape(-1, 3), dtype=wp.vec3)
+        grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=means3D.device)
+        _w_grad_sh_v3 = wp.from_torch(grad_sh.reshape(-1, 3), dtype=wp.vec3)
+        # M2: pass grad_color + clamped directly to kernel (avoids _masked_grad allocation)
+        _w_grad_color_v3 = wp.from_torch(grad_color.contiguous().reshape(-1, 3), dtype=wp.vec3)
+        _w_clamped_i32 = wp.from_torch(clamped_i32.reshape(-1), dtype=wp.int32)
         _key = (_dev, point_count)
 
-        _inp1 = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), _pc, _w_masked_grad]
-        _out1 = [_w_grad_sh_v3, _w_dRGBdx, _w_dRGBdy, _w_dRGBdz]
-        _cmd1 = _C4_LAUNCH_CACHE_SH_DEG01_V3.get(_key)
-        if _cmd1 is None:
-            _cmd1 = wp.launch(kernel=_backward_rgb_from_sh_deg01_v3_warp_kernel, dim=point_count,
-                              inputs=_inp1, outputs=_out1, device=_dev, record_cmd=True)
-            _C4_LAUNCH_CACHE_SH_DEG01_V3[_key] = _cmd1
+        # Merged deg 0-3 kernel — dRGBd is register-local, no intermediate buffer
+        _inp = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), _w_grad_color_v3, _w_clamped_i32]
+        _out = [_w_grad_means, _w_grad_sh_v3]
+        _cmd = _C4_LAUNCH_CACHE_SH_V3.get(_key)
+        if _cmd is None:
+            _cmd = wp.launch(kernel=_backward_rgb_from_sh_v3_warp_kernel, dim=point_count,
+                             inputs=_inp, outputs=_out, device=_dev, record_cmd=True)
+            _C4_LAUNCH_CACHE_SH_V3[_key] = _cmd
         else:
-            for _i, _v in enumerate(_inp1 + _out1):
-                _cmd1.set_param_at_index(_i, _v)
-        _cmd1.launch()
-
-        _inp2 = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), _pc, _w_masked_grad, _w_dRGBdx, _w_dRGBdy, _w_dRGBdz]
-        _out2 = [_w_grad_means, _w_grad_sh_v3]
-        _cmd2 = _C4_LAUNCH_CACHE_SH_DEG23_V3.get(_key)
-        if _cmd2 is None:
-            _cmd2 = wp.launch(kernel=_backward_rgb_from_sh_deg23_v3_warp_kernel, dim=point_count,
-                              inputs=_inp2, outputs=_out2, device=_dev, record_cmd=True)
-            _C4_LAUNCH_CACHE_SH_DEG23_V3[_key] = _cmd2
-        else:
-            for _i, _v in enumerate(_inp2 + _out2):
-                _cmd2.set_param_at_index(_i, _v)
-        _cmd2.launch()
-
-        # SoA -> AoS transpose: (coeff, N, 3) -> (N, coeff, 3)
-        grad_sh = _grad_sh_soa.permute(1, 0, 2).contiguous().reshape_as(shs)
+            for _i, _v in enumerate(_inp + _out):
+                _cmd.set_param_at_index(_i, _v)
+        _cmd.launch()
 
     return grad_means, grad_sh
 
@@ -3524,19 +3507,30 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
             block_dim=_get_block_dim("render"),
         )
     else:
-        wp.launch(
-            kernel=_render_tiles_fast_warp_kernel,
-            dim=image_height * image_width,
-            inputs=_common_inputs,
-            outputs=[
-                wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
-                wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
-                wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
-                wp.from_torch(n_contrib, dtype=wp.int32),
-            ],
-            device=str(device),
-            block_dim=_get_block_dim("render"),
-        )
+        _render_dim = image_height * image_width
+        _render_out = [
+            wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
+            wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
+            wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
+            wp.from_torch(n_contrib, dtype=wp.int32),
+        ]
+        _render_key = (str(device), _render_dim)
+        _render_cmd = _C4_LAUNCH_CACHE_FWD_RENDER.get(_render_key)
+        if _render_cmd is None:
+            _render_cmd = wp.launch(
+                kernel=_render_tiles_fast_warp_kernel,
+                dim=_render_dim,
+                inputs=_common_inputs,
+                outputs=_render_out,
+                device=str(device),
+                record_cmd=True,
+                block_dim=_get_block_dim("render"),
+            )
+            _C4_LAUNCH_CACHE_FWD_RENDER[_render_key] = _render_cmd
+        else:
+            for _i, _v in enumerate(_common_inputs + _render_out):
+                _render_cmd.set_param_at_index(_i, _v)
+        _render_cmd.launch()
     return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
 
@@ -3565,15 +3559,46 @@ def _build_binning_state(
 
         sorted_point_ids: torch.Tensor | None = None
         if point_count > 0 and sort_mode == "warp_depth_stable_tile":
-            point_depth_key_buffer, point_id_buffer, _, _ = _get_radix_sort_i32_buffers(device, point_count * 2)
-            point_depth_keys = point_depth_key_buffer[:point_count]
-            sorted_point_ids = point_id_buffer[:point_count]
-            point_depth_keys.copy_(depths.view(torch.int32))
-            sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
-            point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(point_depth_key_buffer, point_id_buffer, point_count)
-            # Clone to avoid aliasing: step 2 reuses the same i32 cache buffers
-            # for tile-point duplicate sorting, which would overwrite sorted_point_ids.
-            sorted_point_ids = sorted_point_ids.clone()
+            device_key = str(device)
+            _hint_skip = False
+
+            # O6: Check if previous depth sort order is still valid
+            _cached_order = _DEPTH_SORT_ORDER_CACHE.get(device_key)
+            if _cached_order is not None:
+                _cached_ids, _cached_count = _cached_order
+                if _cached_count == point_count:
+                    _flag = _DEPTH_SORT_CHECK_FLAG.get(device_key)
+                    if _flag is None:
+                        _flag = torch.zeros(1, dtype=torch.int32, device=device)
+                        _DEPTH_SORT_CHECK_FLAG[device_key] = _flag
+                    else:
+                        _flag.zero_()
+                    _depths_i32 = depths.view(torch.int32).contiguous()
+                    wp.launch(
+                        kernel=_check_depth_order_warp_kernel,
+                        dim=point_count,
+                        inputs=[
+                            wp.from_torch(_depths_i32, dtype=wp.int32),
+                            wp.from_torch(_cached_ids, dtype=wp.int32),
+                            wp.from_torch(_flag, dtype=wp.int32),
+                        ],
+                        device=device_key,
+                    )
+                    if _flag[0].item() == 0:
+                        _hint_skip = True
+                        sorted_point_ids = _cached_ids
+
+            if not _hint_skip:
+                point_depth_key_buffer, point_id_buffer, _, _ = _get_radix_sort_i32_buffers(device, point_count * 2)
+                point_depth_keys = point_depth_key_buffer[:point_count]
+                sorted_point_ids = point_id_buffer[:point_count]
+                point_depth_keys.copy_(depths.view(torch.int32))
+                sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
+                point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(point_depth_key_buffer, point_id_buffer, point_count)
+                # Clone to avoid aliasing: step 2 reuses the same i32 cache buffers
+                # for tile-point duplicate sorting, which would overwrite sorted_point_ids.
+                sorted_point_ids = sorted_point_ids.clone()
+                _DEPTH_SORT_ORDER_CACHE[device_key] = (sorted_point_ids, point_count)
 
             sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
@@ -4027,14 +4052,23 @@ def preprocess_gaussians(
                   wp.from_torch(tiles_touched, dtype=wp.int32),
                   wp.from_torch(conic_opacity, dtype=wp.vec4),
               ]
-              wp.launch(
-                  kernel=_fused_project_cov3d_cov2d_preprocess_sr_warp_kernel,
-                  dim=point_count,
-                  inputs=_e1_inp,
-                  outputs=_e1_out,
-                  device=str(device),
-                  block_dim=_get_block_dim("preprocess"),
-              )
+              _e1_key = (str(device), point_count)
+              _e1_cmd = _C4_LAUNCH_CACHE_FWD_PREPROCESS.get(_e1_key)
+              if _e1_cmd is None:
+                  _e1_cmd = wp.launch(
+                      kernel=_fused_project_cov3d_cov2d_preprocess_sr_warp_kernel,
+                      dim=point_count,
+                      inputs=_e1_inp,
+                      outputs=_e1_out,
+                      device=str(device),
+                      record_cmd=True,
+                      block_dim=_get_block_dim("preprocess"),
+                  )
+                  _C4_LAUNCH_CACHE_FWD_PREPROCESS[_e1_key] = _e1_cmd
+              else:
+                  for _i, _v in enumerate(_e1_inp + _e1_out):
+                      _e1_cmd.set_param_at_index(_i, _v)
+              _e1_cmd.launch()
           p_proj_all = None
           p_view_z_all = None
         elif has_precomputed_cov:
@@ -4225,15 +4259,17 @@ def _rasterize_gaussians_backward_python(*args: Any):
         point_count = means3D.shape[0]
         device = means3D.device
         # C3: grad_means2D and grad_means3D allocated later by fused accumulation kernel
-        grad_colors = torch.zeros_like(_colors)
-        grad_opacities = torch.zeros_like(_opacities)
-        grad_cov3D = torch.zeros_like(_cov3D_precomp)
-        grad_sh = torch.zeros_like(_sh)
-        grad_scales = torch.zeros_like(_scales)
-        grad_rotations = torch.zeros_like(_rotations)
+        # O3: empty_like for grads that are always overwritten before return
+        grad_colors = torch.empty_like(_colors)
+        grad_opacities = torch.empty_like(_opacities)
+        grad_cov3D = torch.empty_like(_cov3D_precomp)
+        # L1: grad_scales/grad_rotations deferred to branch interiors (saves ~7 MB @262K on fused path)
         if point_count == 0:
             grad_means2D = torch.zeros((point_count, 3), dtype=torch.float32, device=device)
             grad_means3D = torch.zeros_like(means3D)
+            grad_sh = torch.empty_like(_sh)
+            grad_scales = torch.zeros_like(_scales)
+            grad_rotations = torch.zeros_like(_rotations)
             return grad_means2D, grad_colors, grad_opacities, grad_means3D, grad_cov3D, grad_sh, grad_scales, grad_rotations
 
         image_height = grad_color.shape[1]
@@ -4346,13 +4382,16 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     render_grad_feature,
                 )
                 grad_sh = grad_sh_local.reshape_as(_sh)
+        else:
+                grad_sh = torch.empty_like(_sh)
         
         if _use_fused_cov:
                 grad_means3D = torch.empty(means3D.shape, dtype=means3D.dtype, device=device)
                 grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
                 grad_scales = torch.empty(_scales.shape, dtype=_scales.dtype, device=device)
                 grad_rotations = torch.empty(_rotations.shape, dtype=_rotations.dtype, device=device)
-                _sh_grad = _grad_mean_sh if _has_sh else means3D.new_zeros(means3D.shape)
+                # L3: when has_sh=False the kernel never reads grad_sh_means — reuse means3D to avoid zero alloc
+                _sh_grad = _grad_mean_sh if _has_sh else means3D
                 _proj_flat = _projmatrix.contiguous().reshape(-1)
                 _view_flat = _viewmatrix.contiguous().reshape(-1)
                 _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
@@ -4446,8 +4485,11 @@ def _rasterize_gaussians_backward_python(*args: Any):
                         _acc_cmd.set_param_at_index(_i, _v)
                 _acc_cmd.launch()
 
+                # L1: allocate grad_scales/grad_rotations per-branch
                 if _cov3D_precomp.numel() != 0:
                     grad_cov3D = grad_cov_from_cov2d
+                    grad_scales = torch.zeros_like(_scales)
+                    grad_rotations = torch.zeros_like(_rotations)
                 elif _scales.numel() != 0 and _rotations.numel() != 0:
                     grad_scales, grad_rotations = _backward_cov3d_from_scale_rotation_warp(
                         _scales,
@@ -4455,6 +4497,9 @@ def _rasterize_gaussians_backward_python(*args: Any):
                         _rotations,
                         grad_cov_from_cov2d,
                     )
+                else:
+                    grad_scales = torch.zeros_like(_scales)
+                    grad_rotations = torch.zeros_like(_rotations)
 
         return grad_means2D, grad_colors, grad_opacities, grad_means3D, grad_cov3D, grad_sh, grad_scales, grad_rotations
 

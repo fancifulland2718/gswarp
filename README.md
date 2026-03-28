@@ -406,11 +406,11 @@ The test configuration is as follows:
 - `auto_tune=True`
 - `auto_tune_verbose=True`
 - test scales: **4,096 / 16,384 / 65,536 / 262,144** particles
-- evaluation entry: `tests/evaluate_warp_backend_sort_modes.py --warp-backend-module-path diff_gaussian_rasterization/release.py`
 
-Across the full 4-sort-mode sweep, the preprocess diagnostics stay aligned and the final forward outputs remain exact at the checked tolerance for all 16 combinations. The only remaining differences are sparse backward outliers, and their pattern depends on both the point count and the chosen sort backend.
 
-### How the four `release.py` sort backends work
+Across the full 4-sort-mode sweep of the updated warp-backend, the preprocess diagnostics stay aligned and the final forward outputs remain exact at the checked tolerance for all 16 combinations. The only remaining differences are sparse backward outliers, and the "best" sort mode now clearly depends on scale.
+
+### How the four warp-backend sort backends work
 
 All four modes share the exact same **preprocess / render / backward-render** kernels. The only thing that changes is **how the binning stage builds and sorts `(tile, point)` pairs**:
 
@@ -421,7 +421,7 @@ All four modes share the exact same **preprocess / render / backward-render** ke
 
 So the four backends do **not** disagree on the preprocess math or the rendering formula. They only disagree on **the order in which the same Gaussians are fed into each tile**, which is why the remaining differences show up only in sparse backward outliers.
 
-### `release.py` sort-mode sweep
+### warp-backend sort-mode sweep
 
 > In this experiment each run explicitly forces `binning_sort_mode`, so the requested mode and the actually executed mode would be redundant in the README tables.
 
@@ -436,32 +436,32 @@ So the four backends do **not** disagree on the preprocess math or the rendering
         </tr>
     </thead>
     <tbody>
-        <tr><td rowspan="4"><strong>4,096</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.037109</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td><strong>0.011719</strong></td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.039062</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>opacity</code>: 1 / 4,096 (0.024414%)</td><td>0.048828</td></tr>
-        <tr><td rowspan="4"><strong>16,384</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.014648</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.015625</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td>clean</td><td><strong>0.010742</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td>0.011230</td></tr>
-        <tr><td rowspan="4"><strong>65,536</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.375000</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>scales</code>: 2 / 196,608 (0.001017%)<br><code>rotations</code>: 4 / 262,144 (0.001526%)</td><td><strong>0.171875</strong></td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 1 / 65,536 (0.001526%)<br><code>shs</code>: 7 / 3,145,728 (0.000223%)</td><td>0.343750</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 6 / 196,608 (0.003052%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 13 / 3,145,728 (0.000413%)<br><code>rotations</code>: 3 / 262,144 (0.001144%)</td><td>0.218750</td></tr>
-        <tr><td rowspan="4"><strong>262,144</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 6 / 786,432 (0.000763%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 49 / 12,582,912 (0.000389%)<br><code>scales</code>: 5 / 786,432 (0.000636%)<br><code>rotations</code>: 5 / 1,048,576 (0.000477%)</td><td>0.578125</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 786,432 (0.000381%)<br><code>means2D</code>: 2 / 786,432 (0.000254%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 7 / 12,582,912 (0.000056%)<br><code>scales</code>: 3 / 786,432 (0.000381%)<br><code>rotations</code>: 4 / 1,048,576 (0.000381%)</td><td><strong>0.156250</strong></td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 9 / 786,432 (0.001144%)<br><code>means2D</code>: 5 / 786,432 (0.000636%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 79 / 12,582,912 (0.000628%)<br><code>scales</code>: 6 / 786,432 (0.000763%)<br><code>rotations</code>: 9 / 1,048,576 (0.000858%)</td><td>0.429688</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 7 / 786,432 (0.000890%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 3 / 262,144 (0.001144%)<br><code>shs</code>: 70 / 12,582,912 (0.000556%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.734375</td></tr>
+        <tr><td rowspan="4"><strong>4,096</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.039062</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.019531</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.035156</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td><strong>0.012695</strong></td></tr>
+        <tr><td rowspan="4"><strong>16,384</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.007812</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.014648</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>shs</code>: 2 / 786,432 (0.000254%)</td><td>0.023438</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td><strong>0.005859</strong></td></tr>
+        <tr><td rowspan="4"><strong>65,536</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 2 / 196,608 (0.001017%)<br><code>means2D</code>: 1 / 196,608 (0.000509%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>scales</code>: 1 / 196,608 (0.000509%)<br><code>rotations</code>: 2 / 262,144 (0.000763%)</td><td><strong>0.066406</strong></td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>rotations</code>: 1 / 262,144 (0.000381%)</td><td>0.125000</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 3 / 3,145,728 (0.000095%)<br><code>scales</code>: 1 / 196,608 (0.000509%)<br><code>rotations</code>: 3 / 262,144 (0.001144%)</td><td>0.250000</td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 4 / 196,608 (0.002035%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)</td><td>0.179688</td></tr>
+        <tr><td rowspan="4"><strong>262,144</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 5 / 786,432 (0.000636%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 4 / 262,144 (0.001526%)<br><code>shs</code>: 51 / 12,582,912 (0.000405%)<br><code>scales</code>: 3 / 786,432 (0.000381%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.593750</td></tr>
+        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 5 / 786,432 (0.000636%)<br><code>means2D</code>: 2 / 786,432 (0.000254%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 4 / 12,582,912 (0.000032%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.562500</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 4 / 786,432 (0.000509%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 21 / 12,582,912 (0.000167%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 6 / 1,048,576 (0.000572%)</td><td><strong>0.328125</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 7 / 786,432 (0.000890%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 49 / 12,582,912 (0.000389%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 5 / 1,048,576 (0.000477%)</td><td>0.390625</td></tr>
     </tbody>
 </table>
 
 Attribution:
 
-- All four modes keep preprocess tensors aligned and preserve exact forward outputs at the checked tolerance, so the remaining issue is **not** a preprocess or render-path bug.
-- The out-of-threshold backward coverage stays extremely small: the worst 4K case is only **1 / 4,096 = 0.024414%**, and most large-scale fields drop into the **$10^{-3}\%$ to $10^{-4}\%$** range.
-- The residuals track the sort path, which strongly suggests a **binning-order effect**: once the tile-local traversal order changes, alpha compositing and backward `atomic_add` accumulate floating-point terms in a different order, producing a few sparse gradient spikes.
-- `warp_radix` also keeps `WARP_RADIX_DETERMINISTIC_TIEBREAK = False`, so equal-key tie breaks are more likely to differ from the CUDA/CUB reference; `warp_depth_stable_tile` and `torch_count` add extra reorder steps that can also perturb a few boundary samples.
-- Empirically, `torch` gives the smallest residuals at 65K and 262K, suggesting that its stable-sort path stays closer to the CUDA baseline traversal order at large scale — but that is an observed trend, not a different preprocessing formula.
+- All four modes still keep preprocess tensors aligned and preserve exact forward outputs at the checked tolerance, so the remaining issue is **still not** a preprocess or render-path bug.
+- The out-of-threshold backward coverage remains extremely small: even at 4K / 16K the worst case is only **1 / 12,288 = 0.008138%**, and by 65K / 262K most individual fields are down in the **$10^{-3}\%$ to $10^{-4}\%$** range.
+- The residuals still track the sort path, which strongly supports a **binning-order effect**: once the tile-local traversal order changes, alpha compositing and backward `atomic_add` accumulate floating-point terms in a different order and produce a few sparse gradient spikes.
+- In the updated release, there is no longer a single "correctness winner" across all scales: `torch_count` is cleanest at 4K / 16K, `warp_radix` has the smallest max-diff at 65K, and `warp_depth_stable_tile` takes over at 262K. So the new implementation has clearly reshuffled the residual distribution without changing the overall conclusion that the remaining errors are sparse and numerically small.
+- `warp_radix` still keeps `WARP_RADIX_DETERMINISTIC_TIEBREAK = False`, and `warp_depth_stable_tile` / `torch_count` still introduce extra reorder steps, so these residuals are best understood as **sort-induced floating-point accumulation differences**, not as a different preprocess formula.
 
 ---
 
@@ -473,11 +473,12 @@ Methodology:
 
 - **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched **CUDA-event** timing pass over the measured iterations; the `Public API FW / Public API BW / Total iteration` columns below all come from this path and are the right numbers for end-to-end comparisons.
 - **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
+- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; the stage totals run through the **non-`return_stats` execution path** and are wrapped directly by **CUDA events**, so `Internal binning GPU time` is now a pure internal GPU timing and no longer includes Python / ATen wall-clock contamination. The official sweep intentionally leaves the stage-breakdown dictionaries empty so the diagnostic machinery does not perturb the totals; `Internal binning scratch` is still kept to show temporary-memory pressure by sort mode.
 
 
 For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively, for each sort mode.
 
-### CUDA baseline + `release.py` sort-mode sweep
+### CUDA baseline + warp-backend sort-mode sweep
 
 <table>
     <thead>
@@ -491,26 +492,26 @@ For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 
         </tr>
     </thead>
     <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>4.421 ms</td><td>3.082 ms</td><td>7.503 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>3.829 ms</td><td>2.850 ms</td><td>6.679 ms</td><td><strong>1.046 ms</strong></td></tr>
-        <tr><td><code>torch</code></td><td>3.896 ms</td><td><strong>2.554 ms</strong></td><td>6.449 ms</td><td>2.559 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>3.034 ms</strong></td><td>3.119 ms</td><td>6.153 ms</td><td>1.066 ms</td></tr>
-        <tr><td><code>torch_count</code></td><td>3.150 ms</td><td>2.989 ms</td><td><strong>6.139 ms</strong></td><td>2.504 ms</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.647 ms</td><td>2.865 ms</td><td>6.511 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>4.084 ms</td><td>3.811 ms</td><td>7.894 ms</td><td><strong>1.774 ms</strong></td></tr>
-        <tr><td><code>torch</code></td><td>3.796 ms</td><td><strong>2.522 ms</strong></td><td><strong>6.319 ms</strong></td><td>2.649 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.351 ms</td><td>3.738 ms</td><td>7.089 ms</td><td>2.047 ms</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>3.312 ms</strong></td><td>3.413 ms</td><td>6.725 ms</td><td>2.836 ms</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>11.788 ms</td><td>3.343 ms</td><td>15.131 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>11.391 ms</strong></td><td>3.043 ms</td><td><strong>14.433 ms</strong></td><td>14.769 ms</td></tr>
-        <tr><td><code>torch</code></td><td>13.141 ms</td><td>3.046 ms</td><td>16.187 ms</td><td>27.256 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>14.015 ms</td><td><strong>3.019 ms</strong></td><td>17.034 ms</td><td><strong>11.108 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>13.211 ms</td><td>3.196 ms</td><td>16.408 ms</td><td>29.091 ms</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>94.492 ms</td><td><strong>7.900 ms</strong></td><td>102.392 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>94.002 ms</strong></td><td>8.143 ms</td><td><strong>102.145 ms</strong></td><td>138.323 ms</td></tr>
-        <tr><td><code>torch</code></td><td>96.775 ms</td><td>7.922 ms</td><td>104.697 ms</td><td>571.229 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>100.043 ms</td><td>8.416 ms</td><td>108.459 ms</td><td><strong>85.941 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>261.481 ms</td><td>597.331 ms</td><td>858.813 ms</td><td>689.049 ms</td></tr>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>2.865 ms</td><td>3.154 ms</td><td>6.018 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td><strong>2.605 ms</strong></td><td>2.663 ms</td><td><strong>5.268 ms</strong></td><td><strong>1.108 ms</strong></td></tr>
+        <tr><td><code>torch</code></td><td>4.347 ms</td><td>4.183 ms</td><td>8.530 ms</td><td>4.080 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>3.376 ms</td><td>3.467 ms</td><td>6.843 ms</td><td>1.549 ms</td></tr>
+        <tr><td><code>torch_count</code></td><td>3.568 ms</td><td><strong>2.385 ms</strong></td><td>5.953 ms</td><td>2.493 ms</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.982 ms</td><td>3.398 ms</td><td>7.380 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>3.862 ms</td><td><strong>2.470 ms</strong></td><td>6.332 ms</td><td>1.742 ms</td></tr>
+        <tr><td><code>torch</code></td><td>3.965 ms</td><td>2.541 ms</td><td>6.507 ms</td><td>2.649 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>3.102 ms</strong></td><td>2.612 ms</td><td><strong>5.713 ms</strong></td><td><strong>1.572 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>3.154 ms</td><td>2.649 ms</td><td>5.803 ms</td><td>2.843 ms</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>14.716 ms</td><td><strong>4.332 ms</strong></td><td><strong>19.048 ms</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>16.282 ms</td><td>4.502 ms</td><td>20.784 ms</td><td>19.354 ms</td></tr>
+        <tr><td><code>torch</code></td><td>17.100 ms</td><td>5.000 ms</td><td>22.100 ms</td><td>49.330 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>14.424 ms</td><td>5.188 ms</td><td>19.612 ms</td><td><strong>10.053 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td><strong>14.360 ms</strong></td><td>5.075 ms</td><td>19.434 ms</td><td>34.562 ms</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>114.752 ms</td><td><strong>9.735 ms</strong></td><td>124.486 ms</td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>120.477 ms</td><td>14.125 ms</td><td>134.602 ms</td><td>180.326 ms</td></tr>
+        <tr><td><code>torch</code></td><td>113.555 ms</td><td>11.735 ms</td><td>125.290 ms</td><td>916.531 ms</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>96.770 ms</strong></td><td>10.977 ms</td><td><strong>107.747 ms</strong></td><td><strong>96.567 ms</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>320.685 ms</td><td>48.569 ms</td><td>369.254 ms</td><td>1510.155 ms</td></tr>
     </tbody>
 </table>
 
@@ -527,34 +528,38 @@ For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 
         </tr>
     </thead>
     <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td><strong>1.57 MiB</strong></td><td><strong>4.41 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>4.69 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>0.02 MiB</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>1.57 MiB</strong></td><td>4.42 MiB</td><td>5.34 MiB</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td><strong>5.18 MiB</strong></td><td><strong>17.63 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>18.98 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>0.06 MiB</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>5.18 MiB</strong></td><td>17.69 MiB</td><td>22.13 MiB</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td><strong>41.79 MiB</strong></td><td><strong>70.57 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>348.00 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>0.25 MiB</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>41.79 MiB</strong></td><td>70.82 MiB</td><td>330.50 MiB</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td><strong>302.13 MiB</strong></td><td><strong>282.00 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>303.13 MiB</td><td>284.00 MiB</td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>3038.64 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>302.13 MiB</strong></td><td>283.00 MiB</td><td>1.00 MiB</td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>302.13 MiB</strong></td><td>284.32 MiB</td><td>2891.15 MiB</td></tr>
+        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>1.57 MiB</td><td><strong>4.41 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td>4.69 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td>5.34 MiB</td></tr>
+        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>5.18 MiB</td><td><strong>17.63 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td>18.98 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td>22.13 MiB</td></tr>
+        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>41.79 MiB</td><td><strong>70.57 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td>348.00 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td>330.50 MiB</td></tr>
+        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>302.13 MiB</td><td><strong>282.00 MiB</strong></td><td>—</td></tr>
+        <tr><td><code>warp_radix</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td>3038.64 MiB</td></tr>
+        <tr><td><code>warp_depth_stable_tile</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
+        <tr><td><code>torch_count</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td>2891.15 MiB</td></tr>
     </tbody>
 </table>
 
-From the public-API perspective, CUDA and all four Warp sort modes still sit in roughly the same forward peak-memory range, while CUDA remains consistently lower on backward peak memory. The real spread is still the **diagnostic internal binning scratch**: `warp_radix` and `warp_depth_stable_tile` remain tiny, whereas `torch` / `torch_count` grow sharply at 65K and 262K.
+From the public-API perspective, CUDA and the four updated warp-backend Warp modes still sit in roughly the same forward peak-memory range; but one obvious change in this release is that the Warp paths now show **much lower backward peak-memory deltas than the CUDA baseline**, which suggests that buffer reuse and intermediate-state caching are working more effectively. The real spread is still the **diagnostic internal binning scratch**: `warp_radix` / `warp_depth_stable_tile` stay essentially at zero, whereas `torch` / `torch_count` still explode into hundreds of MiB or even GiB at 65K and 262K.
 
+Looking jointly at the CUDA baseline and the four Warp sort modes, five updated observations stand out:
 
-
-`warp_depth_stable_tile` is still kept as the default not because it is absolutely best on every metric, but because within the four Warp modes it continues to offer the most balanced mix of internal binning GPU time, near-zero scratch memory, and relatively small correctness residuals; if you only optimize end-to-end throughput, the best choice already changes with scale.
+- **Tiny 4K case**: `warp_radix` now takes both the shortest total iteration time (**5.268 ms**) and the shortest binning GPU time (**1.108 ms**), which means the updated release has made the pure Warp radix path very competitive at small scale.
+- **Mid-scale 16K**: `warp_depth_stable_tile` becomes the most balanced option, giving both the shortest total iteration time (**5.713 ms**) and the shortest binning GPU time (**1.572 ms**), with `torch_count` only slightly behind in end-to-end runtime.
+- **Large 65K case**: the end-to-end winner is `torch_count` at **19.434 ms**, but it still trails the CUDA baseline (**19.048 ms**); at the same time, `warp_depth_stable_tile` owns the best binning GPU time (**10.053 ms**), so the final ranking at this scale is clearly no longer determined by binning alone.
+- **Very large 262K case**: `warp_depth_stable_tile` pulls ahead decisively with **96.770 ms** forward and **107.747 ms** total iteration, beating both the other Warp modes and the CUDA baseline (**124.486 ms** total). On this release, the default path regains a clear large-scale advantage.
+- **Default-mode choice**: keeping `warp_depth_stable_tile` as the default is still justified, because in the updated warp-backend it combines the most stable cross-scale total-iteration behavior, the best or near-best binning GPU times, essentially zero scratch memory, and relatively small correctness residuals. If you are optimizing for one fixed workload only, the fastest mode still depends on scale.
 
 ---
 
