@@ -62,6 +62,14 @@ def get_runtime_auto_tuning_config():
     return _warp_backend.get_runtime_auto_tuning_config()
 
 
+def get_compute_depth():
+    return _warp_backend.get_compute_depth()
+
+
+def set_compute_depth(enabled):
+    _warp_backend.set_compute_depth(enabled)
+
+
 def _run_with_experimental_settings(raster_settings, fn):
     previous_backward_mode = _warp_backend.get_backward_mode()
     previous_binning_sort_mode = _warp_backend.get_binning_sort_mode()
@@ -265,6 +273,7 @@ class GaussianRasterizationSettings(NamedTuple):
     binning_sort_mode: str | None = None
     auto_tune: bool = True
     auto_tune_verbose: bool = True
+    use_tile_kernels: bool | str | None = None  # deprecated, ignored
 
 
 class GaussianRasterizer(nn.Module):
@@ -323,7 +332,7 @@ class GaussianRasterizer(nn.Module):
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([])
 
-        color, radii, depth, *_extra = rasterize_gaussians(
+        return rasterize_gaussians(
             means3D,
             means2D,
             shs,
@@ -334,7 +343,6 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             raster_settings,
         )
-        return color, radii, depth
 
 
 __all__ = [
@@ -349,4 +357,6 @@ __all__ = [
     "rasterize_gaussians",
     "set_backward_mode",
     "set_binning_sort_mode",
+    "get_compute_depth",
+    "set_compute_depth",
 ]

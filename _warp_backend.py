@@ -1,9 +1,11 @@
+import os
 from typing import Any
 
 import torch
 import warp as wp
 
 __all__ = [
+    "clear_warp_caches",
     "get_default_parameter_info",
     "is_available",
     "get_backward_mode",
@@ -16,12 +18,12 @@ __all__ = [
     "mark_visible",
     "rasterize_gaussians_backward",
     "set_runtime_auto_tuning",
+    "get_compute_depth",
+    "set_compute_depth",
 ]
 
 
 NUM_CHANNELS = 3
-TOP_K = 20
-_COMPUTE_AUX_FORWARD = False
 BLOCK_X = 16
 BLOCK_Y = 16
 sh_c0 = wp.constant(wp.float32(0.28209479177387814))
@@ -42,7 +44,7 @@ sh_c3_6 = wp.constant(wp.float32(-0.5900435899266435))
 
 DEFAULT_BACKWARD_MODE = "manual"
 _BACKWARD_MODE = DEFAULT_BACKWARD_MODE
-BINNING_SORT_MODES = ("warp_radix", "torch", "warp_depth_stable_tile", "torch_count")
+BINNING_SORT_MODES = ("warp_radix", "torch", "warp_depth_stable_tile")
 DEFAULT_BINNING_SORT_MODE = "warp_depth_stable_tile"
 _BINNING_SORT_MODE = DEFAULT_BINNING_SORT_MODE
 WARP_RADIX_DETERMINISTIC_TIEBREAK = False
@@ -58,6 +60,11 @@ BINNING_AUTO_TUNE_MIN_KEEP_POINTS = 12288
 VISIBILITY_NEAR_PLANE = 0.2
 PREPROCESS_CULL_SIGMA = 3.0
 PREPROCESS_CULL_FOV_SCALE = 1.3
+
+# D1: Skip per-pixel depth accumulation (forward) and depth gradient (backward)
+# when depth output is not used in the loss.  Controlled globally or via
+# GSWARP_COMPUTE_DEPTH=0 environment variable.
+_COMPUTE_DEPTH = os.environ.get("GSWARP_COMPUTE_DEPTH", "1") != "0"
 DET_EPSILON = 1.0e-7
 ONE_MINUS_ALPHA_MIN = 1.0e-5
 _RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = {}
@@ -75,6 +82,8 @@ _RUNTIME_BINNING_POLICY_STATE: dict[str, dict[str, Any]] = {}
 _AUTO_TUNE_ENABLED = True
 _AUTO_TUNE_VERBOSE = True
 FORWARD_GEOM_STRIDE_BYTES = FORWARD_GEOM_FLOAT_WIDTH * 4 + FORWARD_GEOM_CLAMP_WIDTH
+# B5: track point count for auto-clear after pruning
+_PREV_POINT_COUNT: int | None = None
 
 # C4: per-kernel Launch object caches — keyed by (device_str, dim)
 _C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = {}
@@ -91,6 +100,16 @@ _C4_LAUNCH_CACHE_SH_V3: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_FWD_SH: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_FWD_PREPROCESS: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_FWD_RENDER: dict[tuple[str, int], Any] = {}
+# G1: binning duplicate launch cache (C4-cached)
+_C4_LAUNCH_CACHE_BINNING_DUPLICATE: dict[tuple[str, int], Any] = {}
+# T1: tiled256 forward render launch cache
+_C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[str, int], Any] = {}
+
+
+# T1: Cooperative tile batch size for render kernels.
+# Each screen-tile block loads RENDER_TILE_BATCH Gaussians into shared memory
+# per iteration. Must be a compile-time constant (wp.constant).
+RENDER_TILE_BATCH = 32
 
 # One-shot initialization flag — after first _require_warp() succeeds, all
 # subsequent calls short-circuit immediately.
@@ -140,12 +159,6 @@ def _runtime_color(text: str, color: str) -> str:
 
 def get_default_parameter_info() -> dict[str, dict[str, Any]]:
     return {
-        "TOP_K": {
-            "value": TOP_K,
-            "category": "gs_fixed",
-            "auto_tunable": False,
-            "description": "Per-pixel Gaussian contribution slots kept fixed because they change GS semantics and buffer shapes.",
-        },
         "BLOCK_X": {
             "value": BLOCK_X,
             "category": "kernel_tile",
@@ -200,13 +213,24 @@ def set_runtime_auto_tuning(enabled: bool | None = None, verbose: bool | None = 
         _AUTO_TUNE_VERBOSE = bool(verbose)
 
 
-def get_compute_aux_forward() -> bool:
-    return _COMPUTE_AUX_FORWARD
 
 
-def set_compute_aux_forward(enabled: bool) -> None:
-    global _COMPUTE_AUX_FORWARD
-    _COMPUTE_AUX_FORWARD = bool(enabled)
+
+def get_compute_depth() -> bool:
+    """Return whether per-pixel depth is computed in the render kernels."""
+    return _COMPUTE_DEPTH
+
+
+def set_compute_depth(enabled: bool) -> None:
+    """Enable or disable per-pixel depth computation.
+
+    When disabled, forward render kernels skip depth accumulation and backward
+    kernels skip depth gradient computation.  This saves ~5-10% of total
+    iteration time for scenes that do not use depth in the loss (the common
+    case for truck, lego, etc.).  Can also be set via GSWARP_COMPUTE_DEPTH=0.
+    """
+    global _COMPUTE_DEPTH
+    _COMPUTE_DEPTH = bool(enabled)
 
 
 def _normalize_runtime_device(device: torch.device | str | None = None) -> torch.device:
@@ -310,8 +334,8 @@ def _estimate_occupancy(regs_per_thread: int, block_dim: int, sm_props: dict[str
 
 
 # Expected register usage per kernel class (empirical, measured via NCU on sm_89
-# for the fused kernels; estimated for others).  Used as representative values
-# when actual register counts are unavailable.
+# for the fused kernels).  Used as representative values when actual register
+# counts are unavailable.
 _KERNEL_REG_ESTIMATES: dict[str, int] = {
     "render": 96,
     "preprocess": 110,
@@ -477,7 +501,8 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
         "current_tile": (BLOCK_X, BLOCK_Y),
         "recommended_tile": (recommended_tile_x, recommended_tile_y),
         "tile_runtime_mutable": False,
-        "gs_fixed_parameters": ("TOP_K",),
+        "use_tile_kernels": True,
+        "compute_depth": _COMPUTE_DEPTH,
         "applied_binning_sort_mode": _BINNING_SORT_MODE,
         "recommended_binning_sort_mode": recommended_binning_sort_mode,
         "block_dim_plan": block_dim_plan,
@@ -613,6 +638,47 @@ def is_available() -> bool:
     return wp is not None
 
 
+def clear_warp_caches() -> None:
+    """Release all grow-only buffer caches.
+
+    Call after ``densify_and_prune`` or when switching scenes to reclaim GPU
+    memory held by stale high-water-mark allocations.  The caches will be
+    lazily re-populated on the next forward pass.
+    """
+    # Synchronize to ensure no in-flight kernels reference cached buffers.
+    torch.cuda.synchronize()
+
+    # A: grow-only GPU buffer caches (~128 MB at 2M Gaussians)
+    _RADIX_SORT_BUFFER_CACHE.clear()
+    _RADIX_SORT_I32_BUFFER_CACHE.clear()
+    _INDEX_GATHER_I32_BUFFER_CACHE.clear()
+    _INDEX_GATHER_I64_BUFFER_CACHE.clear()
+    _SCAN_I32_BUFFER_CACHE.clear()
+    _PROJECT_VISIBLE_BUFFER_CACHE.clear()
+    _SEQUENCE_BUFFER_CACHE.clear()
+    _DEPTH_SORT_ORDER_CACHE.clear()
+    _DEPTH_SORT_CHECK_FLAG.clear()
+
+    # B: C4 launch object caches (no GPU memory, just Python objects)
+    _C4_LAUNCH_CACHE_SH.clear()
+    _C4_LAUNCH_CACHE_COV3D.clear()
+    _C4_LAUNCH_CACHE_RENDER_BWD.clear()
+    _C4_LAUNCH_CACHE_PROJ_MEANS.clear()
+    _C4_LAUNCH_CACHE_COV2D.clear()
+    _C4_LAUNCH_CACHE_ACCUM.clear()
+    _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS.clear()
+    _C4_LAUNCH_CACHE_SH_V3.clear()
+    _C4_LAUNCH_CACHE_FWD_SH.clear()
+    _C4_LAUNCH_CACHE_FWD_PREPROCESS.clear()
+    _C4_LAUNCH_CACHE_FWD_RENDER.clear()
+    _C4_LAUNCH_CACHE_BINNING_DUPLICATE.clear()
+    _C4_LAUNCH_CACHE_FWD_RENDER_TILED256.clear()
+
+    # B5: reset point-count tracker so next forward doesn't false-trigger
+    global _PREV_POINT_COUNT
+    _PREV_POINT_COUNT = None
+
+
 def get_backward_mode() -> str:
     return _BACKWARD_MODE
 
@@ -631,7 +697,7 @@ def get_binning_sort_mode() -> str:
 def set_binning_sort_mode(mode: str) -> None:
     global _BINNING_SORT_MODE
     if mode not in BINNING_SORT_MODES:
-        raise ValueError("mode must be one of 'torch', 'torch_count', 'warp_radix', or 'warp_depth_stable_tile'")
+        raise ValueError("mode must be one of 'torch', 'warp_radix', or 'warp_depth_stable_tile'")
     _BINNING_SORT_MODE = mode
 
 
@@ -715,17 +781,16 @@ def _pack_forward_aux_buffers(preprocess_outputs, binning_state, n_contrib):
     ranges_tensor = _as_detached_contiguous_dtype(binning_state["ranges"].reshape(-1), torch.int32)
     img_tensor = _as_detached_contiguous_dtype(n_contrib.reshape(-1), torch.int32)
 
-    geom_segments = [
-        points_xy_image_tensor.view(torch.uint8).reshape(-1),
-        depths_tensor.view(torch.uint8).reshape(-1),
-        conic_opacity_tensor.view(torch.uint8).reshape(-1),
-        rgb_tensor.view(torch.uint8).reshape(-1),
-        cov3d_tensor.view(torch.uint8).reshape(-1),
+    # F4: torch.cat already returns contiguous tensor; skip redundant .contiguous()
+    geom_buffer = torch.cat([
+        points_xy_image_tensor.reshape(-1).view(torch.uint8),
+        depths_tensor.reshape(-1).view(torch.uint8),
+        conic_opacity_tensor.reshape(-1).view(torch.uint8),
+        rgb_tensor.reshape(-1).view(torch.uint8),
+        cov3d_tensor.reshape(-1).view(torch.uint8),
         clamped_tensor.view(torch.uint8).reshape(-1),
-    ]
-    geom_buffer = torch.cat(geom_segments, dim=0).contiguous()
-    binning_tensor = torch.cat((point_list_tensor, ranges_tensor), dim=0).contiguous()
-    binning_buffer = binning_tensor.view(torch.uint8)
+    ])
+    binning_buffer = torch.cat([point_list_tensor, ranges_tensor]).view(torch.uint8)
     img_buffer = img_tensor.view(torch.uint8)
     return geom_buffer, binning_buffer, img_buffer
 
@@ -744,8 +809,11 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     rgb_bytes = point_count * 3 * 4
     cov_bytes = point_count * 6 * 4
     geom_clamp_bytes = point_count * FORWARD_GEOM_CLAMP_WIDTH
-    expected_binning_bytes = (num_rendered + tile_count * 2) * torch.empty((), dtype=torch.int32).element_size()
-    expected_img_bytes = image_height * image_width * torch.empty((), dtype=torch.int32).element_size()
+    # point_list in binning_buffer includes RENDER_TILE_BATCH padding appended
+    # by _build_binning_state, so account for it when validating buffer size.
+    _i32_size = 4  # torch.int32 element size
+    expected_binning_bytes = (num_rendered + RENDER_TILE_BATCH + tile_count * 2) * _i32_size
+    expected_img_bytes = image_height * image_width * _i32_size
     if geom_buffer.numel() != points_xy_bytes + depths_bytes + conic_opacity_bytes + rgb_bytes + cov_bytes + geom_clamp_bytes or binning_buffer.numel() != expected_binning_bytes or img_buffer.numel() != expected_img_bytes:
         return None
 
@@ -778,9 +846,9 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
         "grid_x": grid_x,
         "grid_y": grid_y,
         "point_offsets": torch.empty((0,), dtype=torch.int32, device=geom_buffer.device),
-        "point_list": binning_tensor[:num_rendered],
+        "point_list": binning_tensor[:num_rendered + RENDER_TILE_BATCH],
         "point_list_keys": torch.empty((0,), dtype=torch.int64, device=geom_buffer.device),
-        "ranges": binning_tensor[num_rendered:].reshape(tile_count, 2),
+        "ranges": binning_tensor[num_rendered + RENDER_TILE_BATCH:].reshape(tile_count, 2),
         "num_rendered": num_rendered,
     }
     n_contrib = img_tensor.reshape(image_height, image_width)
@@ -1015,9 +1083,11 @@ def _warp_radix_sort_i32_pairs_in_place(key_buffer: torch.Tensor, value_buffer: 
         if cached_key_buffer.data_ptr() == key_buffer.data_ptr() and cached_value_buffer.data_ptr() == value_buffer.data_ptr():
             key_warp = cached_key_warp
             value_warp = cached_value_warp
+    _key_arr = key_warp if key_warp is not None else wp.from_torch(key_buffer, dtype=wp.int32)
+    _val_arr = value_warp if value_warp is not None else wp.from_torch(value_buffer, dtype=wp.int32)
     wp.utils.radix_sort_pairs(
-        key_warp if key_warp is not None else wp.from_torch(key_buffer, dtype=wp.int32),
-        value_warp if value_warp is not None else wp.from_torch(value_buffer, dtype=wp.int32),
+        _key_arr,
+        _val_arr,
         count,
     )
     return key_buffer[:count], value_buffer[:count]
@@ -1151,8 +1221,15 @@ if wp is not None:
         )
 
 
+    # W1: constant needed by warp32 backward kernel
+    _BLOCK_PIXELS_C = wp.constant(BLOCK_X * BLOCK_Y)
+
+    # ---- Tiled-256 forward render kernel (cooperative Gaussian loading) ----
+    # Each block = 256 threads = one 16×16 pixel tile.
+    # Gaussians are loaded in batches of 256 via wp.tile() + wp.tile_extract(),
+    # eliminating 256× redundant global memory reads compared to per-pixel SIMT.
     @wp.kernel
-    def _render_tiles_warp_kernel(
+    def _render_tiles_tiled256_warp_kernel(
         ranges_flat: wp.array(dtype=wp.int32),
         point_list: wp.array(dtype=wp.int32),
         points_xy_image: wp.array(dtype=wp.vec2),
@@ -1163,114 +1240,35 @@ if wp is not None:
         image_width: wp.int32,
         image_height: wp.int32,
         grid_x: wp.int32,
-        out_color_flat: wp.array(dtype=wp.float32),
-        out_depth_flat: wp.array(dtype=wp.float32),
-        out_alpha_flat: wp.array(dtype=wp.float32),
-        gs_per_pixel_flat: wp.array(dtype=wp.float32),
-        weight_per_gs_pixel_flat: wp.array(dtype=wp.float32),
-        x_mu_flat: wp.array(dtype=wp.float32),
-        n_contrib: wp.array(dtype=wp.int32),
-    ):
-        tid = wp.tid()
-        total_pixels = image_width * image_height
-        if tid >= total_pixels:
-            return
-
-        pix_x = tid % image_width
-        pix_y = tid // image_width
-        tile_id = (pix_y // BLOCK_Y) * grid_x + (pix_x // BLOCK_X)
-        start = ranges_flat[tile_id * 2]
-        end = ranges_flat[tile_id * 2 + 1]
-
-        for slot in range(TOP_K):
-            gs_per_pixel_flat[slot * total_pixels + tid] = -1.0
-            weight_per_gs_pixel_flat[slot * total_pixels + tid] = 0.0
-            x_mu_flat[(slot * 2) * total_pixels + tid] = 0.0
-            x_mu_flat[(slot * 2 + 1) * total_pixels + tid] = 0.0
-
-        T = float(1.0)
-        contributor = int(0)
-        last_contributor = int(0)
-        color0 = float(0.0)
-        color1 = float(0.0)
-        color2 = float(0.0)
-        weight = float(0.0)
-        depth_acc = float(0.0)
-        calc = int(0)
-        pixf_x = float(pix_x)
-        pixf_y = float(pix_y)
-
-        for idx in range(start, end):
-            contributor = contributor + 1
-            coll_id = point_list[idx]
-            xy = points_xy_image[coll_id]
-            d_x = xy[0] - pixf_x
-            d_y = xy[1] - pixf_y
-            con_o = conic_opacity[coll_id]
-            power = -0.5 * (con_o[0] * d_x * d_x + con_o[2] * d_y * d_y) - con_o[1] * d_x * d_y
-            if power > 0.0:
-                continue
-
-            alpha = wp.min(float(0.99), con_o[3] * wp.exp(power))
-            if alpha < (1.0 / 255.0):
-                continue
-
-            test_T = T * (1.0 - alpha)
-            if test_T < 0.0001:
-                break
-
-            contribution = alpha * T
-            feature_base = coll_id * NUM_CHANNELS
-            color0 = color0 + features_flat[feature_base + 0] * contribution
-            color1 = color1 + features_flat[feature_base + 1] * contribution
-            color2 = color2 + features_flat[feature_base + 2] * contribution
-            weight = weight + contribution
-            depth_acc = depth_acc + depths[coll_id] * contribution
-            T = test_T
-
-            if calc < TOP_K:
-                gs_per_pixel_flat[calc * total_pixels + tid] = float(coll_id)
-                weight_per_gs_pixel_flat[calc * total_pixels + tid] = alpha * T
-                x_mu_flat[(calc * 2) * total_pixels + tid] = d_x
-                x_mu_flat[(calc * 2 + 1) * total_pixels + tid] = d_y
-
-            calc = calc + 1
-            last_contributor = contributor
-
-        n_contrib[tid] = last_contributor
-        out_color_flat[tid] = color0 + T * background[0]
-        out_color_flat[total_pixels + tid] = color1 + T * background[1]
-        out_color_flat[2 * total_pixels + tid] = color2 + T * background[2]
-        out_alpha_flat[tid] = weight
-        out_depth_flat[tid] = depth_acc
-
-    @wp.kernel
-    def _render_tiles_fast_warp_kernel(
-        ranges_flat: wp.array(dtype=wp.int32),
-        point_list: wp.array(dtype=wp.int32),
-        points_xy_image: wp.array(dtype=wp.vec2),
-        features_flat: wp.array(dtype=wp.float32),
-        depths: wp.array(dtype=wp.float32),
-        conic_opacity: wp.array(dtype=wp.vec4),
-        background: wp.array(dtype=wp.float32),
-        image_width: wp.int32,
-        image_height: wp.int32,
-        grid_x: wp.int32,
+        num_tiles: wp.int32,
+        compute_depth: wp.int32,
         out_color_flat: wp.array(dtype=wp.float32),
         out_depth_flat: wp.array(dtype=wp.float32),
         out_alpha_flat: wp.array(dtype=wp.float32),
         n_contrib: wp.array(dtype=wp.int32),
     ):
         tid = wp.tid()
-        total_pixels = image_width * image_height
-        if tid >= total_pixels:
+        tile_id = tid // _BLOCK_PIXELS_C
+        local_id = tid % _BLOCK_PIXELS_C
+
+        if tile_id >= num_tiles:
             return
 
-        pix_x = tid % image_width
-        pix_y = tid // image_width
-        tile_id = (pix_y // BLOCK_Y) * grid_x + (pix_x // BLOCK_X)
+        # Map local_id → pixel within the 16×16 tile
+        tile_x = tile_id % grid_x
+        tile_y = tile_id // grid_x
+        pix_x = tile_x * BLOCK_X + (local_id % BLOCK_X)
+        pix_y = tile_y * BLOCK_Y + (local_id // BLOCK_X)
+        total_pixels = image_width * image_height
+
+        inside = int(0)
+        if pix_x < image_width and pix_y < image_height:
+            inside = 1
+        pixel_id = pix_y * image_width + pix_x
+
         start = ranges_flat[tile_id * 2]
         end = ranges_flat[tile_id * 2 + 1]
+        n_gs = end - start
 
         T = float(1.0)
         contributor = int(0)
@@ -1282,43 +1280,73 @@ if wp is not None:
         depth_acc = float(0.0)
         pixf_x = float(pix_x)
         pixf_y = float(pix_y)
+        done = int(0)
+        if inside == 0:
+            done = 1
 
-        for idx in range(start, end):
-            contributor = contributor + 1
-            coll_id = point_list[idx]
-            xy = points_xy_image[coll_id]
-            d_x = xy[0] - pixf_x
-            d_y = xy[1] - pixf_y
-            con_o = conic_opacity[coll_id]
-            power = -0.5 * (con_o[0] * d_x * d_x + con_o[2] * d_y * d_y) - con_o[1] * d_x * d_y
-            if power > 0.0:
-                continue
-
-            alpha = wp.min(float(0.99), con_o[3] * wp.exp(power))
-            if alpha < (1.0 / 255.0):
-                continue
-
-            test_T = T * (1.0 - alpha)
-            if test_T < 0.0001:
+        rounds = (n_gs + 255) // 256
+        for i in range(rounds):
+            # ---- Block-level early-exit vote ----
+            t_done = wp.tile(done)
+            total_done = wp.tile_sum(t_done)
+            all_done = wp.tile_extract(total_done, 0)
+            if all_done == _BLOCK_PIXELS_C:
                 break
 
-            contribution = alpha * T
-            feature_base = coll_id * NUM_CHANNELS
-            color0 = color0 + features_flat[feature_base + 0] * contribution
-            color1 = color1 + features_flat[feature_base + 1] * contribution
-            color2 = color2 + features_flat[feature_base + 2] * contribution
-            weight = weight + contribution
-            depth_acc = depth_acc + depths[coll_id] * contribution
-            T = test_T
+            # ---- Cooperative load: each thread loads 1 Gaussian ----
+            progress = i * 256 + local_id
+            # 2C: simplified safe_idx — end > start guaranteed by n_gs > 0
+            safe_idx = wp.min(start + progress, end - 1)
+            my_id = point_list[safe_idx]
 
-            last_contributor = contributor
+            my_xy = points_xy_image[my_id]
+            my_co = conic_opacity[my_id]
 
-        n_contrib[tid] = last_contributor
-        out_color_flat[tid] = color0 + T * background[0]
-        out_color_flat[total_pixels + tid] = color1 + T * background[1]
-        out_color_flat[2 * total_pixels + tid] = color2 + T * background[2]
-        out_alpha_flat[tid] = weight
-        out_depth_flat[tid] = depth_acc
+            # 2A: vec2/vec4 tiles — fewer tile_extract calls (3 vs 7)
+            t_id = wp.tile(my_id)
+            t_xy = wp.tile(my_xy, preserve_type=True)
+            t_co = wp.tile(my_co, preserve_type=True)
+
+            # ---- Inner loop: all 256 pixels process the batch ----
+            batch_count = wp.min(256, n_gs - i * 256)
+            for j in range(batch_count):
+                contributor = contributor + 1
+
+                if done == 0:
+                    coll_id = wp.tile_extract(t_id, j)
+                    # 2A: extract vec2/vec4 directly
+                    xy_j = wp.tile_extract(t_xy, j)
+                    co_j = wp.tile_extract(t_co, j)
+
+                    d_x = xy_j[0] - pixf_x
+                    d_y = xy_j[1] - pixf_y
+                    power = -0.5 * (co_j[0] * d_x * d_x + co_j[2] * d_y * d_y) - co_j[1] * d_x * d_y
+
+                    if power <= 0.0:
+                        alpha = wp.min(float(0.99), co_j[3] * wp.exp(power))
+                        if alpha >= (1.0 / 255.0):
+                            test_T = T * (1.0 - alpha)
+                            if test_T < 0.0001:
+                                done = 1
+                            else:
+                                contribution = alpha * T
+                                feat_base = coll_id * NUM_CHANNELS
+                                color0 = color0 + features_flat[feat_base + 0] * contribution
+                                color1 = color1 + features_flat[feat_base + 1] * contribution
+                                color2 = color2 + features_flat[feat_base + 2] * contribution
+                                weight = weight + contribution
+                                if compute_depth != 0:
+                                    depth_acc = depth_acc + depths[coll_id] * contribution
+                                T = test_T
+                                last_contributor = contributor
+
+        if inside != 0:
+            n_contrib[pixel_id] = last_contributor
+            out_color_flat[pixel_id] = color0 + T * background[0]
+            out_color_flat[total_pixels + pixel_id] = color1 + T * background[1]
+            out_color_flat[2 * total_pixels + pixel_id] = color2 + T * background[2]
+            out_alpha_flat[pixel_id] = weight
+            out_depth_flat[pixel_id] = depth_acc
 
     # ---- C3: Fused backward accumulation (replaces 3 torch.add + 1 slice-assign + 2 torch.zeros) ----
     @wp.kernel
@@ -1763,8 +1791,9 @@ if wp is not None:
         grad_means2D[tid] = wp.vec3(rp[0], rp[1], 0.0)
 
     # ---- F1: vec3-typed SH backward kernels for improved memory coalescing ----
-    # Merged SH backward kernel (deg 0-3): vec3-typed AoS indexing, register-local dRGBd.
-    # Eliminates _dRGBd_buf intermediate (P×36 bytes) and saves one kernel launch.
+    # M1+SoA: SH backward kernel with SoA-transposed layout for coalesced memory access.
+    # Data arrives as (K, P, 3) → shs_v3[k * point_count + tid] gives coalesced vec3 reads.
+    # Eliminates 86% excessive sectors from AoS stride (192 bytes between threads).
     @wp.kernel
     def _backward_rgb_from_sh_v3_warp_kernel(
         means3d: wp.array(dtype=wp.vec3),
@@ -1772,6 +1801,7 @@ if wp is not None:
         shs_v3: wp.array(dtype=wp.vec3),
         degree: wp.int32,
         coeff_count: wp.int32,
+        point_count: wp.int32,
         grad_color_v3: wp.array(dtype=wp.vec3),
         clamped_flat: wp.array(dtype=wp.int32),
         grad_means: wp.array(dtype=wp.vec3),
@@ -1799,20 +1829,21 @@ if wp is not None:
         acc_dy = wp.vec3(0.0, 0.0, 0.0)
         acc_dz = wp.vec3(0.0, 0.0, 0.0)
 
-        # M1: AoS indexing — base = tid * coeff_count
-        _base = tid * coeff_count
+        # SoA stride: shs_v3 and grad_sh_v3 are (K, P, 3) layout
+        # shs_v3[k * _P + tid] gives coalesced access (adjacent threads → adjacent vec3s)
+        _P = point_count
 
         if coeff_count > 0:
-            grad_sh_v3[_base] = sh_c0 * grad_rgb
+            grad_sh_v3[tid] = sh_c0 * grad_rgb
 
         if degree > 0 and coeff_count > 3:
-            grad_sh_v3[_base + 1] = (-sh_c1 * y) * grad_rgb
-            grad_sh_v3[_base + 2] = (sh_c1 * z) * grad_rgb
-            grad_sh_v3[_base + 3] = (-sh_c1 * x) * grad_rgb
+            grad_sh_v3[_P + tid] = (-sh_c1 * y) * grad_rgb
+            grad_sh_v3[2 * _P + tid] = (sh_c1 * z) * grad_rgb
+            grad_sh_v3[3 * _P + tid] = (-sh_c1 * x) * grad_rgb
 
-            acc_dx = (-sh_c1) * shs_v3[_base + 3]
-            acc_dy = (-sh_c1) * shs_v3[_base + 1]
-            acc_dz = sh_c1 * shs_v3[_base + 2]
+            acc_dx = (-sh_c1) * shs_v3[3 * _P + tid]
+            acc_dy = (-sh_c1) * shs_v3[_P + tid]
+            acc_dz = sh_c1 * shs_v3[2 * _P + tid]
 
         if degree > 1 and coeff_count > 8:
             xx = x * x
@@ -1822,38 +1853,38 @@ if wp is not None:
             yz = y * z
             xz = x * z
 
-            grad_sh_v3[_base + 4] = (sh_c2_0 * xy) * grad_rgb
-            grad_sh_v3[_base + 5] = (sh_c2_1 * yz) * grad_rgb
-            grad_sh_v3[_base + 6] = (sh_c2_2 * (2.0 * zz - xx - yy)) * grad_rgb
-            grad_sh_v3[_base + 7] = (sh_c2_3 * xz) * grad_rgb
-            grad_sh_v3[_base + 8] = (sh_c2_4 * (xx - yy)) * grad_rgb
+            grad_sh_v3[4 * _P + tid] = (sh_c2_0 * xy) * grad_rgb
+            grad_sh_v3[5 * _P + tid] = (sh_c2_1 * yz) * grad_rgb
+            grad_sh_v3[6 * _P + tid] = (sh_c2_2 * (2.0 * zz - xx - yy)) * grad_rgb
+            grad_sh_v3[7 * _P + tid] = (sh_c2_3 * xz) * grad_rgb
+            grad_sh_v3[8 * _P + tid] = (sh_c2_4 * (xx - yy)) * grad_rgb
 
-            s4 = shs_v3[_base + 4]
-            s5 = shs_v3[_base + 5]
-            s6 = shs_v3[_base + 6]
-            s7 = shs_v3[_base + 7]
-            s8 = shs_v3[_base + 8]
+            s4 = shs_v3[4 * _P + tid]
+            s5 = shs_v3[5 * _P + tid]
+            s6 = shs_v3[6 * _P + tid]
+            s7 = shs_v3[7 * _P + tid]
+            s8 = shs_v3[8 * _P + tid]
 
             acc_dx = acc_dx + (sh_c2_0 * y) * s4 + (sh_c2_2 * (-2.0 * x)) * s6 + (sh_c2_3 * z) * s7 + (sh_c2_4 * (2.0 * x)) * s8
             acc_dy = acc_dy + (sh_c2_0 * x) * s4 + (sh_c2_1 * z) * s5 + (sh_c2_2 * (-2.0 * y)) * s6 + (sh_c2_4 * (-2.0 * y)) * s8
             acc_dz = acc_dz + (sh_c2_1 * y) * s5 + (sh_c2_2 * (4.0 * z)) * s6 + (sh_c2_3 * x) * s7
 
             if degree > 2 and coeff_count > 15:
-                grad_sh_v3[_base + 9] = (sh_c3_0 * y * (3.0 * xx - yy)) * grad_rgb
-                grad_sh_v3[_base + 10] = (sh_c3_1 * xy * z) * grad_rgb
-                grad_sh_v3[_base + 11] = (sh_c3_2 * y * (4.0 * zz - xx - yy)) * grad_rgb
-                grad_sh_v3[_base + 12] = (sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy)) * grad_rgb
-                grad_sh_v3[_base + 13] = (sh_c3_4 * x * (4.0 * zz - xx - yy)) * grad_rgb
-                grad_sh_v3[_base + 14] = (sh_c3_5 * z * (xx - yy)) * grad_rgb
-                grad_sh_v3[_base + 15] = (sh_c3_6 * x * (xx - 3.0 * yy)) * grad_rgb
+                grad_sh_v3[9 * _P + tid] = (sh_c3_0 * y * (3.0 * xx - yy)) * grad_rgb
+                grad_sh_v3[10 * _P + tid] = (sh_c3_1 * xy * z) * grad_rgb
+                grad_sh_v3[11 * _P + tid] = (sh_c3_2 * y * (4.0 * zz - xx - yy)) * grad_rgb
+                grad_sh_v3[12 * _P + tid] = (sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy)) * grad_rgb
+                grad_sh_v3[13 * _P + tid] = (sh_c3_4 * x * (4.0 * zz - xx - yy)) * grad_rgb
+                grad_sh_v3[14 * _P + tid] = (sh_c3_5 * z * (xx - yy)) * grad_rgb
+                grad_sh_v3[15 * _P + tid] = (sh_c3_6 * x * (xx - 3.0 * yy)) * grad_rgb
 
-                s9 = shs_v3[_base + 9]
-                s10 = shs_v3[_base + 10]
-                s11 = shs_v3[_base + 11]
-                s12 = shs_v3[_base + 12]
-                s13 = shs_v3[_base + 13]
-                s14 = shs_v3[_base + 14]
-                s15 = shs_v3[_base + 15]
+                s9 = shs_v3[9 * _P + tid]
+                s10 = shs_v3[10 * _P + tid]
+                s11 = shs_v3[11 * _P + tid]
+                s12 = shs_v3[12 * _P + tid]
+                s13 = shs_v3[13 * _P + tid]
+                s14 = shs_v3[14 * _P + tid]
+                s15 = shs_v3[15 * _P + tid]
 
                 acc_dx = acc_dx + (sh_c3_0 * (6.0 * xy)) * s9 + (sh_c3_1 * yz) * s10 + (sh_c3_2 * (-2.0 * xy)) * s11 + (sh_c3_3 * (-6.0 * xz)) * s12 + (sh_c3_4 * (-3.0 * xx + 4.0 * zz - yy)) * s13 + (sh_c3_5 * (2.0 * xz)) * s14 + (sh_c3_6 * (3.0 * (xx - yy))) * s15
                 acc_dy = acc_dy + (sh_c3_0 * (3.0 * (xx - yy))) * s9 + (sh_c3_1 * xz) * s10 + (sh_c3_2 * (-3.0 * yy + 4.0 * zz - xx)) * s11 + (sh_c3_3 * (-6.0 * yz)) * s12 + (sh_c3_4 * (-2.0 * xy)) * s13 + (sh_c3_5 * (-2.0 * yz)) * s14 + (sh_c3_6 * (-6.0 * xy)) * s15
@@ -2036,19 +2067,19 @@ if wp is not None:
         grad_means[tid] = _dnormvdv_wp(dir_orig, dL_ddir)
 
 
+    # P2b: vec3 forward SH — 3× fewer load/store instructions vs scalar version
     @wp.kernel
-    def _forward_rgb_from_sh_warp_kernel(
+    def _forward_rgb_from_sh_v3_warp_kernel(
         means3d: wp.array(dtype=wp.vec3),
         campos_flat: wp.array(dtype=wp.float32),
-        shs_flat: wp.array(dtype=wp.float32),
+        shs_v3: wp.array(dtype=wp.vec3),
         degree: wp.int32,
         coeff_count: wp.int32,
-        rgb_flat: wp.array(dtype=wp.float32),
+        rgb_v3: wp.array(dtype=wp.vec3),
         clamped_flat: wp.array(dtype=wp.int32),
     ):
         tid = wp.tid()
-        sh_base = tid * coeff_count * NUM_CHANNELS
-        color_base = tid * NUM_CHANNELS
+        sh_base = tid * coeff_count
 
         dir_orig = means3d[tid] - wp.vec3(campos_flat[0], campos_flat[1], campos_flat[2])
         dir_len_sq = dir_orig[0] * dir_orig[0] + dir_orig[1] * dir_orig[1] + dir_orig[2] * dir_orig[2]
@@ -2058,20 +2089,12 @@ if wp is not None:
         y = direction[1]
         z = direction[2]
 
-        rgb0 = sh_c0 * shs_flat[sh_base + 0]
-        rgb1 = sh_c0 * shs_flat[sh_base + 1]
-        rgb2 = sh_c0 * shs_flat[sh_base + 2]
+        color = sh_c0 * shs_v3[sh_base]
 
         if degree > 0 and coeff_count > 3:
-            rgb0 = rgb0 - sh_c1 * y * shs_flat[sh_base + 3]
-            rgb1 = rgb1 - sh_c1 * y * shs_flat[sh_base + 4]
-            rgb2 = rgb2 - sh_c1 * y * shs_flat[sh_base + 5]
-            rgb0 = rgb0 + sh_c1 * z * shs_flat[sh_base + 6]
-            rgb1 = rgb1 + sh_c1 * z * shs_flat[sh_base + 7]
-            rgb2 = rgb2 + sh_c1 * z * shs_flat[sh_base + 8]
-            rgb0 = rgb0 - sh_c1 * x * shs_flat[sh_base + 9]
-            rgb1 = rgb1 - sh_c1 * x * shs_flat[sh_base + 10]
-            rgb2 = rgb2 - sh_c1 * x * shs_flat[sh_base + 11]
+            color = color + (-sh_c1 * y) * shs_v3[sh_base + 1]
+            color = color + (sh_c1 * z) * shs_v3[sh_base + 2]
+            color = color + (-sh_c1 * x) * shs_v3[sh_base + 3]
 
             if degree > 1 and coeff_count > 8:
                 xx = x * x
@@ -2081,67 +2104,42 @@ if wp is not None:
                 yz = y * z
                 xz = x * z
 
-                rgb0 = rgb0 + sh_c2_0 * xy * shs_flat[sh_base + 12]
-                rgb1 = rgb1 + sh_c2_0 * xy * shs_flat[sh_base + 13]
-                rgb2 = rgb2 + sh_c2_0 * xy * shs_flat[sh_base + 14]
-                rgb0 = rgb0 + sh_c2_1 * yz * shs_flat[sh_base + 15]
-                rgb1 = rgb1 + sh_c2_1 * yz * shs_flat[sh_base + 16]
-                rgb2 = rgb2 + sh_c2_1 * yz * shs_flat[sh_base + 17]
-                rgb0 = rgb0 + sh_c2_2 * (2.0 * zz - xx - yy) * shs_flat[sh_base + 18]
-                rgb1 = rgb1 + sh_c2_2 * (2.0 * zz - xx - yy) * shs_flat[sh_base + 19]
-                rgb2 = rgb2 + sh_c2_2 * (2.0 * zz - xx - yy) * shs_flat[sh_base + 20]
-                rgb0 = rgb0 + sh_c2_3 * xz * shs_flat[sh_base + 21]
-                rgb1 = rgb1 + sh_c2_3 * xz * shs_flat[sh_base + 22]
-                rgb2 = rgb2 + sh_c2_3 * xz * shs_flat[sh_base + 23]
-                rgb0 = rgb0 + sh_c2_4 * (xx - yy) * shs_flat[sh_base + 24]
-                rgb1 = rgb1 + sh_c2_4 * (xx - yy) * shs_flat[sh_base + 25]
-                rgb2 = rgb2 + sh_c2_4 * (xx - yy) * shs_flat[sh_base + 26]
+                color = color + (sh_c2_0 * xy) * shs_v3[sh_base + 4]
+                color = color + (sh_c2_1 * yz) * shs_v3[sh_base + 5]
+                color = color + (sh_c2_2 * (2.0 * zz - xx - yy)) * shs_v3[sh_base + 6]
+                color = color + (sh_c2_3 * xz) * shs_v3[sh_base + 7]
+                color = color + (sh_c2_4 * (xx - yy)) * shs_v3[sh_base + 8]
 
                 if degree > 2 and coeff_count > 15:
-                    rgb0 = rgb0 + sh_c3_0 * y * (3.0 * xx - yy) * shs_flat[sh_base + 27]
-                    rgb1 = rgb1 + sh_c3_0 * y * (3.0 * xx - yy) * shs_flat[sh_base + 28]
-                    rgb2 = rgb2 + sh_c3_0 * y * (3.0 * xx - yy) * shs_flat[sh_base + 29]
-                    rgb0 = rgb0 + sh_c3_1 * xy * z * shs_flat[sh_base + 30]
-                    rgb1 = rgb1 + sh_c3_1 * xy * z * shs_flat[sh_base + 31]
-                    rgb2 = rgb2 + sh_c3_1 * xy * z * shs_flat[sh_base + 32]
-                    rgb0 = rgb0 + sh_c3_2 * y * (4.0 * zz - xx - yy) * shs_flat[sh_base + 33]
-                    rgb1 = rgb1 + sh_c3_2 * y * (4.0 * zz - xx - yy) * shs_flat[sh_base + 34]
-                    rgb2 = rgb2 + sh_c3_2 * y * (4.0 * zz - xx - yy) * shs_flat[sh_base + 35]
-                    rgb0 = rgb0 + sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * shs_flat[sh_base + 36]
-                    rgb1 = rgb1 + sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * shs_flat[sh_base + 37]
-                    rgb2 = rgb2 + sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * shs_flat[sh_base + 38]
-                    rgb0 = rgb0 + sh_c3_4 * x * (4.0 * zz - xx - yy) * shs_flat[sh_base + 39]
-                    rgb1 = rgb1 + sh_c3_4 * x * (4.0 * zz - xx - yy) * shs_flat[sh_base + 40]
-                    rgb2 = rgb2 + sh_c3_4 * x * (4.0 * zz - xx - yy) * shs_flat[sh_base + 41]
-                    rgb0 = rgb0 + sh_c3_5 * z * (xx - yy) * shs_flat[sh_base + 42]
-                    rgb1 = rgb1 + sh_c3_5 * z * (xx - yy) * shs_flat[sh_base + 43]
-                    rgb2 = rgb2 + sh_c3_5 * z * (xx - yy) * shs_flat[sh_base + 44]
-                    rgb0 = rgb0 + sh_c3_6 * x * (xx - 3.0 * yy) * shs_flat[sh_base + 45]
-                    rgb1 = rgb1 + sh_c3_6 * x * (xx - 3.0 * yy) * shs_flat[sh_base + 46]
-                    rgb2 = rgb2 + sh_c3_6 * x * (xx - 3.0 * yy) * shs_flat[sh_base + 47]
+                    color = color + (sh_c3_0 * y * (3.0 * xx - yy)) * shs_v3[sh_base + 9]
+                    color = color + (sh_c3_1 * xy * z) * shs_v3[sh_base + 10]
+                    color = color + (sh_c3_2 * y * (4.0 * zz - xx - yy)) * shs_v3[sh_base + 11]
+                    color = color + (sh_c3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy)) * shs_v3[sh_base + 12]
+                    color = color + (sh_c3_4 * x * (4.0 * zz - xx - yy)) * shs_v3[sh_base + 13]
+                    color = color + (sh_c3_5 * z * (xx - yy)) * shs_v3[sh_base + 14]
+                    color = color + (sh_c3_6 * x * (xx - 3.0 * yy)) * shs_v3[sh_base + 15]
 
-        rgb0 = rgb0 + 0.5
-        rgb1 = rgb1 + 0.5
-        rgb2 = rgb2 + 0.5
+        color = color + wp.vec3(0.5, 0.5, 0.5)
+        c0 = color[0]
+        c1 = color[1]
+        c2 = color[2]
         clamp0 = int(0)
         clamp1 = int(0)
         clamp2 = int(0)
-        if rgb0 < 0.0:
-            rgb0 = 0.0
+        if c0 < 0.0:
+            c0 = 0.0
             clamp0 = int(1)
-        if rgb1 < 0.0:
-            rgb1 = 0.0
+        if c1 < 0.0:
+            c1 = 0.0
             clamp1 = int(1)
-        if rgb2 < 0.0:
-            rgb2 = 0.0
+        if c2 < 0.0:
+            c2 = 0.0
             clamp2 = int(1)
 
-        rgb_flat[color_base + 0] = rgb0
-        rgb_flat[color_base + 1] = rgb1
-        rgb_flat[color_base + 2] = rgb2
-        clamped_flat[color_base + 0] = clamp0
-        clamped_flat[color_base + 1] = clamp1
-        clamped_flat[color_base + 2] = clamp2
+        rgb_v3[tid] = wp.vec3(c0, c1, c2)
+        clamped_flat[tid * 3 + 0] = clamp0
+        clamped_flat[tid * 3 + 1] = clamp1
+        clamped_flat[tid * 3 + 2] = clamp2
 
 
     @wp.kernel
@@ -2468,7 +2466,32 @@ if wp is not None:
         rect_max_x = wp.min(grid_x, wp.max(0, wp.int32((point_x + float(radius_x) + float(BLOCK_X - 1)) / float(BLOCK_X))))
         rect_max_y = wp.min(grid_y, wp.max(0, wp.int32((point_y + float(radius_y) + float(BLOCK_Y - 1)) / float(BLOCK_Y))))
         return wp.vec4i(rect_min_x, rect_min_y, rect_max_x, rect_max_y)
-      
+
+    # A2: AccuTile — per-row ellipse intersection for exact tile-x ranges.
+    # Solves  con_a*dx^2 + 2*con_b*dx*dy + con_c*dy^2 = t  for dx at fixed dy
+    # to narrow the tile-x loop per tile-y row in duplicate kernels.
+    @wp.func
+    def _accutile_row_x_range_wp(
+        point_x: wp.float32,
+        con_a: wp.float32,
+        con_b: wp.float32,
+        det_conic: wp.float32,
+        t: wp.float32,
+        dy: wp.float32,
+        grid_x: wp.int32,
+    ):
+        inner = con_a * t - det_conic * dy * dy
+        if inner <= 0.0:
+            return wp.vec2i(0, 0)
+        sqrt_inner = wp.sqrt(inner)
+        dx_center = -con_b * dy / con_a
+        dx_half = sqrt_inner / con_a
+        x_min = point_x + dx_center - dx_half
+        x_max = point_x + dx_center + dx_half
+        tile_x_min = wp.min(grid_x, wp.max(0, wp.int32(x_min / float(BLOCK_X))))
+        tile_x_max = wp.min(grid_x, wp.max(0, wp.int32((x_max + float(BLOCK_X - 1)) / float(BLOCK_X))))
+        return wp.vec2i(tile_x_min, tile_x_max)
+
     @wp.func
     def _preprocess_rect_visible_wp(
         proj_value: wp.vec3,
@@ -2611,11 +2634,16 @@ if wp is not None:
         
         cov = cov2d_inv[idx]
         rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
+        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
+        det_c = con_a * con_c - con_b * con_b
 
         for tile_y in range(rect[1], rect[3]):
-            for tile_x in range(rect[0], rect[2]):
+            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
+            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
+            row_x_min = wp.max(row_range[0], rect[0])
+            row_x_max = wp.min(row_range[1], rect[2])
+            for tile_x in range(row_x_min, row_x_max):
                 dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
                 power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
                 if power > 0.0:
                     power = 0.0
@@ -2624,9 +2652,9 @@ if wp is not None:
                     tile_ids_out[off] = tile_y * grid_x + tile_x
                     point_list_out[off] = idx
                     off = off + 1
-        
-        # Sentinel-fill remaining slots (preprocess SnugBox AABB may be slightly larger
-        # than what per-tile alpha filter writes, due to AABB corner tiles)
+
+        # Sentinel-fill remaining slots (AccuTile row range + alpha filter
+        # may write fewer entries than preprocess SnugBox AABB allocated)
         end_off = point_offsets[idx]
         sentinel_tile = grid_x * grid_y
         while off < end_off:
@@ -2666,11 +2694,16 @@ if wp is not None:
         rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
         depth_bits = wp.cast(depths[idx], wp.int32)
         depth_key = wp.int64(depth_bits) & wp.int64(4294967295)
+        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
+        det_c = con_a * con_c - con_b * con_b
 
         for tile_y in range(rect[1], rect[3]):
-            for tile_x in range(rect[0], rect[2]):
+            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
+            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
+            row_x_min = wp.max(row_range[0], rect[0])
+            row_x_max = wp.min(row_range[1], rect[2])
+            for tile_x in range(row_x_min, row_x_max):
                 dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
                 power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
                 if power > 0.0:
                     power = 0.0
@@ -2719,11 +2752,16 @@ if wp is not None:
         opac = co[3]
         cov = cov2d_inv[point_id]
         rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
-        
+        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
+        det_c = con_a * con_c - con_b * con_b
+
         for tile_y in range(rect[1], rect[3]):
-            for tile_x in range(rect[0], rect[2]):
+            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
+            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
+            row_x_min = wp.max(row_range[0], rect[0])
+            row_x_max = wp.min(row_range[1], rect[2])
+            for tile_x in range(row_x_min, row_x_max):
                 dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
                 power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
                 if power > 0.0:
                     power = 0.0
@@ -2800,8 +2838,11 @@ if wp is not None:
             range_flat[curr_tile * 2 + 1] = length
 
 
+    # ---- W1: Warp32 backward render — 32-thread warp-level gradient reduction ----
+    # Each 32-thread warp covers a spatial sub-tile (2 consecutive rows of a 16×16 screen tile).
+    # Benefits vs non-tiled: 32× fewer atomic writes per Gaussian.
     @wp.kernel
-    def _backward_render_tiles_warp_kernel(
+    def _backward_render_tiles_warp32_kernel(
         ranges_flat: wp.array(dtype=wp.int32),
         point_list: wp.array(dtype=wp.int32),
         points_xy_image: wp.array(dtype=wp.vec2),
@@ -2817,43 +2858,61 @@ if wp is not None:
         image_width: wp.int32,
         image_height: wp.int32,
         grid_x: wp.int32,
+        num_tiles: wp.int32,
+        compute_depth: wp.int32,
         grad_points_xy: wp.array(dtype=wp.vec2),
         grad_depths: wp.array(dtype=wp.float32),
         grad_conic_opacity: wp.array(dtype=wp.vec4),
         grad_feature: wp.array(dtype=wp.vec3),
     ):
         tid = wp.tid()
+        block_id = tid // _BLOCK_PIXELS_C
+        local_id = tid % _BLOCK_PIXELS_C
+
+        if block_id >= num_tiles:
+            return
+
+        tile_x = block_id % grid_x
+        tile_y = block_id // grid_x
+        pix_x = tile_x * BLOCK_X + (local_id % BLOCK_X)
+        pix_y = tile_y * BLOCK_Y + (local_id // BLOCK_X)
         total_pixels = image_width * image_height
-        if tid >= total_pixels:
-            return
 
-        pix_x = tid % image_width
-        pix_y = tid // image_width
-        tile_id = (pix_y // BLOCK_Y) * grid_x + (pix_x // BLOCK_X)
-        start = ranges_flat[tile_id * 2]
-        end = ranges_flat[tile_id * 2 + 1]
-        if end <= start:
-            return
+        inside = int(0)
+        if pix_x < image_width and pix_y < image_height:
+            inside = 1
+        pixel_id = pix_y * image_width + pix_x
 
-        T_final = 1.0 - out_alpha_flat[tid]
-        T = T_final
-        last_contributor = n_contrib[tid]
-        if last_contributor <= 0:
-            return
+        start = ranges_flat[block_id * 2]
+        end = ranges_flat[block_id * 2 + 1]
+        n_gs = end - start
 
+        T_final = float(0.0)
+        T = float(0.0)
+        last_contributor = int(0)
         ddelx_dx = 0.5 * float(image_width)
         ddely_dy = 0.5 * float(image_height)
         pixf_x = float(pix_x)
         pixf_y = float(pix_y)
+        dL_dpixel = wp.vec3(0.0, 0.0, 0.0)
+        dL_dpixel_depth = float(0.0)
+        dL_dalpha = float(0.0)
+        bg_dot = float(0.0)
 
-        dL_dpixel0 = grad_color_flat[tid]
-        dL_dpixel1 = grad_color_flat[total_pixels + tid]
-        dL_dpixel2 = grad_color_flat[2 * total_pixels + tid]
-        dL_dpixel = wp.vec3(dL_dpixel0, dL_dpixel1, dL_dpixel2)
-        dL_dpixel_depth = grad_depth_flat[tid]
-        dL_dalpha = grad_alpha_flat[tid]
-        bg = wp.vec3(background[0], background[1], background[2])
-        bg_dot = wp.dot(bg, dL_dpixel)
+        if inside != 0 and n_gs > 0:
+            T_final = 1.0 - out_alpha_flat[pixel_id]
+            T = T_final
+            last_contributor = n_contrib[pixel_id]
+            dL_dpixel = wp.vec3(
+                grad_color_flat[pixel_id],
+                grad_color_flat[total_pixels + pixel_id],
+                grad_color_flat[2 * total_pixels + pixel_id],
+            )
+            if compute_depth != 0:
+                dL_dpixel_depth = grad_depth_flat[pixel_id]
+            dL_dalpha = grad_alpha_flat[pixel_id]
+            bg = wp.vec3(background[0], background[1], background[2])
+            bg_dot = wp.dot(bg, dL_dpixel)
 
         accum_rec = wp.vec3(0.0, 0.0, 0.0)
         accum_depth_rec = float(0.0)
@@ -2861,60 +2920,86 @@ if wp is not None:
         last_alpha = float(0.0)
         last_color = wp.vec3(0.0, 0.0, 0.0)
         last_depth = float(0.0)
-        for step in range(last_contributor):
-            idx = start + last_contributor - step - 1
-            coll_id = point_list[idx]
-            xy = points_xy_image[coll_id]
-            d_x = xy[0] - pixf_x
-            d_y = xy[1] - pixf_y
-            con_o = conic_opacity[coll_id]
-            power = _compute_power(con_o, d_x, d_y)
-            if power > 0.0:
-                continue
 
-            G = wp.exp(power)
-            alpha = _compute_alpha(con_o, power)
-            if alpha < (1.0 / 255.0):
-                continue
+        # W1: Warp-level max contributor — each 32-pixel sub-tile determines its own loop bound.
+        t_lc = wp.tile(last_contributor)
+        t_max_lc = wp.tile_reduce(wp.max, t_lc)
+        warp_max_lc = wp.tile_extract(t_max_lc, 0)
 
-            one_minus_alpha = wp.max(1.0 - alpha, ONE_MINUS_ALPHA_MIN)
-            T = T / one_minus_alpha
-            dchannel_dcolor = alpha * T
+        for step in range(warp_max_lc):
+            pos = warp_max_lc - step - 1
+            coll_id = point_list[start + pos]
 
-            feature_base = coll_id * NUM_CHANNELS
-            color = wp.vec3(
-                features_flat[feature_base + 0],
-                features_flat[feature_base + 1],
-                features_flat[feature_base + 2],
-            )
+            my_grad_feat = wp.vec3(0.0, 0.0, 0.0)
+            my_grad_depth = float(0.0)
+            my_grad_xy = wp.vec2(0.0, 0.0)
+            my_grad_co = wp.vec4(0.0, 0.0, 0.0, 0.0)
 
-            accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec
-            last_color = color
+            if inside != 0 and pos < last_contributor:
+                xy = points_xy_image[coll_id]
+                con_o = conic_opacity[coll_id]
+                d_x = xy[0] - pixf_x
+                d_y = xy[1] - pixf_y
+                power = _compute_power(con_o, d_x, d_y)
 
-            dL_dopa = wp.dot(color - accum_rec, dL_dpixel)
-            wp.atomic_add(grad_feature, coll_id, dchannel_dcolor * dL_dpixel)
+                if power <= 0.0:
+                    G = wp.exp(power)
+                    alpha = _compute_alpha(con_o, power)
+                    if alpha >= (1.0 / 255.0):
+                        one_minus_alpha = wp.max(1.0 - alpha, ONE_MINUS_ALPHA_MIN)
+                        T = T / one_minus_alpha
+                        dchannel_dcolor = alpha * T
 
-            depth_value = depths[coll_id]
-            accum_depth_rec = last_alpha * last_depth + (1.0 - last_alpha) * accum_depth_rec
-            last_depth = depth_value
-            dL_dopa = dL_dopa + (depth_value - accum_depth_rec) * dL_dpixel_depth
-            wp.atomic_add(grad_depths, coll_id, dchannel_dcolor * dL_dpixel_depth)
+                        feature_base = coll_id * NUM_CHANNELS
+                        color = wp.vec3(
+                            features_flat[feature_base + 0],
+                            features_flat[feature_base + 1],
+                            features_flat[feature_base + 2],
+                        )
+                        accum_rec = last_alpha * last_color + (1.0 - last_alpha) * accum_rec
+                        last_color = color
+                        dL_dopa = wp.dot(color - accum_rec, dL_dpixel)
+                        my_grad_feat = dchannel_dcolor * dL_dpixel
 
-            accum_alpha_rec = last_alpha + (1.0 - last_alpha) * accum_alpha_rec
-            dL_dopa = dL_dopa + (1.0 - accum_alpha_rec) * dL_dalpha
-            dL_dopa = dL_dopa * T
-            last_alpha = alpha
-            dL_dopa = dL_dopa + (-T_final / one_minus_alpha) * bg_dot
+                        if compute_depth != 0:
+                            depth_value = depths[coll_id]
+                            accum_depth_rec = last_alpha * last_depth + (1.0 - last_alpha) * accum_depth_rec
+                            last_depth = depth_value
+                            dL_dopa = dL_dopa + (depth_value - accum_depth_rec) * dL_dpixel_depth
+                            my_grad_depth = dchannel_dcolor * dL_dpixel_depth
 
-            dL_dG = con_o[3] * dL_dopa
-            gdx = G * d_x
-            gdy = G * d_y
-            dG_ddelx = -gdx * con_o[0] - gdy * con_o[1]
-            dG_ddely = -gdy * con_o[2] - gdx * con_o[1]
+                        accum_alpha_rec = last_alpha + (1.0 - last_alpha) * accum_alpha_rec
+                        dL_dopa = dL_dopa + (1.0 - accum_alpha_rec) * dL_dalpha
+                        dL_dopa = dL_dopa * T
+                        last_alpha = alpha
+                        dL_dopa = dL_dopa + (-T_final / one_minus_alpha) * bg_dot
 
-            wp.atomic_add(grad_points_xy, coll_id, wp.vec2(dL_dG * dG_ddelx * ddelx_dx, dL_dG * dG_ddely * ddely_dy))
-            wp.atomic_add(grad_conic_opacity, coll_id, wp.vec4(-0.5 * gdx * d_x * dL_dG, -0.5 * gdx * d_y * dL_dG, -0.5 * gdy * d_y * dL_dG, G * dL_dopa))
+                        dL_dG = con_o[3] * dL_dopa
+                        gdx = G * d_x
+                        gdy = G * d_y
+                        dG_ddelx = -gdx * con_o[0] - gdy * con_o[1]
+                        dG_ddely = -gdy * con_o[2] - gdx * con_o[1]
 
+                        my_grad_xy = wp.vec2(dL_dG * dG_ddelx * ddelx_dx, dL_dG * dG_ddely * ddely_dy)
+                        my_grad_co = wp.vec4(-0.5 * gdx * d_x * dL_dG, -0.5 * gdx * d_y * dL_dG, -0.5 * gdy * d_y * dL_dG, G * dL_dopa)
+
+            # W1: Warp-level reduction — ALL 32 threads participate (UNIFORM path)
+            t_feat = wp.tile(my_grad_feat, preserve_type=True)
+            s_feat = wp.tile_reduce(wp.add, t_feat)
+            wp.tile_atomic_add(grad_feature, s_feat, offset=coll_id)
+
+            if compute_depth != 0:
+                t_depth = wp.tile(my_grad_depth)
+                s_depth = wp.tile_sum(t_depth)
+                wp.tile_atomic_add(grad_depths, s_depth, offset=coll_id)
+
+            t_xy = wp.tile(my_grad_xy, preserve_type=True)
+            s_xy = wp.tile_reduce(wp.add, t_xy)
+            wp.tile_atomic_add(grad_points_xy, s_xy, offset=coll_id)
+
+            t_co = wp.tile(my_grad_co, preserve_type=True)
+            s_co = wp.tile_reduce(wp.add, t_co)
+            wp.tile_atomic_add(grad_conic_opacity, s_co, offset=coll_id)
 
     @wp.kernel
     def _backward_cov2d_warp_kernel(
@@ -3165,14 +3250,9 @@ def _make_empty_forward_outputs(means3D, image_height, image_width):
     proj_2d = _allocate_scalar_tensor((point_count, 2), torch.float32, means3D.device, fill_value=0.0)
     conic_2d = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
     conic_2d_inv = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
-    if _COMPUTE_AUX_FORWARD:
-        gs_per_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=-1.0)
-        weight_per_gs_pixel = _allocate_scalar_tensor((TOP_K, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
-        x_mu = _allocate_scalar_tensor((TOP_K, 2, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
-    else:
-        gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
-        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
-        x_mu = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+    gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+    weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+    x_mu = torch.empty((0,), dtype=torch.float32, device=means3D.device)
     geom_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     binning_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     img_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
@@ -3323,21 +3403,22 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
 
     coeff_count = shs.shape[1]
     _dev = str(means3D.device)
+    # P2b: vec3 SH forward — 3× fewer load/store instructions
     _inp = [
         wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
         wp.from_torch(campos.detach().contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(shs.detach().contiguous().reshape(-1), dtype=wp.float32),
+        wp.from_torch(shs.detach().contiguous().reshape(-1, 3), dtype=wp.vec3),
         int(degree),
         int(coeff_count),
     ]
     _out = [
-        wp.from_torch(rgb.reshape(-1), dtype=wp.float32),
+        wp.from_torch(rgb.reshape(-1, 3), dtype=wp.vec3),
         wp.from_torch(clamped_int.reshape(-1), dtype=wp.int32),
     ]
     _key = (_dev, point_count)
     _cmd = _C4_LAUNCH_CACHE_FWD_SH.get(_key)
     if _cmd is None:
-        _cmd = wp.launch(kernel=_forward_rgb_from_sh_warp_kernel, dim=point_count,
+        _cmd = wp.launch(kernel=_forward_rgb_from_sh_v3_warp_kernel, dim=point_count,
                          inputs=_inp, outputs=_out, device=_dev, record_cmd=True)
         _C4_LAUNCH_CACHE_FWD_SH[_key] = _cmd
     else:
@@ -3384,17 +3465,17 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
                 _cmd.set_param_at_index(_i, _v)
         _cmd.launch()
     else:
-        # M1: AoS direct — no SoA transpose needed, kernels index shs as (P*coeff, 3)
-        _w_shs_v3 = wp.from_torch(shs.contiguous().reshape(-1, 3), dtype=wp.vec3)
-        grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=means3D.device)
-        _w_grad_sh_v3 = wp.from_torch(grad_sh.reshape(-1, 3), dtype=wp.vec3)
+        # SoA layout for coalesced GPU access: (P, K, 3) → (K, P, 3)
+        # Adjacent threads access adjacent vec3s → eliminates 86% excessive sectors
+        _w_shs_v3 = wp.from_torch(shs.permute(1, 0, 2).contiguous().reshape(-1, 3), dtype=wp.vec3)
+        grad_sh_soa = torch.zeros((coeff_count, point_count, 3), dtype=shs.dtype, device=means3D.device)
+        _w_grad_sh_v3 = wp.from_torch(grad_sh_soa.reshape(-1, 3), dtype=wp.vec3)
         # M2: pass grad_color + clamped directly to kernel (avoids _masked_grad allocation)
         _w_grad_color_v3 = wp.from_torch(grad_color.contiguous().reshape(-1, 3), dtype=wp.vec3)
         _w_clamped_i32 = wp.from_torch(clamped_i32.reshape(-1), dtype=wp.int32)
         _key = (_dev, point_count)
 
-        # Merged deg 0-3 kernel — dRGBd is register-local, no intermediate buffer
-        _inp = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), _w_grad_color_v3, _w_clamped_i32]
+        _inp = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), int(point_count), _w_grad_color_v3, _w_clamped_i32]
         _out = [_w_grad_means, _w_grad_sh_v3]
         _cmd = _C4_LAUNCH_CACHE_SH_V3.get(_key)
         if _cmd is None:
@@ -3405,6 +3486,8 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
             for _i, _v in enumerate(_inp + _out):
                 _cmd.set_param_at_index(_i, _v)
         _cmd.launch()
+        # Transpose grad_sh from SoA (K, P, 3) back to AoS (P, K, 3)
+        grad_sh = grad_sh_soa.permute(1, 0, 2).contiguous()
 
     return grad_means, grad_sh
 
@@ -3443,94 +3526,63 @@ def _backward_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations, 
 
 def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, background, image_height, image_width):
     device = feature_ptr.device
-    compute_aux = _COMPUTE_AUX_FORWARD
     total_pixels = image_height * image_width
     out_color = torch.empty((NUM_CHANNELS, image_height, image_width), dtype=torch.float32, device=device)
     out_depth = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     out_alpha = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
-    if compute_aux:
-        gs_per_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
-        weight_per_gs_pixel = torch.empty((TOP_K, image_height, image_width), dtype=torch.float32, device=device)
-        x_mu = torch.empty((TOP_K, 2, image_height, image_width), dtype=torch.float32, device=device)
-    else:
-        gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=device)
-        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=device)
-        x_mu = torch.empty((0,), dtype=torch.float32, device=device)
     n_contrib = torch.empty((total_pixels,), dtype=torch.int32, device=device)
+    gs_per_pixel = torch.empty((0,), dtype=torch.float32, device=device)
+    weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=device)
+    x_mu = torch.empty((0,), dtype=torch.float32, device=device)
 
     if binning_state["num_rendered"] == 0:
         out_color.zero_()
         out_depth.zero_()
         out_alpha.zero_()
-        if compute_aux:
-            gs_per_pixel.fill_(-1.0)
-            weight_per_gs_pixel.zero_()
-            x_mu.zero_()
         n_contrib.zero_()
         return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
-    points_xy_image = preprocess_outputs["points_xy_image"].detach().contiguous()
-    conic_opacity = preprocess_outputs["conic_opacity"].detach().contiguous()
-    depths = preprocess_outputs["depths"].detach().contiguous()
+    # F6: preprocess outputs are already contiguous from torch.empty(); skip redundant .detach().contiguous()
+    points_xy_image = preprocess_outputs["points_xy_image"]
+    conic_opacity = preprocess_outputs["conic_opacity"]
+    depths = preprocess_outputs["depths"]
     feature_ptr = feature_ptr.detach().contiguous()
     background = background.detach().to(dtype=torch.float32, device=device).contiguous()
-    ranges = binning_state["ranges"].detach().contiguous().reshape(-1)
-    point_list = binning_state["point_list"].detach().contiguous()
+    ranges = binning_state["ranges"].reshape(-1)
+    point_list = binning_state["point_list"]
 
-    _common_inputs = [
-        wp.from_torch(ranges, dtype=wp.int32),
-        wp.from_torch(point_list, dtype=wp.int32),
-        wp.from_torch(points_xy_image, dtype=wp.vec2),
-        wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32),
-        wp.from_torch(depths, dtype=wp.float32),
-        wp.from_torch(conic_opacity, dtype=wp.vec4),
-        wp.from_torch(background.reshape(-1), dtype=wp.float32),
-        int(image_width),
-        int(image_height),
-        int(binning_state["grid_x"]),
-    ]
-    if compute_aux:
-        wp.launch(
-            kernel=_render_tiles_warp_kernel,
-            dim=image_height * image_width,
-            inputs=_common_inputs,
-            outputs=[
-                wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
-                wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
-                wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
-                wp.from_torch(gs_per_pixel.reshape(-1), dtype=wp.float32),
-                wp.from_torch(weight_per_gs_pixel.reshape(-1), dtype=wp.float32),
-                wp.from_torch(x_mu.reshape(-1), dtype=wp.float32),
-                wp.from_torch(n_contrib, dtype=wp.int32),
-            ],
-            device=str(device),
-            block_dim=_get_block_dim("render"),
-        )
+    _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
+    _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
+    _wp_points_xy = wp.from_torch(points_xy_image, dtype=wp.vec2)
+    _wp_features = wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32)
+    _wp_depths = wp.from_torch(depths, dtype=wp.float32)
+    _wp_conic_opacity = wp.from_torch(conic_opacity, dtype=wp.vec4)
+    _wp_bg = wp.from_torch(background.reshape(-1), dtype=wp.float32)
+    _wp_out_color = wp.from_torch(out_color.reshape(-1), dtype=wp.float32)
+    _wp_out_depth = wp.from_torch(out_depth.reshape(-1), dtype=wp.float32)
+    _wp_out_alpha = wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32)
+    _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
+    _compute_depth_flag = int(1 if _COMPUTE_DEPTH else 0)
+    # T1: Tiled-256 cooperative forward render
+    _grid_x_fwd = int(binning_state["grid_x"])
+    _grid_y_fwd = (image_height + BLOCK_Y - 1) // BLOCK_Y
+    _num_tiles_fwd = _grid_x_fwd * _grid_y_fwd
+    _dim = _num_tiles_fwd * (BLOCK_X * BLOCK_Y)
+    _inp = [_wp_ranges, _wp_point_list, _wp_points_xy, _wp_features, _wp_depths,
+            _wp_conic_opacity, _wp_bg, int(image_width), int(image_height),
+            _grid_x_fwd, _num_tiles_fwd, _compute_depth_flag]
+    _out = [_wp_out_color, _wp_out_depth, _wp_out_alpha, _wp_n_contrib]
+    _key = (str(device), _dim)
+    _cmd = _C4_LAUNCH_CACHE_FWD_RENDER_TILED256.get(_key)
+    if _cmd is None:
+        _cmd = wp.launch(kernel=_render_tiles_tiled256_warp_kernel, dim=_dim,
+                         inputs=_inp, outputs=_out, device=str(device), record_cmd=True,
+                         block_dim=256)
+        _C4_LAUNCH_CACHE_FWD_RENDER_TILED256[_key] = _cmd
     else:
-        _render_dim = image_height * image_width
-        _render_out = [
-            wp.from_torch(out_color.reshape(-1), dtype=wp.float32),
-            wp.from_torch(out_depth.reshape(-1), dtype=wp.float32),
-            wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32),
-            wp.from_torch(n_contrib, dtype=wp.int32),
-        ]
-        _render_key = (str(device), _render_dim)
-        _render_cmd = _C4_LAUNCH_CACHE_FWD_RENDER.get(_render_key)
-        if _render_cmd is None:
-            _render_cmd = wp.launch(
-                kernel=_render_tiles_fast_warp_kernel,
-                dim=_render_dim,
-                inputs=_common_inputs,
-                outputs=_render_out,
-                device=str(device),
-                record_cmd=True,
-                block_dim=_get_block_dim("render"),
-            )
-            _C4_LAUNCH_CACHE_FWD_RENDER[_render_key] = _render_cmd
-        else:
-            for _i, _v in enumerate(_common_inputs + _render_out):
-                _render_cmd.set_param_at_index(_i, _v)
-        _render_cmd.launch()
+        for _i, _v in enumerate(_inp + _out):
+            _cmd.set_param_at_index(_i, _v)
+    _cmd.launch()
     return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
 
@@ -3555,57 +3607,51 @@ def _build_binning_state(
             sort_mode, _ = _select_auto_binning_sort_mode(device, point_count)
 
         if sort_mode not in BINNING_SORT_MODES:
-            raise ValueError("sort_mode must be one of 'torch', 'torch_count', 'warp_radix', or 'warp_depth_stable_tile'")
+            raise ValueError("sort_mode must be one of 'torch', 'warp_radix', or 'warp_depth_stable_tile'")
 
         sorted_point_ids: torch.Tensor | None = None
         if point_count > 0 and sort_mode == "warp_depth_stable_tile":
             device_key = str(device)
-            _hint_skip = False
 
-            # O6: Check if previous depth sort order is still valid
-            _cached_order = _DEPTH_SORT_ORDER_CACHE.get(device_key)
-            if _cached_order is not None:
-                _cached_ids, _cached_count = _cached_order
-                if _cached_count == point_count:
-                    _flag = _DEPTH_SORT_CHECK_FLAG.get(device_key)
-                    if _flag is None:
-                        _flag = torch.zeros(1, dtype=torch.int32, device=device)
-                        _DEPTH_SORT_CHECK_FLAG[device_key] = _flag
-                    else:
-                        _flag.zero_()
-                    _depths_i32 = depths.view(torch.int32).contiguous()
-                    wp.launch(
-                        kernel=_check_depth_order_warp_kernel,
-                        dim=point_count,
-                        inputs=[
-                            wp.from_torch(_depths_i32, dtype=wp.int32),
-                            wp.from_torch(_cached_ids, dtype=wp.int32),
-                            wp.from_torch(_flag, dtype=wp.int32),
-                        ],
-                        device=device_key,
-                    )
-                    if _flag[0].item() == 0:
-                        _hint_skip = True
-                        sorted_point_ids = _cached_ids
-
-            if not _hint_skip:
-                point_depth_key_buffer, point_id_buffer, _, _ = _get_radix_sort_i32_buffers(device, point_count * 2)
-                point_depth_keys = point_depth_key_buffer[:point_count]
-                sorted_point_ids = point_id_buffer[:point_count]
-                point_depth_keys.copy_(depths.view(torch.int32))
-                sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
-                point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(point_depth_key_buffer, point_id_buffer, point_count)
-                # Clone to avoid aliasing: step 2 reuses the same i32 cache buffers
-                # for tile-point duplicate sorting, which would overwrite sorted_point_ids.
-                sorted_point_ids = sorted_point_ids.clone()
-                _DEPTH_SORT_ORDER_CACHE[device_key] = (sorted_point_ids, point_count)
+            # Always sort — the O6 depth-order-unchanged check requires a GPU→CPU
+            # sync (.item()) that costs more than the sort itself during training.
+            # Use the shared i32 radix sort buffers for depth sorting, then clone
+            # sorted_point_ids before those buffers are reused by the duplicate sort.
+            _ds_key_buf, _ds_val_buf, _, _ = _get_radix_sort_i32_buffers(device, point_count * 2)
+            point_depth_keys = _ds_key_buf[:point_count]
+            sorted_point_ids = _ds_val_buf[:point_count]
+            point_depth_keys.copy_(depths.view(torch.int32))
+            sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
+            point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(_ds_key_buf, _ds_val_buf, point_count)
+            sorted_point_ids = sorted_point_ids.clone()
+            _DEPTH_SORT_ORDER_CACHE[device_key] = (sorted_point_ids, point_count)
 
             sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
         else:
             point_offsets = _inclusive_scan_i32(tiles_touched) if point_count > 0 else _allocate_scalar_tensor((0,), torch.int32, device)
 
-        num_rendered = int(point_offsets[-1].item()) if point_count > 0 else 0
+        # ----- Prepare data for binning while GPU finishes the scan -----
+        # Moving data prep before the .item() sync allows the host to do useful
+        # work while waiting for the inclusive-scan result.
+        ranges_warp = None
+        ranges = torch.zeros((tile_count + 1, 2), dtype=torch.int32, device=device)
+        point_list_keys = _allocate_scalar_tensor((0,), torch.int64, device)
+        if point_count > 0:
+            points_xy_image_vec2 = _as_detached_contiguous_dtype(points_xy_image, torch.float32)
+            radii_i32 = _as_detached_contiguous_dtype(radii, torch.int32)
+            conic_opacity_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
+            conic_opacity_wp = wp.from_torch(conic_opacity_f32, dtype=wp.vec4)
+            cov2d_inv_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_2d_inv"], torch.float32)
+            cov2d_inv_wp = wp.from_torch(cov2d_inv_f32, dtype=wp.vec3)
+            point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
+
+        # ----- Read num_rendered via GPU→CPU sync -----
+        device_key = str(device)
+        if point_count > 0:
+            num_rendered = int(point_offsets_i32[-1].item())
+        else:
+            num_rendered = 0
 
         if num_rendered == 0:
             state = {
@@ -3621,20 +3667,6 @@ def _build_binning_state(
             }
             return state
 
-        ranges_warp = None
-        # Allocate one extra row: sentinel tile_id (== tile_count) written by
-        # _duplicate_with_keys* kernels would cause OOB in _identify_tile_ranges*.
-        ranges = torch.zeros((tile_count + 1, 2), dtype=torch.int32, device=device)
-
-        point_list_keys = _allocate_scalar_tensor((0,), torch.int64, device)
-
-        points_xy_image_vec2 = _as_detached_contiguous_dtype(points_xy_image, torch.float32)
-        radii_i32 = _as_detached_contiguous_dtype(radii, torch.int32)
-        conic_opacity_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
-        conic_opacity_wp = wp.from_torch(conic_opacity_f32, dtype=wp.vec4)
-        cov2d_inv_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_2d_inv"], torch.float32)
-        cov2d_inv_wp = wp.from_torch(cov2d_inv_f32, dtype=wp.vec3)
-        point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
         point_list = _allocate_scalar_tensor((num_rendered,), torch.int32, device)
         if sort_mode == "warp_radix":
             point_list_keys_buffer, point_list_buffer, _, _ = _get_radix_sort_buffers(device, num_rendered * 2)
@@ -3664,30 +3696,37 @@ def _build_binning_state(
             point_list_keys, point_list = _warp_radix_sort_pairs_in_place(point_list_keys_buffer, point_list_buffer, num_rendered)
         elif sort_mode == "warp_depth_stable_tile":
             tile_id_buffer, point_list_buffer, _, _ = _get_radix_sort_i32_buffers(device, num_rendered * 2)
+            sorted_point_ids_i32 = _as_detached_contiguous_dtype(sorted_point_ids, torch.int32)
+            _dev = str(radii.device)
+            _g1_inp = [
+                wp.from_torch(points_xy_image_vec2, dtype=wp.vec2),
+                wp.from_torch(radii_i32, dtype=wp.int32),
+                conic_opacity_wp,
+                cov2d_inv_wp,
+                wp.from_torch(sorted_point_ids_i32, dtype=wp.int32),
+                wp.from_torch(point_offsets_i32, dtype=wp.int32),
+                int(grid_x),
+                int(grid_y),
+            ]
+            _g1_out = [
+                wp.from_torch(tile_id_buffer[:num_rendered], dtype=wp.int32),
+                wp.from_torch(point_list_buffer[:num_rendered], dtype=wp.int32),
+            ]
+            _g1_key = (_dev, point_count)
+            _g1_cmd = _C4_LAUNCH_CACHE_BINNING_DUPLICATE.get(_g1_key)
+            if _g1_cmd is None:
+                _g1_cmd = wp.launch(
+                    kernel=_duplicate_with_keys_from_order_warp_kernel,
+                    dim=point_count,
+                    inputs=_g1_inp, outputs=_g1_out,
+                    device=_dev, record_cmd=True)
+                _C4_LAUNCH_CACHE_BINNING_DUPLICATE[_g1_key] = _g1_cmd
+            else:
+                for _i, _v in enumerate(_g1_inp + _g1_out):
+                    _g1_cmd.set_param_at_index(_i, _v)
+            _g1_cmd.launch()
             tile_ids = tile_id_buffer[:num_rendered]
             point_list = point_list_buffer[:num_rendered]
-
-            sorted_point_ids_i32 = _as_detached_contiguous_dtype(sorted_point_ids, torch.int32)
-            wp.launch(
-                kernel=_duplicate_with_keys_from_order_warp_kernel,
-                dim=point_count,
-                inputs=[
-                    wp.from_torch(points_xy_image_vec2, dtype=wp.vec2),
-                    wp.from_torch(radii_i32, dtype=wp.int32),
-                    conic_opacity_wp,
-                    cov2d_inv_wp,
-                    wp.from_torch(sorted_point_ids_i32, dtype=wp.int32),
-                    wp.from_torch(point_offsets_i32, dtype=wp.int32),
-                    int(grid_x),
-                    int(grid_y),
-                ],
-                outputs=[
-                    wp.from_torch(tile_ids, dtype=wp.int32),
-                    wp.from_torch(point_list, dtype=wp.int32),
-                ],
-                device=str(radii.device),
-            )
-
             tile_ids, point_list = _warp_radix_sort_i32_pairs_in_place(tile_id_buffer, point_list_buffer, num_rendered)
         else:
             if _can_use_warp_scalar_alloc(device):
@@ -3717,21 +3756,7 @@ def _build_binning_state(
                 device=str(radii.device),
             )
 
-            if sort_mode == "torch_count":
-                point_depth_keys = _gather_i32_by_index(depths.view(torch.int32), point_list)
-                depth_order = torch.argsort(point_depth_keys, stable=True)
-                tile_ids_by_depth = tile_ids[depth_order]
-
-                if tile_count <= 32767:
-                    sorted_tile_ids_i16, tile_order = torch.sort(tile_ids_by_depth.short(), stable=True)
-                    tile_ids = sorted_tile_ids_i16.to(torch.int32)
-                else:
-                    tile_order = torch.argsort(tile_ids_by_depth, stable=True)
-                    tile_ids = tile_ids_by_depth[tile_order]
-                final_order = depth_order[tile_order]
-                point_list = point_list[final_order]
-                point_list_keys = tile_ids.to(torch.int64)
-            elif num_rendered <= TORCH_SINGLE_SORT_THRESHOLD:
+            if num_rendered <= TORCH_SINGLE_SORT_THRESHOLD:
                 point_list_keys = _pack_binning_sort_keys(tile_ids, point_list, depths)
 
                 order = torch.argsort(point_list_keys, stable=True)
@@ -3773,6 +3798,10 @@ def _build_binning_state(
                 ],
                 device=str(radii.device),
             )
+        # T1: pad point_list with RENDER_TILE_BATCH zeros so tile_load at the
+        # tail of any tile's range never reads out-of-bounds memory.
+        point_list = torch.cat([point_list, torch.zeros(RENDER_TILE_BATCH, dtype=point_list.dtype, device=device)])
+
         state = {
             "grid_x": grid_x,
             "grid_y": grid_y,
@@ -3780,7 +3809,7 @@ def _build_binning_state(
             "point_list": point_list,
             "point_list_keys": point_list_keys,
             "ranges": ranges[:tile_count],
-            "num_rendered": int(point_list.numel()),
+            "num_rendered": int(point_list.numel()) - RENDER_TILE_BATCH,
             "requested_sort_mode": requested_sort_mode,
             "selected_sort_mode": sort_mode,
         }
@@ -3804,7 +3833,8 @@ def _backward_render_tiles_warp(
 
     # C3: Combined allocation — 1 memset instead of 4
     _stride = 2 + 1 + 4 + NUM_CHANNELS  # 10
-    _combined = torch.zeros(point_count * _stride, dtype=torch.float32, device=device)
+    _bwd_total = point_count * _stride
+    _combined = torch.zeros(_bwd_total, dtype=torch.float32, device=device)
     _off = 0
     grad_points_xy = _combined[_off:_off + point_count * 2].reshape(point_count, 2); _off += point_count * 2
     grad_depths = _combined[_off:_off + point_count]; _off += point_count
@@ -3820,47 +3850,53 @@ def _backward_render_tiles_warp(
     conic_opacity = preprocess_outputs["conic_opacity"]
     depths = preprocess_outputs["depths"]
     feature_ptr = feature_ptr.contiguous()
-    background = background.to(dtype=torch.float32, device=device).contiguous()
+    background = background.to(dtype=torch.float32, device=device)
     ranges = binning_state["ranges"].reshape(-1)
     point_list = binning_state["point_list"]
-    out_alpha = out_alpha.contiguous().reshape(-1)
-    n_contrib = n_contrib.to(dtype=torch.int32, device=device).contiguous().reshape(-1)
+    out_alpha = out_alpha.reshape(-1)
+    n_contrib = n_contrib.to(dtype=torch.int32, device=device).reshape(-1)
 
     grad_color = grad_color.contiguous().reshape(-1)
     grad_depth = grad_depth.contiguous().reshape(-1)
     grad_alpha = grad_alpha.contiguous().reshape(-1)
 
-    # C4: cache wp.from_torch wrappers + Launch object
-    _dim = image_height * image_width
-    _inp = [
-        wp.from_torch(ranges, dtype=wp.int32),
-        wp.from_torch(point_list, dtype=wp.int32),
-        wp.from_torch(points_xy_image, dtype=wp.vec2),
-        wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32),
-        wp.from_torch(depths, dtype=wp.float32),
-        wp.from_torch(conic_opacity, dtype=wp.vec4),
-        wp.from_torch(background.reshape(-1), dtype=wp.float32),
-        wp.from_torch(out_alpha, dtype=wp.float32),
-        wp.from_torch(n_contrib, dtype=wp.int32),
-        wp.from_torch(grad_color, dtype=wp.float32),
-        wp.from_torch(grad_depth, dtype=wp.float32),
-        wp.from_torch(grad_alpha, dtype=wp.float32),
-        int(image_width),
-        int(image_height),
-        int(binning_state["grid_x"]),
-    ]
-    _out = [
-        wp.from_torch(grad_points_xy, dtype=wp.vec2),
-        wp.from_torch(grad_depths, dtype=wp.float32),
-        wp.from_torch(grad_conic_opacity, dtype=wp.vec4),
-        wp.from_torch(grad_feature, dtype=wp.vec3),
-    ]
-    _key = (str(device), _dim)
+    # W1: Smart dispatch — warp32 for high density, non-tiled for low density
+    _grid_x = int(binning_state["grid_x"])
+    _grid_y = (image_height + BLOCK_Y - 1) // BLOCK_Y
+    _num_tiles = _grid_x * _grid_y
+    _num_rendered = int(binning_state["num_rendered"])
+
+    _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
+    _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
+    _wp_points_xy = wp.from_torch(points_xy_image, dtype=wp.vec2)
+    _wp_features = wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32)
+    _wp_depths = wp.from_torch(depths, dtype=wp.float32)
+    _wp_conic_opacity = wp.from_torch(conic_opacity, dtype=wp.vec4)
+    _wp_bg = wp.from_torch(background.reshape(-1), dtype=wp.float32)
+    _wp_out_alpha = wp.from_torch(out_alpha, dtype=wp.float32)
+    _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
+    _wp_grad_color = wp.from_torch(grad_color, dtype=wp.float32)
+    _wp_grad_depth = wp.from_torch(grad_depth, dtype=wp.float32)
+    _wp_grad_alpha = wp.from_torch(grad_alpha, dtype=wp.float32)
+    _wp_grad_xy = wp.from_torch(grad_points_xy, dtype=wp.vec2)
+    _wp_grad_d = wp.from_torch(grad_depths, dtype=wp.float32)
+    _wp_grad_co = wp.from_torch(grad_conic_opacity, dtype=wp.vec4)
+    _wp_grad_f = wp.from_torch(grad_feature, dtype=wp.vec3)
+    _compute_depth_flag = int(1 if _COMPUTE_DEPTH else 0)
+
+    _dim = _num_tiles * (BLOCK_X * BLOCK_Y)
+    # W1: warp32 backward — warp-level tile_reduce gives 32× fewer atomicAdd
+    _inp = [_wp_ranges, _wp_point_list, _wp_points_xy, _wp_features, _wp_depths,
+            _wp_conic_opacity, _wp_bg, _wp_out_alpha, _wp_n_contrib,
+            _wp_grad_color, _wp_grad_depth, _wp_grad_alpha,
+            int(image_width), int(image_height), _grid_x, _num_tiles, _compute_depth_flag]
+    _out = [_wp_grad_xy, _wp_grad_d, _wp_grad_co, _wp_grad_f]
+    _key = ("w32", str(device), _dim)
     _cmd = _C4_LAUNCH_CACHE_RENDER_BWD.get(_key)
     if _cmd is None:
-        _cmd = wp.launch(kernel=_backward_render_tiles_warp_kernel, dim=_dim,
+        _cmd = wp.launch(kernel=_backward_render_tiles_warp32_kernel, dim=_dim,
                          inputs=_inp, outputs=_out, device=str(device), record_cmd=True,
-                         block_dim=_get_block_dim("backward_render"))
+                         block_dim=32)
         _C4_LAUNCH_CACHE_RENDER_BWD[_key] = _cmd
     else:
         for _i, _v in enumerate(_inp + _out):
@@ -4000,6 +4036,11 @@ def preprocess_gaussians(
                 raise ValueError("means3D and computed covariances must have the same number of points")
 
         point_count = means3D.shape[0]
+        # B5: auto-detect pruning (>20% point drop) and clear stale grow-only caches
+        global _PREV_POINT_COUNT
+        if _PREV_POINT_COUNT is not None and point_count < int(_PREV_POINT_COUNT * 0.8):
+            clear_warp_caches()
+        _PREV_POINT_COUNT = point_count
         proj_2d = torch.empty((point_count, 2), dtype=torch.float32, device=device)
         conic_2d = torch.empty((point_count, 3), dtype=torch.float32, device=device)
         conic_2d_inv = torch.empty((point_count, 3), dtype=torch.float32, device=device)
@@ -4092,7 +4133,8 @@ def preprocess_gaussians(
         if cov3d_all is None:
             cov3d_all = torch.zeros((point_count, 6), dtype=torch.float32, device=device)
 
-        visible_count = int(visible_mask.sum().item()) if point_count > 0 else 0
+        # F3: E1 fused path processes all points — skip GPU→CPU sync
+        visible_count = point_count if has_scale_rotation else (int(visible_mask.sum().item()) if point_count > 0 else 0)
 
         if point_count == 0 or visible_count == 0:
             depths.zero_()

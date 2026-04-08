@@ -30,11 +30,15 @@ A **pure Python + NVIDIA Warp** reimplementation of the differentiable Gaussian 
 - **Complete rasterization pipeline**: Preprocess → Binning → Forward render → Backward render, all implemented by Warp kernels.
 - **Drop-in replacement**: The API is compatible with the native CUDA backend — you only need to change the import path to switch backends.
 - **No compilation required**: Pure Python + Warp JIT. No `setup.py build_ext`, no CUDA toolkit headers, and no platform-specific build issues.
+- **Cooperative tile loading (forward)**: The forward render kernel (block_dim=256) uses `wp.tile()` + `wp.tile_extract()` for cooperative Gaussian data loading, eliminating redundant per-pixel global memory reads.
+- **Warp-level gradient reduction (backward)**: The backward render kernel (block_dim=32) uses `wp.tile_reduce()` for pure warp-shuffle gradient reduction, reducing atomic writes by 32×.
 - **Spherical Harmonics**: Supports degrees 0–3, consistent with the original implementation.
 - **Auto-tuning**: Occupancy-aware kernel block-dimension selection based on GPU SM architecture (Volta through Blackwell).
-- **Multiple binning sort modes**: `warp_depth_stable_tile` (default, recommended), `warp_radix`, `torch`, `torch_count`.
+- **Multiple binning sort modes**: `warp_depth_stable_tile` (default, recommended), `warp_radix`, `torch`.
 - **Fused backward kernels**: Merges allocation and gradient-accumulation steps to reduce kernel launch overhead.
 - **Tight AABB tile culling**: Uses per-axis 3σ bounding boxes for Gaussian-to-tile assignment (inspired by [Zhang et al., 2025](https://arxiv.org/abs/2601.19489)), reducing unnecessary tile overlap for elongated Gaussians.
+- **Depth computation skip**: Optionally disables per-pixel depth accumulation (`GSWARP_COMPUTE_DEPTH=0`), saving ~5% per-iteration time when depth is not used in the loss.
+- **Automatic cache clearing**: Automatically clears Warp caches when Gaussian count drops significantly (>20% decrease), ensuring optimally sized caches after densification/pruning.
 - **Forward-state packing**: Efficient forward-state serialization for backward reuse, avoiding redundant recomputation.
 
 ---
@@ -43,10 +47,10 @@ A **pure Python + NVIDIA Warp** reimplementation of the differentiable Gaussian 
 
 | Component | Minimum Version | Tested Version |
 |------|---------|---------|
-| **Python** | 3.10+ | 3.10 |
-| **NVIDIA GPU** | Compute Capability ≥ 7.0 (Volta) | RTX 4060 Laptop |
-| **NVIDIA Driver** | Compatible with CUDA 12.x | 13.2 |
-| **PyTorch** | 2.0+ (with CUDA support) | 2.7.0+cu126 |
+| **Python** | 3.10+ | 3.14.3 |
+| **NVIDIA GPU** | Compute Capability ≥ 7.0 (Volta) | RTX 5090D V2 (sm_120, 24 GiB) |
+| **NVIDIA Driver** | Compatible with CUDA 12.x | 595.79 |
+| **PyTorch** | 2.0+ (with CUDA support) | 2.11.0+cu130 |
 | **NVIDIA Warp** | 1.12.0+ | 1.12.0 |
 
 The SM-architecture auto-tuning table covers the following architectures:
@@ -125,7 +129,7 @@ raster_settings = GaussianRasterizationSettings(
     prefiltered=False,
     # Warp-specific optional fields:
     backward_mode="manual",              # Only "manual" is supported
-    binning_sort_mode="warp_depth_stable_tile",  # or: "warp_radix", "torch", "torch_count"
+    binning_sort_mode="warp_depth_stable_tile",  # or: "warp_radix", "torch"
     auto_tune=True,
     auto_tune_verbose=True,
 )
@@ -242,21 +246,25 @@ Input Gaussians (means3D, SH, scales, rotations, opacities)
 └─────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────┐
-│  3. FORWARD RENDER              │
-│  - Per-pixel alpha blending     │
-│  - Front-to-back compositing    │
-│  - TOP_K early termination      │
-│  - Color, depth, alpha outputs  │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│  3. FORWARD RENDER                       │
+│  - block_dim=256 cooperative tile load   │
+│    (wp.tile + wp.tile_extract)           │
+│  - Per-pixel alpha blending              │
+│  - Front-to-back compositing             │
+│  - Transmittance threshold termination   │
+│  - Color, depth, alpha outputs           │
+└──────────────────────────────────────────┘
     │
     ▼
-┌─────────────────────────────────┐
-│  4. BACKWARD RENDER             │
-│  - Gradients w.r.t. conic,      │
-│    opacity, color, and pos      │
-│  - atomic_add accumulation      │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│  4. BACKWARD RENDER                      │
+│  - block_dim=32 warp-level grad reduce   │
+│    (wp.tile_reduce → warp shuffle)       │
+│  - Gradients w.r.t. conic,              │
+│    opacity, color, and pos               │
+│  - 32× fewer atomic_add writes           │
+└──────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────┐
@@ -270,7 +278,7 @@ Input Gaussians (means3D, SH, scales, rotations, opacities)
 
 ### Single-File Design
 
-The entire Warp backend is contained in a single Python file (about 4400 lines), including:
+The entire Warp backend is contained in a single Python file (about 4100 lines), including:
 
 - all Warp kernel definitions (`@wp.kernel`)
 - all Warp helper functions (`@wp.func`)
@@ -283,10 +291,10 @@ This is intentional — Warp's JIT compilation model requires all kernel code an
 
 | Constant | Value | Description |
 |------|---|------|
-| `TOP_K` | 20 | Maximum number of Gaussians per pixel (early termination) |
 | `BLOCK_X` | 16 | Tile width in pixels |
 | `BLOCK_Y` | 16 | Tile height in pixels |
 | `NUM_CHANNELS` | 3 | RGB output channels |
+| `RENDER_TILE_BATCH` | 32 | Number of Gaussians cooperatively loaded into shared memory per round in the forward kernel |
 | `PREPROCESS_CULL_SIGMA` | 3.0 | Frustum-culling sigma multiplier |
 | `PREPROCESS_CULL_FOV_SCALE` | 1.3 | FoV-boundary scale used for culling |
 | `VISIBILITY_NEAR_PLANE` | 0.2 | Near-plane distance used for culling |
@@ -321,9 +329,9 @@ radius_y = wp.int32(wp.ceil(3.0 * wp.sqrt(wp.max(cov_yy, 0.01))))
 - For **circular Gaussians**, the two approaches are equivalent.
 - This introduces a small mismatch: some boundary tiles included by the CUDA baseline due to its overly conservative isotropic radius are excluded by Warp's tighter bounds. The visual difference is negligible, but measurable in numerical comparisons.
 
-### 2. No Shared-Memory Cooperative Fetch
+### 2. Partial Cooperative Tile Loading (via Warp Tile API)
 
-**CUDA baseline** uses `__shared__` memory for cooperative tile-level data fetching:
+**CUDA baseline** uses explicit `__shared__` memory for cooperative data fetching — all 256 threads in a tile collaboratively load Gaussian data from global memory into shared memory, then iterate over the shared buffer:
 
 ```c
 // CUDA: forward.cu renderCUDA()
@@ -331,43 +339,51 @@ __shared__ int collected_id[BLOCK_SIZE];
 __shared__ float2 collected_xy[BLOCK_SIZE];
 __shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
-// All threads in the tile cooperatively load a batch of Gaussians from global
-// memory into shared memory, and then iterate over that batch.
 for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) {
-    // Read from shared memory — fast, broadcast to all threads in the tile
     float2 xy = collected_xy[j];
     float4 con_o = collected_conic_opacity[j];
     ...
 }
 ```
 
-In the **Warp backend**, using `__shared__` memory is currently relatively difficult. Each thread reads independently from global memory:
+The **Warp backend** cannot directly declare or manipulate `__shared__` variables, but achieves cooperative loading indirectly through the Warp Tile API (`wp.tile()` + `wp.tile_extract()`). The forward render kernel uses block_dim=256 (one 16×16 pixel tile per block). In each iteration, each thread loads 1 Gaussian, then all threads read other threads' data via `wp.tile_extract()`:
 
 ```python
-# Warp: each thread reads independently
-g_idx = point_list[tile_start + j]
-xy_x = means2d_x[g_idx]
-xy_y = means2d_y[g_idx]
-con_x = conic_x[g_idx]
-...
+# Warp: _render_tiles_tiled256_warp_kernel
+# Each thread loads 1 Gaussian (cooperative)
+my_xy = points_xy_image[my_id]
+my_co = conic_opacity[my_id]
+t_xy = wp.tile(my_xy, preserve_type=True)
+t_co = wp.tile(my_co, preserve_type=True)
+
+# All 256 threads share this batch of data
+for j in range(batch_count):
+    xy_j = wp.tile_extract(t_xy, j)
+    co_j = wp.tile_extract(t_co, j)
+    ...
 ```
 
+This is functionally equivalent to CUDA's shared-memory cooperative fetch — global memory reads are amortized across all threads in the tile. However, the Warp Tile API has certain constraints:
+- `wp.tile()` always creates block-level tiles — cannot create warp-level tiles
+- Each `wp.tile()` call implicitly involves `__syncthreads`
+- No direct control over shared memory layout or alignment
+
+The **backward render kernel** uses block_dim=32 (single warp), employing `wp.tile_reduce()` for gradient reduction. In the single-warp configuration, `tile_reduce` compiles to pure warp shuffles (`__shfl_down_sync`), requiring no `__syncthreads` or shared memory — the optimal configuration for backward gradient reduction under the Warp API.
+
 **Impact**:
-- This is the **largest performance gap** between Warp and CUDA at small and medium scales. In CUDA's shared-memory pattern, a single load is shared by all 256 threads in a tile, whereas Warp issues 256 independent global reads per Gaussian.
-- In large scenes (`num_rendered > ~30K`), blending computation and memory bandwidth dominate performance, so this gap becomes smaller.
+- The forward render is now close to CUDA baseline efficiency at all scales — cooperative loading eliminates the previous 256× redundant global memory reads per Gaussian.
+- The backward render is also efficient — warp-level reduction reduces atomic writes by 32×.
+- However, the Warp Tile API is still less flexible than direct `__shared__` memory manipulation — for example, complex double buffering or custom bank-conflict avoidance strategies cannot be implemented.
 
 ### 3. Sorting Differences
 
 **CUDA baseline** uses a single CUB `DeviceRadixSort` pass with a packed 64-bit key (`(tile_id << 32) | depth_bits`).
 
-**Warp backend** provides four sort modes. They share the same **preprocess / render / backward-render** kernels, and differ only in **how the binning stage builds and sorts `(tile, point)` pairs**:
+**Warp backend** default mode (`warp_depth_stable_tile`) uses two sorts:
+1. First pass: sort by depth (Warp radix sort)
+2. Second pass: stable sort by tile ID (Warp radix sort)
 
-- `warp_radix`: directly duplicates packed 64-bit `(tile_id, depth_bits)` keys inside Warp and runs a **single Warp radix sort**. This is the shortest path and uses the lightest scratch, but its tie-break behavior is not fully identical to CUDA/CUB.
-- `warp_depth_stable_tile`: first sorts points by depth with a **Warp i32 radix sort**, then duplicates `(tile_id, point_id)` in that depth order, and finally performs a **stable Warp radix sort by tile id**, preserving depth order inside each tile.
-- `torch`: first generates `tile_id / point_id` in Warp, then performs a **stable PyTorch argsort**. When `num_rendered <= TORCH_SINGLE_SORT_THRESHOLD`, it uses a single packed-key sort; above that threshold, it falls back to a two-stage stable sort (`depth`, then `tile`).
-- `torch_count`: also generates `tile_id / point_id` in Warp, but first stable-sorts by depth and then sorts by `tile_id` in PyTorch; when the tile count is small, it can take an `int16` fast path to reduce the key width of the second sort.
-
-In other words, the four Warp paths do not disagree on whether preprocess / render are mathematically correct. They differ in **the order in which the same Gaussians are fed into each tile**. That changes the floating-point accumulation order during alpha blending and backward `atomic_add`, which is why the remaining differences appear as sparse numeric residuals instead of large systematic errors.
+This leads to different Gaussian ordering within each tile compared with the CUDA baseline, which in turn changes the floating-point accumulation order during alpha blending. Because floating-point arithmetic is non-associative, the pixel-level outputs differ slightly.
 
 ### 4. Culling Parameters
 
@@ -377,7 +393,7 @@ The Warp backend applies explicit frustum-culling parameters:
 
 This differs slightly from the CUDA baseline's implicit culling behavior.
 
-### 5. Per-Pixel vs Per-Tile Dispatch
+### 5. Dispatch Differences
 
 The CUDA baseline dispatches the render kernel on a 2D grid of tile blocks:
 
@@ -386,223 +402,329 @@ dim3 grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 dim3 block(BLOCK_X, BLOCK_Y, 1);
 ```
 
-The Warp backend dispatches in 1D, with one thread per pixel:
+The Warp backend dispatches in 1D, but also on a per-tile basis — each tile corresponds to 256 threads (16×16 pixels):
 
 ```python
-wp.launch(kernel, dim=image_height * image_width, ...)
+# Forward: block_dim=256, each block = one tile
+_dim = num_tiles * 256
+wp.launch(kernel, dim=_dim, block_dim=256, ...)
 ```
 
-The tile index is derived inside the kernel using arithmetic on `wp.tid()`. The functionality is equivalent, but occupancy and scheduling characteristics differ.
+The tile index is derived inside the kernel using arithmetic on `wp.tid()` (`tile_id = tid // 256`, `local_id = tid % 256`). The functionality is equivalent, but the 1D dispatch thread mapping is slightly different.
+
+The backward render kernel uses block_dim=32 (single warp), where each warp covers the same 16×16 tile but each thread handles approximately 8 pixels within the tile.
 
 ---
 
 ## Correctness
 
-The test configuration is as follows:
+### Random Particle Correctness (256K–2048K)
 
-- `mode = sh_scale_rotation`
-- `backward_mode="manual"`
-- `binning_sort_mode ∈ {"warp_radix", "torch", "warp_depth_stable_tile", "torch_count"}` (explicitly set per run)
-- `auto_tune=True`
-- `auto_tune_verbose=True`
-- test scales: **4,096 / 16,384 / 65,536 / 262,144** particles
+Numerical consistency between Native CUDA and Warp backends was verified at 256K–2048K random particle scales using the public API. Test configuration: `backward_mode="manual"`, `binning_sort_mode="warp_depth_stable_tile"`, `auto_tune=True`. Test platform: **NVIDIA RTX 5090D V2**, PyTorch 2.11.0+cu130, Warp 1.12.0.
 
+#### Forward: Rendered Color Difference
 
-Across the full 4-sort-mode sweep of the updated warp-backend, the preprocess diagnostics stay aligned and the final forward outputs remain exact at the checked tolerance for all 16 combinations. The only remaining differences are sparse backward outliers, and the "best" sort mode now clearly depends on scale.
+| Scale | Resolution | Max abs error | Mean abs error |
+|------|--------|------------|------------|
+| 256K | 384×384 | 0.0108 | 4.01e-05 |
+| 512K | 512×512 | 0.0064 | 3.37e-05 |
+| 1024K | 640×640 | 0.0077 | 2.78e-05 |
+| 2048K | 800×800 | 0.0033 | 1.74e-05 |
 
-### How the four warp-backend sort backends work
+Max single-pixel error < 0.011 (value range [0,1]), with mean absolute error on the order of 1e-5. Error slightly decreases with increasing scale, indicating the differences arise from sparse outlier pixels rather than systematic bias. The two backends use different tile sorting implementations and floating-point accumulation orders, producing numerically small differences.
 
-All four modes share the exact same **preprocess / render / backward-render** kernels. The only thing that changes is **how the binning stage builds and sorts `(tile, point)` pairs**:
+#### Backward: Gradient Difference
 
-- `warp_radix`: duplicates packed 64-bit keys of the form `(tile_id, depth_bits)` inside Warp and runs a **single Warp radix sort**. This is the leanest path, but its tie-break behavior is not identical to CUDA/CUB.
-- `warp_depth_stable_tile`: first does a **Warp i32 radix sort by depth**, then duplicates `(tile_id, point_id)` in that depth order, and finally performs a **stable Warp radix sort by tile id**, preserving depth order inside each tile.
-- `torch`: generates `tile_id / point_id` in Warp and then switches to **stable PyTorch argsort**. Below `TORCH_SINGLE_SORT_THRESHOLD`, it uses one packed-key stable sort; above that threshold, it falls back to a two-pass stable sort (`depth`, then `tile`).
-- `torch_count`: also generates `tile_id / point_id` in Warp, but explicitly stable-sorts by depth first and then sorts by `tile_id` in PyTorch; when the tile count is small, it takes an `int16` fast path for the second sort.
+| Scale | Gradient field | Max abs error | Mean abs error |
+|------|----------|------------|------------|
+| 256K | `grad_means3D` | 35.78 | 0.00114 |
+| | `grad_shs` | 1.75 | 6.68e-05 |
+| | `grad_scales` | 152.56 | 0.00607 |
+| | `grad_rotations` | 12.11 | 3.95e-04 |
+| | `grad_opacities` | 2.38 | 1.56e-04 |
+| 1024K | `grad_means3D` | 89.53 | 5.63e-04 |
+| | `grad_shs` | 6.36 | 4.97e-05 |
+| | `grad_scales` | 1014.70 | 0.00324 |
+| | `grad_rotations` | 64.96 | 2.14e-04 |
+| | `grad_opacities` | 12.29 | 1.00e-04 |
+| 2048K | `grad_means3D` | 43.93 | 2.95e-04 |
+| | `grad_shs` | 3.68 | 2.21e-05 |
+| | `grad_scales` | 461.47 | 0.00173 |
+| | `grad_rotations` | 19.03 | 1.05e-04 |
+| | `grad_opacities` | 1.85 | 5.37e-05 |
 
-So the four backends do **not** disagree on the preprocess math or the rendering formula. They only disagree on **the order in which the same Gaussians are fed into each tile**, which is why the remaining differences show up only in sparse backward outliers.
+The large max absolute errors in backward gradients require context:
+- Gradient values span a very wide range (e.g. `grad_scales` can reach ±10⁴); max absolute errors occur only at a few extreme gradient points.
+- **Mean absolute errors** are tiny (`grad_means3D` < 0.0012, `grad_shs` < 7e-05), indicating the vast majority of per-point gradients are highly consistent.
+- As scale increases from 256K → 2048K, mean absolute errors consistently decrease (e.g. `grad_means3D` drops from 0.00114 to 0.00030), confirming differences arise from sparse outliers rather than systematic bias.
+- Differences stem from different tile sorting orders causing floating-point rounding divergence in alpha blending accumulation, plus non-deterministic ordering of atomic gradient writes.
 
-### warp-backend sort-mode sweep
+### End-to-End Training Quality (12 Datasets × 30K Iterations)
 
-> In this experiment each run explicitly forces `binning_sort_mode`, so the requested mode and the actually executed mode would be redundant in the README tables.
+The following data is based on the **default training parameters** from the original 3DGS repository (30,000 iterations), tested on 12 standard datasets. The test platform is **NVIDIA RTX 5090D V2** (24 GiB), PyTorch 2.11.0+cu130, Warp 1.12.0.
 
-<table>
-    <thead>
-        <tr>
-            <th>Points</th>
-            <th>Sort mode</th>
-            <th>Preprocess</th>
-            <th>Backward out-of-threshold coverage</th>
-            <th>Backward max-diff</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr><td rowspan="4"><strong>4,096</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.039062</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.019531</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 1 / 12,288 (0.008138%)</td><td>0.035156</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td><strong>0.012695</strong></td></tr>
-        <tr><td rowspan="4"><strong>16,384</strong></td><td><code>warp_radix</code></td><td>aligned</td><td>clean</td><td>0.007812</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td>clean</td><td>0.014648</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>shs</code>: 2 / 786,432 (0.000254%)</td><td>0.023438</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td>clean</td><td><strong>0.005859</strong></td></tr>
-        <tr><td rowspan="4"><strong>65,536</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 2 / 196,608 (0.001017%)<br><code>means2D</code>: 1 / 196,608 (0.000509%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>scales</code>: 1 / 196,608 (0.000509%)<br><code>rotations</code>: 2 / 262,144 (0.000763%)</td><td><strong>0.066406</strong></td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>rotations</code>: 1 / 262,144 (0.000381%)</td><td>0.125000</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 3 / 196,608 (0.001526%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)<br><code>shs</code>: 3 / 3,145,728 (0.000095%)<br><code>scales</code>: 1 / 196,608 (0.000509%)<br><code>rotations</code>: 3 / 262,144 (0.001144%)</td><td>0.250000</td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 4 / 196,608 (0.002035%)<br><code>opacity</code>: 2 / 65,536 (0.003052%)</td><td>0.179688</td></tr>
-        <tr><td rowspan="4"><strong>262,144</strong></td><td><code>warp_radix</code></td><td>aligned</td><td><code>means3D</code>: 5 / 786,432 (0.000636%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 4 / 262,144 (0.001526%)<br><code>shs</code>: 51 / 12,582,912 (0.000405%)<br><code>scales</code>: 3 / 786,432 (0.000381%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.593750</td></tr>
-        <tr><td><code>torch</code></td><td>aligned</td><td><code>means3D</code>: 5 / 786,432 (0.000636%)<br><code>means2D</code>: 2 / 786,432 (0.000254%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 4 / 12,582,912 (0.000032%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 7 / 1,048,576 (0.000668%)</td><td>0.562500</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>aligned</td><td><code>means3D</code>: 4 / 786,432 (0.000509%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 21 / 12,582,912 (0.000167%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 6 / 1,048,576 (0.000572%)</td><td><strong>0.328125</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>aligned</td><td><code>means3D</code>: 7 / 786,432 (0.000890%)<br><code>means2D</code>: 4 / 786,432 (0.000509%)<br><code>opacity</code>: 2 / 262,144 (0.000763%)<br><code>shs</code>: 49 / 12,582,912 (0.000389%)<br><code>scales</code>: 4 / 786,432 (0.000509%)<br><code>rotations</code>: 5 / 1,048,576 (0.000477%)</td><td>0.390625</td></tr>
-    </tbody>
-</table>
+**NeRF Synthetic (800×800):**
 
-Attribution:
+| Dataset | | PSNR (dB) | SSIM | LPIPS |
+|---------|---|-----------|------|-------|
+| chair | Warp | 35.614 | 0.9871 | 0.0119 |
+| | CUDA | 35.854 | 0.9876 | 0.0116 |
+| drums | Warp | 26.083 | 0.9540 | 0.0371 |
+| | CUDA | 26.173 | 0.9548 | 0.0367 |
+| ficus | Warp | 34.827 | 0.9871 | 0.0119 |
+| | CUDA | 34.901 | 0.9873 | 0.0117 |
+| hotdog | Warp | 37.552 | 0.9849 | 0.0206 |
+| | CUDA | 37.624 | 0.9854 | 0.0200 |
+| lego | Warp | 35.758 | 0.9829 | 0.0154 |
+| | CUDA | 35.903 | 0.9832 | 0.0154 |
+| materials | Warp | 29.998 | 0.9609 | 0.0334 |
+| | CUDA | 30.102 | 0.9616 | 0.0329 |
+| mic | Warp | 35.596 | 0.9916 | 0.0061 |
+| | CUDA | 35.998 | 0.9922 | 0.0057 |
+| ship | Warp | 30.884 | 0.9057 | 0.1054 |
+| | CUDA | 31.062 | 0.9074 | 0.1057 |
 
-- All four modes still keep preprocess tensors aligned and preserve exact forward outputs at the checked tolerance, so the remaining issue is **still not** a preprocess or render-path bug.
-- The out-of-threshold backward coverage remains extremely small: even at 4K / 16K the worst case is only **1 / 12,288 = 0.008138%**, and by 65K / 262K most individual fields are down in the **$10^{-3}\%$ to $10^{-4}\%$** range.
-- The residuals still track the sort path, which strongly supports a **binning-order effect**: once the tile-local traversal order changes, alpha compositing and backward `atomic_add` accumulate floating-point terms in a different order and produce a few sparse gradient spikes.
-- In the updated release, there is no longer a single "correctness winner" across all scales: `torch_count` is cleanest at 4K / 16K, `warp_radix` has the smallest max-diff at 65K, and `warp_depth_stable_tile` takes over at 262K. So the new implementation has clearly reshuffled the residual distribution without changing the overall conclusion that the remaining errors are sparse and numerically small.
-- `warp_radix` still keeps `WARP_RADIX_DETERMINISTIC_TIEBREAK = False`, and `warp_depth_stable_tile` / `torch_count` still introduce extra reorder steps, so these residuals are best understood as **sort-induced floating-point accumulation differences**, not as a different preprocess formula.
+**Tanks & Temples / Deep Blending (native resolution per scene):**
+
+| Dataset | | PSNR (dB) | SSIM | LPIPS |
+|---------|---|-----------|------|-------|
+| train | Warp | 22.101 | 0.8183 | 0.1982 |
+| | CUDA | 22.060 | 0.8213 | 0.1962 |
+| truck | Warp | 25.372 | 0.8828 | 0.1445 |
+| | CUDA | 25.479 | 0.8850 | 0.1420 |
+| drjohnson | Warp | 29.383 | 0.9043 | 0.2372 |
+| | CUDA | 29.455 | 0.9053 | 0.2357 |
+| playroom | Warp | 30.150 | 0.9076 | 0.2414 |
+| | CUDA | 30.072 | 0.9091 | 0.2399 |
+
+In most scenes the PSNR gap between Warp and CUDA is within **-0.07 to -0.40 dB**, a negligible difference. Two scenes (train, playroom) show Warp PSNR slightly higher than CUDA. SSIM and LPIPS metrics are similarly close. This difference may come from warp-backend's lower convergence rate.
 
 ---
 
 ## Performance Characteristics
 
-The following data also comes from the **current code state**. The test platform is **NVIDIA GeForce RTX 4060 Laptop GPU** (sm_89, 8 GiB, 24 SMs), **Warp 1.12.0**, and **PyTorch 2.7.0+cu126**.
+### End-to-End Training Performance (12 Datasets × 30K Iterations)
+
+The following data was tested on **NVIDIA RTX 5090D V2** (24 GiB, sm_120), **PyTorch 2.11.0+cu130**, **Warp 1.12.0**, using the default training parameters from the original 3DGS repository.
+
+#### Training Speed and Total Training Time
+
+| Dataset | | Avg FPS (30K) | Total Time (s) | Peak Mem (MB) |
+|---------|---|-------:|--------:|--------:|
+| chair | CUDA | 139.6 | 215 | 609 |
+| | Stable Tile | 125.5 | 239 | 567 |
+| | Radix | 111.3 | 270 | 566 |
+| | Torch Sort | 117.9 | 255 | 565 |
+| drums | CUDA | 160.9 | 186 | 648 |
+| | Stable Tile | 128.2 | 234 | 607 |
+| | Radix | 120.1 | 250 | 609 |
+| | Torch Sort | 118.4 | 253 | 620 |
+| ficus | CUDA | 214.7 | 140 | 394 |
+| | Stable Tile | 152.9 | 196 | 386 |
+| | Radix | 145.7 | 206 | 387 |
+| | Torch Sort | 147.1 | 204 | 385 |
+| hotdog | CUDA | 124.3 | 241 | 427 |
+| | Stable Tile | 156.1 | 192 | 344 |
+| | Radix | 139.4 | 215 | 345 |
+| | Torch Sort | 141.1 | 213 | 348 |
+| lego | CUDA | 151.6 | 198 | 640 |
+| | Stable Tile | 144.1 | 208 | 565 |
+| | Radix | 130.1 | 231 | 560 |
+| | Torch Sort | 133.2 | 225 | 567 |
+| materials | CUDA | 169.5 | 177 | 512 |
+| | Stable Tile | 162.6 | 184 | 468 |
+| | Radix | 145.2 | 207 | 464 |
+| | Torch Sort | 144.1 | 208 | 467 |
+| mic | CUDA | 154.1 | 195 | 603 |
+| | Stable Tile | 116.7 | 257 | 561 |
+| | Radix | 112.7 | 266 | 568 |
+| | Torch Sort | 110.5 | 271 | 566 |
+| ship | CUDA | 83.8 | 358 | 801 |
+| | Stable Tile | 121.7 | 247 | 642 |
+| | Radix | 120.1 | 250 | 645 |
+| | Torch Sort | 121.3 | 247 | 642 |
+| train | CUDA | 66.5 | 451 | 1,888 |
+| | Stable Tile | 73.6 | 408 | 1,869 |
+| | Radix | 71.6 | 419 | 1,870 |
+| | Torch Sort | 72.7 | 413 | 1,874 |
+| truck | CUDA | 62.9 | 477 | 3,353 |
+| | Stable Tile | 60.6 | 495 | 3,597 |
+| | Radix | 59.3 | 506 | 3,596 |
+| | Torch Sort | 61.7 | 486 | 3,614 |
+| drjohnson | CUDA | 32.9 | 913 | 5,254 |
+| | Stable Tile | 51.2 | 586 | 5,305 |
+| | Radix | 48.8 | 615 | 5,304 |
+| | Torch Sort | 49.4 | 607 | 5,323 |
+| playroom | CUDA | 41.9 | 716 | 3,126 |
+| | Stable Tile | 70.2 | 427 | 3,219 |
+| | Radix | 67.3 | 446 | 3,229 |
+| | Torch Sort | 65.2 | 460 | 3,229 |
+
+**Key findings:**
+- NeRF Synthetic (small scenes, ~150K–350K Gaussians): CUDA is generally faster. Among the three Warp sort backends, **Stable Tile** is the fastest overall, followed by Torch Sort and Radix.
+- Tanks & Temples / Deep Blending (large scenes, ~1M–3.1M Gaussians): **All three Warp backends clearly outperform CUDA** — e.g. drjohnson: Stable Tile 1.56×, Radix 1.49×, Torch Sort 1.50×; playroom: Stable Tile 1.68×, Radix 1.61×, Torch Sort 1.56×.
+- The three Warp sort backends (Stable Tile, Radix, Torch Sort) show very similar performance: the maximum speed difference among them is typically within 10–15%. **Stable Tile (default) is recommended** as it delivers the best overall throughput.
+- Memory usage: all backends are at the same order of magnitude; Warp variants have lower peak memory on most NeRF Synthetic scenes.
+
+#### Training Curves
+
+The following figure shows the iteration speed (FPS), total loss (log), peak GPU memory, and Gaussian count over 30K training iterations for all 12 datasets across CUDA (blue), Stable Tile (red), Radix (green), and Torch Sort (purple):
+
+![Sort Backend Training Overview](../runs/bench_sort_plots/sort_backend_overview.png)
+
+### Micro-Benchmarks (Random Particles)
+
+The following data comes from random-particle tests. The test platform is **NVIDIA GeForce RTX 5090D** (sm_120, 24 GiB, 170 SMs), **Warp 1.12.0**, and **PyTorch 2.11.0+cu130**.
 
 Methodology:
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched **CUDA-event** timing pass over the measured iterations; the `Public API FW / Public API BW / Total iteration` columns below all come from this path and are the right numbers for end-to-end comparisons.
-- **Memory usage**: after warmup, one forward stage and one backward stage are measured separately, recording the CUDA allocator peak increment (`peak_allocated_delta_mib`).
-- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; the stage totals run through the **non-`return_stats` execution path** and are wrapped directly by **CUDA events**, so `Internal binning GPU time` is now a pure internal GPU timing and no longer includes Python / ATen wall-clock contamination. The official sweep intentionally leaves the stage-breakdown dictionaries empty so the diagnostic machinery does not perturb the totals; `Internal binning scratch` is still kept to show temporary-memory pressure by sort mode.
+- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the main table reports the mean over the measured runs.
+- **Peak memory**: after warmup, `reset_peak_memory_stats` is called before running a full stage, and the absolute peak `max_memory_allocated` is recorded. Forward peak includes forward only; backward peak includes the full forward+backward flow.
+- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; these stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
 
+For the 256K / 512K / 1024K / 2048K cases, the evaluation uses **4+8 / 3+6 / 3+6 / 2+4** (warmup count + measured count), respectively.
 
-For the 4K / 16K / 65K / 262K cases, the evaluation uses **12+24 / 10+20 / 6+12 / 4+8** (warmup count + measured count), respectively, for each sort mode.
+### Public API Steady-State Runtime
 
-### CUDA baseline + warp-backend sort-mode sweep
+| Points | Resolution | `num_rendered` | Native FW | Warp FW | FW ratio | Native BW | Warp BW | BW ratio |
+|------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
+| 262,144 | 384×384 | 265,106 | 0.315 ms | 0.999 ms | 3.17× | 1.772 ms | 1.012 ms | 0.57× |
+| 524,288 | 512×512 | 874,049 | 0.461 ms | 1.101 ms | 2.39× | 3.252 ms | 1.632 ms | 0.50× |
+| 1,048,576 | 640×640 | 2,556,549 | 0.857 ms | 1.594 ms | 1.86× | 5.363 ms | 2.464 ms | 0.46× |
+| 2,097,152 | 800×800 | 7,644,361 | 2.695 ms | 2.697 ms | 1.00× | 8.839 ms | 4.418 ms | 0.50× |
 
-<table>
-    <thead>
-        <tr>
-            <th>Points</th>
-            <th>Backend / sort mode</th>
-            <th>Public API FW</th>
-            <th>Public API BW</th>
-            <th>Total iteration</th>
-            <th>Internal binning GPU time</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>2.865 ms</td><td>3.154 ms</td><td>6.018 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td><strong>2.605 ms</strong></td><td>2.663 ms</td><td><strong>5.268 ms</strong></td><td><strong>1.108 ms</strong></td></tr>
-        <tr><td><code>torch</code></td><td>4.347 ms</td><td>4.183 ms</td><td>8.530 ms</td><td>4.080 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>3.376 ms</td><td>3.467 ms</td><td>6.843 ms</td><td>1.549 ms</td></tr>
-        <tr><td><code>torch_count</code></td><td>3.568 ms</td><td><strong>2.385 ms</strong></td><td>5.953 ms</td><td>2.493 ms</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>3.982 ms</td><td>3.398 ms</td><td>7.380 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>3.862 ms</td><td><strong>2.470 ms</strong></td><td>6.332 ms</td><td>1.742 ms</td></tr>
-        <tr><td><code>torch</code></td><td>3.965 ms</td><td>2.541 ms</td><td>6.507 ms</td><td>2.649 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>3.102 ms</strong></td><td>2.612 ms</td><td><strong>5.713 ms</strong></td><td><strong>1.572 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>3.154 ms</td><td>2.649 ms</td><td>5.803 ms</td><td>2.843 ms</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>14.716 ms</td><td><strong>4.332 ms</strong></td><td><strong>19.048 ms</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>16.282 ms</td><td>4.502 ms</td><td>20.784 ms</td><td>19.354 ms</td></tr>
-        <tr><td><code>torch</code></td><td>17.100 ms</td><td>5.000 ms</td><td>22.100 ms</td><td>49.330 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>14.424 ms</td><td>5.188 ms</td><td>19.612 ms</td><td><strong>10.053 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td><strong>14.360 ms</strong></td><td>5.075 ms</td><td>19.434 ms</td><td>34.562 ms</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>114.752 ms</td><td><strong>9.735 ms</strong></td><td>124.486 ms</td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>120.477 ms</td><td>14.125 ms</td><td>134.602 ms</td><td>180.326 ms</td></tr>
-        <tr><td><code>torch</code></td><td>113.555 ms</td><td>11.735 ms</td><td>125.290 ms</td><td>916.531 ms</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td><strong>96.770 ms</strong></td><td>10.977 ms</td><td><strong>107.747 ms</strong></td><td><strong>96.567 ms</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>320.685 ms</td><td>48.569 ms</td><td>369.254 ms</td><td>1510.155 ms</td></tr>
-    </tbody>
-</table>
+At the 256K–2048K scale, Warp forward is still slower than native (1.00×–3.17×) due to Python-level orchestration overhead (tensor allocation, kernel launch, inter-stage data passing), but the gap narrows rapidly as particle count grows and GPU compute dominates—at 2048K the forward ratio reaches **1.00×** (parity with native). **On the backward side, Warp is faster than native at all scales** (ratio 0.46×–0.57×), thanks to the computational efficiency of the `_backward_render_tiles_warp32` kernel's warp shuffle (block_dim=32) fast path at large `num_rendered` volumes.
 
-### Public API peak memory + internal binning scratch
+### Public API Peak Memory
 
-<table>
-    <thead>
-        <tr>
-            <th>Points</th>
-            <th>Backend / sort mode</th>
-            <th>Warp FW peak</th>
-            <th>Warp BW peak</th>
-            <th>Internal binning peak</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr><td rowspan="5"><strong>4,096</strong></td><td><strong>CUDA baseline</strong></td><td>1.57 MiB</td><td><strong>4.41 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td>4.69 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>1.59 MiB</td><td><strong>1.32 MiB</strong></td><td>5.34 MiB</td></tr>
-        <tr><td rowspan="5"><strong>16,384</strong></td><td><strong>CUDA baseline</strong></td><td>5.18 MiB</td><td><strong>17.63 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td>18.98 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>5.28 MiB</td><td><strong>5.25 MiB</strong></td><td>22.13 MiB</td></tr>
-        <tr><td rowspan="5"><strong>65,536</strong></td><td><strong>CUDA baseline</strong></td><td>41.79 MiB</td><td><strong>70.57 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td>348.00 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>42.17 MiB</td><td><strong>21.00 MiB</strong></td><td>330.50 MiB</td></tr>
-        <tr><td rowspan="5"><strong>262,144</strong></td><td><strong>CUDA baseline</strong></td><td>302.13 MiB</td><td><strong>282.00 MiB</strong></td><td>—</td></tr>
-        <tr><td><code>warp_radix</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td>3038.64 MiB</td></tr>
-        <tr><td><code>warp_depth_stable_tile</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td><strong>0.00 MiB</strong></td></tr>
-        <tr><td><code>torch_count</code></td><td>306.69 MiB</td><td><strong>85.00 MiB</strong></td><td>2891.15 MiB</td></tr>
-    </tbody>
-</table>
+| Points | Resolution | Native FW peak | Native BW peak | Warp FW peak | Warp BW peak |
+|------|--------|------------|------------|-------------|-------------|
+| 262,144 | 384×384 | 128.61 MiB | 205.67 MiB | 145.63 MiB | 336.08 MiB |
+| 524,288 | 512×512 | 274.00 MiB | 427.51 MiB | 285.69 MiB | 662.50 MiB |
+| 1,048,576 | 640×640 | 587.75 MiB | 891.75 MiB | 570.97 MiB | 1324.02 MiB |
+| 2,097,152 | 800×800 | 1300.70 MiB | 1910.72 MiB | 1149.20 MiB | 2645.05 MiB |
 
-From the public-API perspective, CUDA and the four updated warp-backend Warp modes still sit in roughly the same forward peak-memory range; but one obvious change in this release is that the Warp paths now show **much lower backward peak-memory deltas than the CUDA baseline**, which suggests that buffer reuse and intermediate-state caching are working more effectively. The real spread is still the **diagnostic internal binning scratch**: `warp_radix` / `warp_depth_stable_tile` stay essentially at zero, whereas `torch` / `torch_count` still explode into hundreds of MiB or even GiB at 65K and 262K.
+> **Note**: These are absolute peak values (`max_memory_allocated`), including input tensors, model parameters, forward intermediates, and autograd saved tensors. Backward peak includes the full forward+backward flow.
 
-Looking jointly at the CUDA baseline and the four Warp sort modes, five updated observations stand out:
+Warp forward peak is about 1.13× higher than native at 256K, but from 1024K onward, Warp forward peak (571 MiB) is actually **lower** than native (588 MiB); at 2048K it is 0.88× of native. Backward peak for Warp is about 1.4×–1.6× of native (2645 vs 1911 MiB at 2048K), mainly due to Warp's additional intermediate tensors (depth, alpha, projected coordinates, per-pixel weights, etc.).
 
-- **Tiny 4K case**: `warp_radix` now takes both the shortest total iteration time (**5.268 ms**) and the shortest binning GPU time (**1.108 ms**), which means the updated release has made the pure Warp radix path very competitive at small scale.
-- **Mid-scale 16K**: `warp_depth_stable_tile` becomes the most balanced option, giving both the shortest total iteration time (**5.713 ms**) and the shortest binning GPU time (**1.572 ms**), with `torch_count` only slightly behind in end-to-end runtime.
-- **Large 65K case**: the end-to-end winner is `torch_count` at **19.434 ms**, but it still trails the CUDA baseline (**19.048 ms**); at the same time, `warp_depth_stable_tile` owns the best binning GPU time (**10.053 ms**), so the final ranking at this scale is clearly no longer determined by binning alone.
-- **Very large 262K case**: `warp_depth_stable_tile` pulls ahead decisively with **96.770 ms** forward and **107.747 ms** total iteration, beating both the other Warp modes and the CUDA baseline (**124.486 ms** total). On this release, the default path regains a clear large-scale advantage.
-- **Default-mode choice**: keeping `warp_depth_stable_tile` as the default is still justified, because in the updated warp-backend it combines the most stable cross-scale total-iteration behavior, the best or near-best binning GPU times, essentially zero scratch memory, and relatively small correctness residuals. If you are optimizing for one fixed workload only, the fastest mode still depends on scale.
+### Internal Stage Hotspots
+
+| Points | Resolution | Preprocess | Binning | Render | Backward Render | Selected Sort Mode |
+|------|--------|--------|------|------|----------|--------------|
+| 262,144 | 384×384 | 0.335 ms | 0.495 ms | 0.221 ms | 0.386 ms | `warp_depth_stable_tile` |
+| 524,288 | 512×512 | 0.390 ms | 0.492 ms | 0.248 ms | 0.430 ms | `warp_depth_stable_tile` |
+| 1,048,576 | 640×640 | 0.580 ms | 0.583 ms | 0.249 ms | 0.561 ms | `warp_depth_stable_tile` |
+| 2,097,152 | 800×800 | 0.944 ms | 1.275 ms | 0.323 ms | 0.790 ms | `warp_depth_stable_tile` |
+
+### Internal Stage Cumulative Peak Memory (diagnostic only)
+
+| Points | Resolution | After preprocess | After preprocess+binning | After full forward | After forward+backward |
+|------|--------|-------------|-----------------|-------------|-------------------|
+| 262,144 | 384×384 | 134.76 MiB | 137.76 MiB | 138.76 MiB | 136.07 MiB |
+| 524,288 | 512×512 | 264.67 MiB | 271.01 MiB | 270.83 MiB | 266.01 MiB |
+| 1,048,576 | 640×640 | 529.08 MiB | 541.08 MiB | 540.08 MiB | 526.71 MiB |
+| 2,097,152 | 800×800 | 1053.43 MiB | 1076.07 MiB | 1076.07 MiB | 1052.18 MiB |
+
+> **Note**: Each column is the absolute peak from `empty_cache()` through completion of that stage. Due to temporary tensor release and reuse between stages, "after forward+backward" may be slightly lower than "after full forward".
+
+Looking at the internal stages, preprocess and binning grow near-linearly with particle count and are the scalability bottleneck; render and backward render remain under 1 ms even at 2048K, indicating good pure-GPU-compute efficiency in the Warp tile kernels. Preprocess is the main memory consumer (1053 MiB peak after preprocess at 2048K); binning adds only about 23 MiB on top (at 2048K), and render adds virtually no extra peak.
+
+### Kernel-Level Profiling (Nsight Systems)
+
+> **Note**: This GPU SKU (RTX 5090D V2) does not support Nsight Compute hardware performance counter collection (`ERR_NVGPU`). The following data was captured via **Nsight Systems 2025.6** timeline tracing at **256K@384×384** and **1024K@640×640** scales. Each run: 5 warmup + 3 NVTX-annotated profiled iterations (forward+backward), sort mode `warp_depth_stable_tile`.
+
+#### Per-Iteration End-to-End Breakdown (NVTX)
+
+| Scale | Forward (NVTX) | Backward (NVTX) | Iteration total |
+|------|------------|------------|-----------|
+| 256K@384×384 | 1.42 ms | 1.37 ms | 2.79 ms |
+| 1024K@640×640 | 2.84 ms | 1.36 ms | 4.20 ms |
+
+#### Kernel Hotspots by GPU Time
+
+The table below lists per-iteration average GPU time for each kernel across the full pipeline (forward + backward) at 256K and 1024K scales, based on nsys timeline statistics (per-instance mean over 8 iterations).
+
+| Kernel | Calls/iter | 256K avg time | 1024K avg time | Pipeline stage |
+|--------|---------|-------------|--------------|----------|
+| `_backward_render_tiles_warp32` | 1 | 230.0 µs | 423.2 µs | Backward Render |
+| `_render_tiles_fast_warp` | 1 | 93.6 µs | 127.7 µs | Forward Render |
+| `_backward_rgb_from_sh_v3` | 1 | 59.4 µs | 408.5 µs | Backward Preprocess |
+| `_forward_rgb_from_sh_v3` | 1 | 48.6 µs | 227.9 µs | Forward Preprocess (SH→RGB) |
+| CUB `DeviceRadixSort` (Onesweep) | 8 | 7.4 µs × 8 | 12.5 µs × 8 | Binning (sort) |
+| `_duplicate_with_keys_from_order` | 1 | 34.7 µs | 129.9 µs | Binning (overlap expansion) |
+| `_fused_project_cov3d_cov2d_preprocess_sr` | 1 | 25.2 µs | 131.2 µs | Forward Preprocess (proj+cov) |
+| `_fused_backward_preprocess_accumulate` | 1 | 24.2 µs | 102.3 µs | Backward Preprocess |
+| PyTorch `elementwise_copy` | ~3 | 41.5 µs × 3 | 366.5 µs × 3 | PyTorch tensor copy |
+| PyTorch `fill` / `zero_` | ~10 | 3.6 µs × 10 | 18.8 µs × 10 | PyTorch initialization |
+| `_identify_tile_ranges` | 1 | 1.4 µs | 6.9 µs | Binning |
+| `_gather_i32_by_index` | 1 | 1.7 µs | 5.9 µs | Binning |
+
+#### CPU vs GPU Overhead Breakdown
+
+| Metric | 256K@384×384 | 1024K@640×640 |
+|------|-------------|--------------|
+| Wall-clock per iteration | 2.79 ms | 4.20 ms |
+| Warp kernel GPU time | 578 µs (20.7%) | 1,664 µs (39.6%) |
+| PyTorch kernel GPU time | 186 µs (6.7%) | 1,383 µs (32.9%) |
+| **GPU total** | **764 µs (27.4%)** | **3,047 µs (72.5%)** |
+| **CPU overhead (remainder)** | **2,026 µs (72.6%)** | **1,153 µs (27.5%)** |
+
+CPU overhead breakdown (from nsys CUDA API Summary):
+
+| CUDA API call | Calls per iter (approx.) | Median latency | Per-iter total |
+|---------------|---------------------|---------|-----------|
+| `cudaLaunchKernel` (PyTorch side) | ~38 | 5.8 µs | ~220 µs |
+| `cuLaunchKernel` (Warp side) | ~9 | 15.4 µs | ~139 µs |
+| `cudaMemsetAsync` | ~15 | 4.6 µs | ~69 µs |
+| `cudaMemcpyAsync` | ~4 | 18.8 µs | ~75 µs |
+| `cudaMallocAsync` | ~5 | 4.3 µs | ~22 µs |
+| `cudaFreeAsync` | ~6 | 2.3 µs | ~14 µs |
+| **CUDA API total** | | | **~539 µs** |
+| **Python/Warp runtime (tensor creation, attribute lookup, dispatch)** | | | **~1,487 µs** |
+
+#### Key Analysis
+
+1. **CPU overhead is approximately constant**: whether at 256K or 1024K, CPU-side overhead is about 1.2–2.0 ms/iteration. At 256K, CPU accounts for 73%; at 1024K it drops to 28%. At 2048K, GPU compute grows further, reducing the CPU ratio even more—explaining why the 2048K forward ratio reaches 1.00×.
+2. **Backward render is the largest GPU hotspot**: `_backward_render_tiles_warp32` (block_dim=32, warp shuffle fast path) takes 230 µs at 256K and 423 µs at 1024K, accounting for 25%–40% of Warp kernel GPU time.
+3. **SH color computation scales linearly with N**: `_forward_rgb_from_sh_v3` + `_backward_rgb_from_sh_v3` total 636 µs at 1024K, making them the second largest hotspot after backward render. At SH degree=3, each point requires 16 coefficients × 3 channels of read/write bandwidth.
+4. **PyTorch `elementwise_copy` grows sharply with data size**: 42 µs at 256K, 367 µs at 1024K per call. These are PyTorch autograd tensor copy/type-conversion operations (not Warp kernels), accounting for 33% of GPU time at 1024K.
+5. **Actual CUDA API calls account for only ~26% of CPU overhead** (539 µs / 2026 µs at 256K). The remaining ~74% is pure-CPU work under the Python GIL: object creation, Warp runtime dispatch, PyTorch autograd graph construction. This is an inherent cost of the Warp-on-Python architecture, only mitigable via CUDA Graphs or reducing the number of pipeline stages.
 
 ---
 
 ## Known Limitations
 
-### 1. No Shared Memory (Warp Limitation)
+### 1. Warp Tile API Flexibility Limitations
 
-NVIDIA Warp lacks an explicit and flexible way to control shared memory. Alignment, padding, and construction of complex structures are difficult, so CUDA `__shared__` memory cannot be handled freely. This prevents the cooperative tile-level fetch pattern used by the CUDA baseline, where 256 threads in a tile collaboratively load Gaussian data from global memory into shared memory and then iterate over the shared buffer. Instead, each thread reads from global memory independently, causing:
+NVIDIA Warp provides shared memory and warp-level operations indirectly through the Tile API (`wp.tile()`, `wp.tile_extract()`, `wp.tile_reduce()`), but compared to directly operating CUDA `__shared__` memory, there are the following limitations:
+- **`wp.tile()` always creates block-level tiles** — it is not possible to create warp-level or other granularity sub-block tiles.
+- **Each `wp.tile()` call implicitly triggers `__syncthreads`** — creating tiles multiple times in an inner loop causes a barrier storm (verified experimentally: the tiled-256 backward kernel triggers 12 `__syncthreads` per Gaussian, resulting in a 2–3× performance regression).
+- **No control over shared memory layout** — alignment, padding, and bank conflict avoidance cannot be manually optimized.
+- **`tile_reduce` uses shared memory + `__syncthreads` when block_dim > 32** — only when block_dim=32 (single warp) does it take the pure warp shuffle fast path.
 
-- many more global-memory transactions per tile for the same data
-- poor memory coalescing (scattered reads indexed by Gaussian)
-- NCU profiling to show that **almost all kernels are bottlenecked by memory**
+Current solution: forward uses block_dim=256 + `wp.tile()`/`wp.tile_extract()` for cooperative loading; backward uses block_dim=32 to ensure `tile_reduce` takes the warp shuffle fast path.
 
-### 2. No Warp-Level Intrinsics
+### 2. `tile_atomic_add` Only Supports Scalars
 
-Warp does not expose CUDA warp-level intrinsics (`__shfl_sync`, `__ballot_sync`, `__any_sync`). The available synchronization mechanisms are relatively limited and not compatible with some advanced patterns. This prevents:
+`wp.tile_atomic_add` only supports a few scalar operands such as `float32`. Vector- and matrix-level atomic reductions must be decomposed into separate scalar atomic operations. This has been verified experimentally — the tiled-256 + `tile_reduce` + `tile_atomic_add` backward kernel is **2–3× slower** than the warp32 version, requiring 10 scalar atomic operations plus 12 `__syncthreads` barriers per Gaussian.
 
-- warp-level reductions for gradient accumulation
-- warp-level voting for early termination
-- cross-lane communication patterns used in advanced CUDA rasterizers
-
-### 3. `tile_atomic_add` Only Supports Scalars
-
-`wp.tile_atomic_add` only supports a few scalar operands such as `float32`. Vector- and matrix-level atomic reductions must be decomposed into separate scalar atomic operations, which introduces too much synchronization overhead. This has been verified experimentally — the tile-reduced backward kernel (C2) is **2–3× slower** than the non-Warp version and requires 10 scalar atomic operations per Gaussian.
-
-### 4. Compile-Time Tile Shape
+### 3. Compile-Time Tile Shape
 
 `BLOCK_X` and `BLOCK_Y` are defined as `wp.constant()` values (16×16). Changing the tile shape requires modifying the source code and triggering Warp module recompilation. The CUDA baseline also uses fixed tile sizes, but Warp's JIT model makes this limitation more obvious because the constants are baked into the kernel at compile time.
 
-### 5. First-Run JIT Compilation Overhead
+### 4. First-Run JIT Compilation Overhead
 
 The first call to any Warp kernel triggers JIT compilation of the whole module. On a typical system, this takes several seconds (depending on the number of kernels and the GPU). Subsequent calls use the Warp kernel cache and complete almost instantly.
 
-### 6. Backward Non-Determinism
+### 5. Backward Non-Determinism
 
 The backward render kernel uses `wp.atomic_add` to accumulate gradients. When multiple threads write to the same address, this is inherently non-deterministic. This means:
-
 - two runs with identical inputs may produce slightly different gradient values
 - the difference is usually within FP32 precision (most gradients < 1e-4)
-- in extreme cases, `conic_opacity` gradients can reach max-diff values as high as ~1.6e+05 because the gradient magnitude itself is large
 - this is consistent with the CUDA baseline (`atomicAdd` is also non-deterministic)
 
-### 7. Python-Level Orchestration Overhead
+### 6. Python-Level Orchestration Overhead
 
 Unlike the CUDA baseline, where the full pipeline is orchestrated in C++ with very little Python interaction, the Warp backend uses Python to:
 
@@ -612,7 +734,7 @@ Unlike the CUDA baseline, where the full pipeline is orchestrated in C++ with ve
 
 This introduces measurable fixed overhead. It is significant at small scales and negligible at large scales. **This may cause large fluctuations in Warp training throughput.**
 
-### 8. Single Backward Mode
+### 7. Single Backward Mode
 
 Only `backward_mode="manual"` is supported. The CUDA baseline's `autograd`-level differentiation is not applicable because Warp kernels are not natively integrated into PyTorch's autograd graph — the backward pass is explicitly encoded with manually derived gradients.
 
@@ -622,25 +744,25 @@ Only `backward_mode="manual"` is supported. The CUDA baseline's `autograd`-level
 
 The following are the most impactful potential improvements, roughly ordered by expected benefit:
 
-### 1. Shared-Memory Support
+### 1. More Efficient Backward Tile Reduction
 
-If NVIDIA Warp adds richer `__shared__` memory support in a future release, the render and backward-render kernels could be rewritten into cooperative tile-level fetch kernels, potentially closing the **2–3× gap** at small and medium scales. This is the single most important optimization. It is still difficult to achieve on the current Warp version.
+The current backward kernel uses block_dim=32 (single warp) to ensure `tile_reduce` takes the pure warp shuffle fast path. This approach is already 3–4× faster than the block_dim=256 `tile_reduce + tile_atomic_add` approach, but each pixel still requires multiple atomic writes. If Warp adds support in a future release for:
+- **Sub-block / warp-level tile creation** (allowing creation of 32-thread warp tiles within a 256-thread block)
+- **Direct exposure of `__shfl_down_sync` and other warp-level intrinsics**
+
+then the block_dim=256 backward kernel could implement intra-warp reduction followed by cross-warp reduction, combining the benefits of cooperative loading and efficient reduction.
 
 ### 2. Runtime Tile-Shape Adaptation
 
 Currently `BLOCK_X=16, BLOCK_Y=16` is fixed at compile time. Allowing runtime selection of tile shapes (for example, 8×8 for small images and 32×16 for wide images) could improve occupancy and reduce tile-boundary overhead. This would require Warp to support dynamic kernel parameterization or template-like mechanisms.
 
-### 3. TOP_K Externalization
+### 3. `.item()` Sync Point Elimination
 
-The `TOP_K = 20` constant controls the maximum number of Gaussians considered per pixel before early termination. Exposing it as a runtime parameter would allow:
+The binning stage synchronizes via `.item()` to obtain `num_rendered` (GPU→CPU), which breaks the GPU pipeline. If speculative launch or GPU-side branch resolution based on this value could be implemented, pipeline efficiency could be further improved. The effect is limited at low Gaussian counts, but becomes meaningful in multi-view / batch training.
 
-- lowering TOP_K to speed up training at acceptable quality loss
-- increasing TOP_K for quality-critical rendering
-- adapting TOP_K based on scene complexity
+### 4. Smart Buffer Pool Recycling
 
-### 4. Warp-Level Intrinsics (Pending Future Warp Features)
-
-If warp-level intrinsics become available in Warp, per-warp reduction could replace `atomic_add` in the backward kernel, potentially removing the non-determinism issue and reducing LG-throttle stalls.
+Currently, radix sort, index gather, scan, and other buffers use a grow-only cache — once allocated, they only grow and never shrink. After densification/pruning, old buffers may be far larger than actually needed. Introducing aging or shrink strategies could reduce memory fragmentation.
 
 ---
 
