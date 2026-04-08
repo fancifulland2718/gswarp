@@ -1109,20 +1109,6 @@ if wp is not None:
         idx = wp.tid()
         out[idx] = src[indices[idx]]
 
-
-    @wp.kernel
-    def _check_depth_order_warp_kernel(
-        depths_i32: wp.array(dtype=wp.int32),
-        prev_order: wp.array(dtype=wp.int32),
-        flag: wp.array(dtype=wp.int32),
-    ):
-        i = wp.tid()
-        if i >= prev_order.shape[0] - 1:
-            return
-        if depths_i32[prev_order[i]] > depths_i32[prev_order[i + 1]]:
-            wp.atomic_max(flag, 0, wp.int32(1))
-
-
     @wp.kernel
     def _cov3d_from_scale_rotation_warp_kernel(
         scales: wp.array(dtype=wp.vec3),
