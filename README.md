@@ -570,7 +570,7 @@ The following data was tested on **NVIDIA RTX 5090D V2** (24 GiB, sm_120), **PyT
 
 The following figure shows the iteration speed (FPS), total loss (log), peak GPU memory, and Gaussian count over 30K training iterations for all 12 datasets across CUDA (blue), Stable Tile (red), Radix (green), and Torch Sort (purple):
 
-![Sort Backend Training Overview](../runs/bench_sort_plots/sort_backend_overview.png)
+![Sort Backend Training Overview](figures/sort_backend_overview.png)
 
 ### Micro-Benchmarks (Random Particles)
 

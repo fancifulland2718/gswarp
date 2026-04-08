@@ -568,7 +568,7 @@ wp.launch(kernel, dim=_dim, block_dim=256, ...)
 
 下图展示了 12 个数据集上 CUDA（蓝色）、Stable Tile（红色）、Radix（绿色）和 Torch Sort（紫色）在 30K 迭代训练中的迭代速度（FPS）、总 loss（对数）、峰值 GPU 显存和高斯点数的变化：
 
-![排序后端训练概览](../runs/bench_sort_plots/sort_backend_overview.png)
+![排序后端训练概览](figures/sort_backend_overview.png)
 
 ### 微基准测试（随机粒子）
 
