@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -110,6 +111,46 @@ _C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[str, int], Any] = {}
 # Each screen-tile block loads RENDER_TILE_BATCH Gaussians into shared memory
 # per iteration. Must be a compile-time constant (wp.constant).
 RENDER_TILE_BATCH = 32
+
+# ---------------------------------------------------------------------------
+# Lightweight typed containers for preprocess + binning pipeline data
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class PreprocessOutputs:
+    visible: torch.Tensor
+    depths: torch.Tensor
+    radii: torch.Tensor
+    proj_2d: torch.Tensor
+    conic_2d: torch.Tensor
+    conic_2d_inv: torch.Tensor
+    points_xy_image: torch.Tensor
+    tiles_touched: torch.Tensor
+    rgb: torch.Tensor
+    clamped: torch.Tensor
+    conic_opacity: torch.Tensor
+    cov3d_all: torch.Tensor
+
+
+@dataclass(slots=True)
+class BinningState:
+    grid_x: int
+    grid_y: int
+    point_offsets: torch.Tensor
+    point_list: torch.Tensor
+    point_list_keys: torch.Tensor
+    ranges: torch.Tensor
+    num_rendered: int
+
+
+def _prep(tensor: torch.Tensor) -> torch.Tensor:
+    """Detach + ensure contiguous, skipping when unnecessary."""
+    if tensor.requires_grad:
+        tensor = tensor.detach()
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    return tensor
+
 
 # One-shot initialization flag — after first _require_warp() succeeds, all
 # subsequent calls short-circuit immediately.
@@ -770,15 +811,15 @@ def _as_detached_contiguous_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> t
 
 
 def _pack_forward_aux_buffers(preprocess_outputs, binning_state, n_contrib):
-    points_xy_image_tensor = _as_detached_contiguous_dtype(preprocess_outputs["points_xy_image"], torch.float32)
-    depths_tensor = _as_detached_contiguous_dtype(preprocess_outputs["depths"], torch.float32)
-    conic_opacity_tensor = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
-    rgb_tensor = _as_detached_contiguous_dtype(preprocess_outputs["rgb"], torch.float32)
-    cov3d_tensor = _as_detached_contiguous_dtype(preprocess_outputs["cov3d_all"], torch.float32)
+    points_xy_image_tensor = _as_detached_contiguous_dtype(preprocess_outputs.points_xy_image, torch.float32)
+    depths_tensor = _as_detached_contiguous_dtype(preprocess_outputs.depths, torch.float32)
+    conic_opacity_tensor = _as_detached_contiguous_dtype(preprocess_outputs.conic_opacity, torch.float32)
+    rgb_tensor = _as_detached_contiguous_dtype(preprocess_outputs.rgb, torch.float32)
+    cov3d_tensor = _as_detached_contiguous_dtype(preprocess_outputs.cov3d_all, torch.float32)
     # L2: store clamped as int32 — avoids backward int32 conversion allocation
-    clamped_tensor = _as_detached_contiguous_dtype(preprocess_outputs["clamped"], torch.int32)
-    point_list_tensor = _as_detached_contiguous_dtype(binning_state["point_list"], torch.int32)
-    ranges_tensor = _as_detached_contiguous_dtype(binning_state["ranges"].reshape(-1), torch.int32)
+    clamped_tensor = _as_detached_contiguous_dtype(preprocess_outputs.clamped, torch.int32)
+    point_list_tensor = _as_detached_contiguous_dtype(binning_state.point_list, torch.int32)
+    ranges_tensor = _as_detached_contiguous_dtype(binning_state.ranges.reshape(-1), torch.int32)
     img_tensor = _as_detached_contiguous_dtype(n_contrib.reshape(-1), torch.int32)
 
     # F4: torch.cat already returns contiguous tensor; skip redundant .contiguous()
@@ -833,24 +874,29 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     binning_tensor = binning_buffer.view(torch.int32)
     img_tensor = img_buffer.view(torch.int32)
 
-    preprocess_outputs = {
-        "points_xy_image": points_xy_image_tensor,
-        "depths": depths_tensor,
-        "conic_opacity": conic_opacity_tensor,
-        "rgb": rgb_tensor,
-        "clamped": clamped_tensor,
-        "cov3d_all": cov3d_tensor,
-        "radii": torch.empty((point_count,), dtype=torch.int32, device=geom_buffer.device),
-    }
-    binning_state = {
-        "grid_x": grid_x,
-        "grid_y": grid_y,
-        "point_offsets": torch.empty((0,), dtype=torch.int32, device=geom_buffer.device),
-        "point_list": binning_tensor[:num_rendered + RENDER_TILE_BATCH],
-        "point_list_keys": torch.empty((0,), dtype=torch.int64, device=geom_buffer.device),
-        "ranges": binning_tensor[num_rendered + RENDER_TILE_BATCH:].reshape(tile_count, 2),
-        "num_rendered": num_rendered,
-    }
+    preprocess_outputs = PreprocessOutputs(
+        visible=torch.empty((0,), dtype=torch.bool, device=geom_buffer.device),
+        depths=depths_tensor,
+        radii=torch.empty((point_count,), dtype=torch.int32, device=geom_buffer.device),
+        proj_2d=torch.empty((0,), dtype=torch.float32, device=geom_buffer.device),
+        conic_2d=torch.empty((0,), dtype=torch.float32, device=geom_buffer.device),
+        conic_2d_inv=torch.empty((0,), dtype=torch.float32, device=geom_buffer.device),
+        points_xy_image=points_xy_image_tensor,
+        tiles_touched=torch.empty((0,), dtype=torch.int32, device=geom_buffer.device),
+        rgb=rgb_tensor,
+        clamped=clamped_tensor,
+        conic_opacity=conic_opacity_tensor,
+        cov3d_all=cov3d_tensor,
+    )
+    binning_state = BinningState(
+        grid_x=grid_x,
+        grid_y=grid_y,
+        point_offsets=torch.empty((0,), dtype=torch.int32, device=geom_buffer.device),
+        point_list=binning_tensor[:num_rendered + RENDER_TILE_BATCH],
+        point_list_keys=torch.empty((0,), dtype=torch.int64, device=geom_buffer.device),
+        ranges=binning_tensor[num_rendered + RENDER_TILE_BATCH:].reshape(tile_count, 2),
+        num_rendered=num_rendered,
+    )
     n_contrib = img_tensor.reshape(image_height, image_width)
     return preprocess_outputs, binning_state, n_contrib
 
@@ -3265,8 +3311,8 @@ def _compute_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations):
     if scales.numel() == 0:
         return torch.zeros((0, 6), dtype=torch.float32, device=scales.device)
 
-    scales = scales.detach().contiguous()
-    rotations = rotations.detach().contiguous()
+    scales = _prep(scales)
+    rotations = _prep(rotations)
     out_cov3d = torch.empty((scales.shape[0], 6), dtype=torch.float32, device=scales.device)
     wp.launch(
         kernel=_cov3d_from_scale_rotation_warp_kernel,
@@ -3292,9 +3338,9 @@ def _project_visible_points_warp(means3D, viewmatrix, projmatrix):
         kernel=_project_visible_points_warp_kernel,
         dim=point_count,
         inputs=[
-            wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-            wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-            wp.from_torch(projmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
+            wp.from_torch(_prep(means3D), dtype=wp.vec3),
+            wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+            wp.from_torch(_prep(projmatrix).reshape(-1), dtype=wp.float32),
         ],
         outputs=[
             wp.from_torch(visible_mask, dtype=wp.int32),
@@ -3336,10 +3382,10 @@ def _project_preprocess_visible_points_warp(
             kernel=_project_preprocess_visible_points_cov_warp_kernel,
             dim=point_count,
             inputs=[
-                wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                wp.from_torch(cov3D_precomp.detach().contiguous().reshape(-1), dtype=wp.float32),
-                wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                wp.from_torch(projmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
+                wp.from_torch(_prep(means3D), dtype=wp.vec3),
+                wp.from_torch(_prep(cov3D_precomp).reshape(-1), dtype=wp.float32),
+                wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+                wp.from_torch(_prep(projmatrix).reshape(-1), dtype=wp.float32),
                 float(tanfovx),
                 float(tanfovy),
                 int(image_width),
@@ -3359,11 +3405,11 @@ def _project_preprocess_visible_points_warp(
         kernel=_project_preprocess_visible_points_scale_warp_kernel,
         dim=point_count,
         inputs=[
-            wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-            wp.from_torch(scales.detach().contiguous(), dtype=wp.vec3),
+            wp.from_torch(_prep(means3D), dtype=wp.vec3),
+            wp.from_torch(_prep(scales), dtype=wp.vec3),
             float(scale_modifier),
-            wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-            wp.from_torch(projmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
+            wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+            wp.from_torch(_prep(projmatrix).reshape(-1), dtype=wp.float32),
             float(tanfovx),
             float(tanfovy),
             int(image_width),
@@ -3391,9 +3437,9 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
     _dev = str(means3D.device)
     # P2b: vec3 SH forward — 3× fewer load/store instructions
     _inp = [
-        wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-        wp.from_torch(campos.detach().contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(shs.detach().contiguous().reshape(-1, 3), dtype=wp.vec3),
+        wp.from_torch(_prep(means3D), dtype=wp.vec3),
+        wp.from_torch(_prep(campos).reshape(-1), dtype=wp.float32),
+        wp.from_torch(_prep(shs).reshape(-1, 3), dtype=wp.vec3),
         int(degree),
         int(coeff_count),
     ]
@@ -3521,7 +3567,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=device)
     x_mu = torch.empty((0,), dtype=torch.float32, device=device)
 
-    if binning_state["num_rendered"] == 0:
+    if binning_state.num_rendered == 0:
         out_color.zero_()
         out_depth.zero_()
         out_alpha.zero_()
@@ -3529,13 +3575,13 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
         return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
     # F6: preprocess outputs are already contiguous from torch.empty(); skip redundant .detach().contiguous()
-    points_xy_image = preprocess_outputs["points_xy_image"]
-    conic_opacity = preprocess_outputs["conic_opacity"]
-    depths = preprocess_outputs["depths"]
-    feature_ptr = feature_ptr.detach().contiguous()
-    background = background.detach().to(dtype=torch.float32, device=device).contiguous()
-    ranges = binning_state["ranges"].reshape(-1)
-    point_list = binning_state["point_list"]
+    points_xy_image = preprocess_outputs.points_xy_image
+    conic_opacity = preprocess_outputs.conic_opacity
+    depths = preprocess_outputs.depths
+    feature_ptr = _prep(feature_ptr)
+    background = _prep(background.to(dtype=torch.float32, device=device))
+    ranges = binning_state.ranges.reshape(-1)
+    point_list = binning_state.point_list
 
     _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
     _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
@@ -3550,7 +3596,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
     _compute_depth_flag = int(1 if _COMPUTE_DEPTH else 0)
     # T1: Tiled-256 cooperative forward render
-    _grid_x_fwd = int(binning_state["grid_x"])
+    _grid_x_fwd = int(binning_state.grid_x)
     _grid_y_fwd = (image_height + BLOCK_Y - 1) // BLOCK_Y
     _num_tiles_fwd = _grid_x_fwd * _grid_y_fwd
     _dim = _num_tiles_fwd * (BLOCK_X * BLOCK_Y)
@@ -3578,10 +3624,10 @@ def _build_binning_state(
     image_width,
     sort_mode: str | None = None,
 ):
-        radii = preprocess_outputs["radii"]
-        points_xy_image = preprocess_outputs["points_xy_image"]
-        depths = preprocess_outputs["depths"]
-        tiles_touched = _as_detached_contiguous_dtype(preprocess_outputs["tiles_touched"], torch.int32)
+        radii = preprocess_outputs.radii
+        points_xy_image = preprocess_outputs.points_xy_image
+        depths = preprocess_outputs.depths
+        tiles_touched = _as_detached_contiguous_dtype(preprocess_outputs.tiles_touched, torch.int32)
         point_count = radii.shape[0]
         device = radii.device
         grid_x = (image_width + BLOCK_X - 1) // BLOCK_X
@@ -3626,9 +3672,9 @@ def _build_binning_state(
         if point_count > 0:
             points_xy_image_vec2 = _as_detached_contiguous_dtype(points_xy_image, torch.float32)
             radii_i32 = _as_detached_contiguous_dtype(radii, torch.int32)
-            conic_opacity_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_opacity"], torch.float32)
+            conic_opacity_f32 = _as_detached_contiguous_dtype(preprocess_outputs.conic_opacity, torch.float32)
             conic_opacity_wp = wp.from_torch(conic_opacity_f32, dtype=wp.vec4)
-            cov2d_inv_f32 = _as_detached_contiguous_dtype(preprocess_outputs["conic_2d_inv"], torch.float32)
+            cov2d_inv_f32 = _as_detached_contiguous_dtype(preprocess_outputs.conic_2d_inv, torch.float32)
             cov2d_inv_wp = wp.from_torch(cov2d_inv_f32, dtype=wp.vec3)
             point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
 
@@ -3640,18 +3686,15 @@ def _build_binning_state(
             num_rendered = 0
 
         if num_rendered == 0:
-            state = {
-                "grid_x": grid_x,
-                "grid_y": grid_y,
-                "point_offsets": point_offsets,
-                "point_list": _allocate_scalar_tensor((0,), torch.int32, device),
-                "point_list_keys": _allocate_scalar_tensor((0,), torch.int64, device),
-                "ranges": _allocate_scalar_tensor((tile_count, 2), torch.int32, device, fill_value=0),
-                "num_rendered": 0,
-                "requested_sort_mode": requested_sort_mode,
-                "selected_sort_mode": sort_mode,
-            }
-            return state
+            return BinningState(
+                grid_x=grid_x,
+                grid_y=grid_y,
+                point_offsets=point_offsets,
+                point_list=_allocate_scalar_tensor((0,), torch.int32, device),
+                point_list_keys=_allocate_scalar_tensor((0,), torch.int64, device),
+                ranges=_allocate_scalar_tensor((tile_count, 2), torch.int32, device, fill_value=0),
+                num_rendered=0,
+            )
 
         point_list = _allocate_scalar_tensor((num_rendered,), torch.int32, device)
         if sort_mode == "warp_radix":
@@ -3788,18 +3831,15 @@ def _build_binning_state(
         # tail of any tile's range never reads out-of-bounds memory.
         point_list = torch.cat([point_list, torch.zeros(RENDER_TILE_BATCH, dtype=point_list.dtype, device=device)])
 
-        state = {
-            "grid_x": grid_x,
-            "grid_y": grid_y,
-            "point_offsets": point_offsets,
-            "point_list": point_list,
-            "point_list_keys": point_list_keys,
-            "ranges": ranges[:tile_count],
-            "num_rendered": int(point_list.numel()) - RENDER_TILE_BATCH,
-            "requested_sort_mode": requested_sort_mode,
-            "selected_sort_mode": sort_mode,
-        }
-        return state
+        return BinningState(
+            grid_x=grid_x,
+            grid_y=grid_y,
+            point_offsets=point_offsets,
+            point_list=point_list,
+            point_list_keys=point_list_keys,
+            ranges=ranges[:tile_count],
+            num_rendered=int(point_list.numel()) - RENDER_TILE_BATCH,
+        )
 
 def _backward_render_tiles_warp(
     preprocess_outputs,
@@ -3827,18 +3867,18 @@ def _backward_render_tiles_warp(
     grad_conic_opacity = _combined[_off:_off + point_count * 4].reshape(point_count, 4); _off += point_count * 4
     grad_feature = _combined[_off:_off + point_count * NUM_CHANNELS].reshape(point_count, NUM_CHANNELS)
 
-    if binning_state["num_rendered"] == 0:
+    if binning_state.num_rendered == 0:
         outputs = (grad_points_xy, grad_depths, grad_conic_opacity, grad_feature)
         return outputs
 
     # C5: preprocess outputs are already contiguous (torch.empty/zeros); skip .detach().contiguous()
-    points_xy_image = preprocess_outputs["points_xy_image"]
-    conic_opacity = preprocess_outputs["conic_opacity"]
-    depths = preprocess_outputs["depths"]
+    points_xy_image = preprocess_outputs.points_xy_image
+    conic_opacity = preprocess_outputs.conic_opacity
+    depths = preprocess_outputs.depths
     feature_ptr = feature_ptr.contiguous()
     background = background.to(dtype=torch.float32, device=device)
-    ranges = binning_state["ranges"].reshape(-1)
-    point_list = binning_state["point_list"]
+    ranges = binning_state.ranges.reshape(-1)
+    point_list = binning_state.point_list
     out_alpha = out_alpha.reshape(-1)
     n_contrib = n_contrib.to(dtype=torch.int32, device=device).reshape(-1)
 
@@ -3847,10 +3887,10 @@ def _backward_render_tiles_warp(
     grad_alpha = grad_alpha.contiguous().reshape(-1)
 
     # W1: Smart dispatch — warp32 for high density, non-tiled for low density
-    _grid_x = int(binning_state["grid_x"])
+    _grid_x = int(binning_state.grid_x)
     _grid_y = (image_height + BLOCK_Y - 1) // BLOCK_Y
     _num_tiles = _grid_x * _grid_y
-    _num_rendered = int(binning_state["num_rendered"])
+    _num_rendered = int(binning_state.num_rendered)
 
     _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
     _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
@@ -4051,13 +4091,13 @@ def preprocess_gaussians(
           visible_mask = torch.empty((point_count,), dtype=torch.int32, device=device)
           if point_count > 0:
               _e1_inp = [
-                  wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                  wp.from_torch(scales.detach().contiguous(), dtype=wp.vec3),
-                  wp.from_torch(rotations.detach().contiguous(), dtype=wp.vec4),
+                  wp.from_torch(_prep(means3D), dtype=wp.vec3),
+                  wp.from_torch(_prep(scales), dtype=wp.vec3),
+                  wp.from_torch(_prep(rotations), dtype=wp.vec4),
                   float(scale_modifier),
-                  wp.from_torch(opacities.reshape(-1).detach().contiguous(), dtype=wp.float32),
-                  wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                  wp.from_torch(projmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
+                  wp.from_torch(_prep(opacities.reshape(-1)), dtype=wp.float32),
+                  wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+                  wp.from_torch(_prep(projmatrix).reshape(-1), dtype=wp.float32),
                   float(tanfovx),
                   float(tanfovy),
                   float(focal_x),
@@ -4131,21 +4171,20 @@ def preprocess_gaussians(
             points_xy_image.zero_()
             tiles_touched.zero_()
             conic_opacity.zero_()
-            outputs = {
-                "visible": visible,
-                "depths": depths,
-                "radii": radii,
-                "proj_2d": proj_2d,
-                "conic_2d": conic_2d,
-                "conic_2d_inv": conic_2d_inv,
-                "points_xy_image": points_xy_image,
-                "tiles_touched": tiles_touched,
-                "rgb": rgb,
-                "clamped": clamped,
-                "conic_opacity": conic_opacity,
-                "cov3d_all": cov3d_all.to(dtype=torch.float32),
-            }
-            return outputs
+            return PreprocessOutputs(
+                visible=visible,
+                depths=depths,
+                radii=radii,
+                proj_2d=proj_2d,
+                conic_2d=conic_2d,
+                conic_2d_inv=conic_2d_inv,
+                points_xy_image=points_xy_image,
+                tiles_touched=tiles_touched,
+                rgb=rgb,
+                clamped=clamped,
+                conic_opacity=conic_opacity,
+                cov3d_all=cov3d_all.to(dtype=torch.float32),
+            )
 
         if has_scale_rotation:
             pass  # E1: preprocess already done by fused kernel
@@ -4154,13 +4193,13 @@ def preprocess_gaussians(
                 kernel=_cov2d_preprocess_masked_pack_warp_kernel,
                 dim=point_count,
                 inputs=[
-                    wp.from_torch(visible_mask.detach().contiguous(), dtype=wp.int32),
-                    wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                    wp.from_torch(cov3d_all.detach().contiguous().reshape(-1), dtype=wp.float32),
-                    wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                    wp.from_torch(p_proj_all.detach().contiguous(), dtype=wp.vec3),
-                    wp.from_torch(p_view_z_all.detach().contiguous(), dtype=wp.float32),
-                    wp.from_torch(opacities.reshape(-1).detach().contiguous(), dtype=wp.float32),
+                    wp.from_torch(_prep(visible_mask), dtype=wp.int32),
+                    wp.from_torch(_prep(means3D), dtype=wp.vec3),
+                    wp.from_torch(_prep(cov3d_all).reshape(-1), dtype=wp.float32),
+                    wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+                    wp.from_torch(_prep(p_proj_all), dtype=wp.vec3),
+                    wp.from_torch(_prep(p_view_z_all), dtype=wp.float32),
+                    wp.from_torch(_prep(opacities.reshape(-1)), dtype=wp.float32),
                     float(tanfovx),
                     float(tanfovy),
                     float(focal_x),
@@ -4187,15 +4226,15 @@ def preprocess_gaussians(
                 kernel=_cov2d_preprocess_masked_pack_scale_rotation_warp_kernel,
                 dim=point_count,
                 inputs=[
-                    wp.from_torch(visible_mask.detach().contiguous(), dtype=wp.int32),
-                    wp.from_torch(means3D.detach().contiguous(), dtype=wp.vec3),
-                    wp.from_torch(scales.detach().contiguous(), dtype=wp.vec3),
-                    wp.from_torch(rotations.detach().contiguous(), dtype=wp.vec4),
+                    wp.from_torch(_prep(visible_mask), dtype=wp.int32),
+                    wp.from_torch(_prep(means3D), dtype=wp.vec3),
+                    wp.from_torch(_prep(scales), dtype=wp.vec3),
+                    wp.from_torch(_prep(rotations), dtype=wp.vec4),
                     float(scale_modifier),
-                    wp.from_torch(viewmatrix.detach().contiguous().reshape(-1), dtype=wp.float32),
-                    wp.from_torch(p_proj_all.detach().contiguous(), dtype=wp.vec3),
-                    wp.from_torch(p_view_z_all.detach().contiguous(), dtype=wp.float32),
-                    wp.from_torch(opacities.reshape(-1).detach().contiguous(), dtype=wp.float32),
+                    wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+                    wp.from_torch(_prep(p_proj_all), dtype=wp.vec3),
+                    wp.from_torch(_prep(p_view_z_all), dtype=wp.float32),
+                    wp.from_torch(_prep(opacities.reshape(-1)), dtype=wp.float32),
                     float(tanfovx),
                     float(tanfovy),
                     float(focal_x),
@@ -4227,22 +4266,20 @@ def preprocess_gaussians(
             campos = campos.to(device=device, dtype=torch.float32)
             rgb, clamped = _compute_rgb_from_sh_warp(means3D, campos, shs, degree)
 
-        outputs = {
-            "visible": visible,
-            "depths": depths,
-            "radii": radii,
-            "proj_2d": proj_2d,
-            "conic_2d": conic_2d,
-            "conic_2d_inv": conic_2d_inv,
-            "points_xy_image": points_xy_image,
-            "tiles_touched": tiles_touched,
-            "rgb": rgb,
-            "clamped": clamped,
-            "conic_opacity": conic_opacity,
-            "cov3d_all": cov3d_all.to(dtype=torch.float32),
-        }
-
-        return outputs
+        return PreprocessOutputs(
+            visible=visible,
+            depths=depths,
+            radii=radii,
+            proj_2d=proj_2d,
+            conic_2d=conic_2d,
+            conic_2d_inv=conic_2d_inv,
+            points_xy_image=points_xy_image,
+            tiles_touched=tiles_touched,
+            rgb=rgb,
+            clamped=clamped,
+            conic_opacity=conic_opacity,
+            cov3d_all=cov3d_all.to(dtype=torch.float32),
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -4307,8 +4344,8 @@ def _rasterize_gaussians_backward_python(*args: Any):
         if cached_forward_state is not None:
             preprocess_outputs, binning_state, n_contrib = cached_forward_state
             # Shallow copy to avoid mutating the cached dict
-            preprocess_outputs = {**preprocess_outputs, "radii": _radii}
-            cov3d_all = preprocess_outputs["cov3d_all"]
+            preprocess_outputs.radii = _radii
+            cov3d_all = preprocess_outputs.cov3d_all
         else:
             # Only the cov3d source differs between precomp and scale/rotation paths
             if _cov3D_precomp.numel() != 0:
@@ -4344,12 +4381,12 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
         # Unified: preprocess_gaussians already stores the correct rgb
         # (colors_precomp when provided, SH-evaluated colors otherwise).
-        feature_ptr = preprocess_outputs["rgb"]
+        feature_ptr = preprocess_outputs.rgb
         # Always use the saved alpha tensor from forward.
         render_alpha = _alphas
         background_float = _background.to(dtype=torch.float32)
         # num_rendered is a Python int — no device sync.
-        has_active_points = binning_state["num_rendered"] != 0
+        has_active_points = binning_state.num_rendered != 0
 
         if has_active_points:
             # Fallback: if n_contrib could not be recovered, re-render.
@@ -4406,7 +4443,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     _campos.to(device=device, dtype=torch.float32),
                     _sh.reshape(point_count, -1, NUM_CHANNELS),
                     _degree,
-                    preprocess_outputs["clamped"],
+                    preprocess_outputs.clamped,
                     render_grad_feature,
                 )
                 grad_sh = grad_sh_local.reshape_as(_sh)
@@ -4426,7 +4463,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
                     wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
-                    wp.from_torch(preprocess_outputs["radii"].contiguous(), dtype=wp.int32),
+                    wp.from_torch(preprocess_outputs.radii.contiguous(), dtype=wp.int32),
                     wp.from_torch(_proj_flat, dtype=wp.float32),
                     wp.from_torch(_view_flat, dtype=wp.float32),
                     wp.from_torch(render_grad_points, dtype=wp.vec2),
@@ -4466,7 +4503,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
         else:
                 _grad_projected = _backward_projected_means_warp(
                     means3D,
-                    preprocess_outputs["radii"],
+                    preprocess_outputs.radii,
                     _projmatrix,
                     _viewmatrix,
                     render_grad_points,
@@ -4475,7 +4512,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 )
                 _grad_means_cov, grad_cov_from_cov2d = _backward_cov2d_warp(
                     means3D,
-                    preprocess_outputs["radii"],
+                    preprocess_outputs.radii,
                     cov3d_all,
                     _viewmatrix,
                     _tan_fovx,
@@ -4585,7 +4622,7 @@ def rasterize_gaussians(*args: Any):
                     opacities=_opacity,
                     prefiltered=_prefiltered,
                 )
-            feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs["rgb"]
+            feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs.rgb
 
         if _cov3D_precomp.numel() == 0 and _scales.numel() != 0 and _rotations.numel() != 0:
             preprocess_outputs = preprocess_gaussians(
@@ -4606,7 +4643,7 @@ def rasterize_gaussians(*args: Any):
                     opacities=_opacity,
                     prefiltered=_prefiltered,
                 )
-            feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs["rgb"]
+            feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs.rgb
 
         binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
         out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, _n_contrib = _render_tiles_warp(
@@ -4620,17 +4657,17 @@ def rasterize_gaussians(*args: Any):
 
         geom_buffer, binning_buffer, img_buffer = _pack_forward_aux_buffers(preprocess_outputs, binning_state, _n_contrib)
         return (
-            binning_state["num_rendered"],
+            binning_state.num_rendered,
             out_color,
             out_depth,
             out_alpha,
-            preprocess_outputs["radii"],
+            preprocess_outputs.radii,
             geom_buffer,
             binning_buffer,
             img_buffer,
-            preprocess_outputs["proj_2d"],
-            preprocess_outputs["conic_2d"],
-            preprocess_outputs["conic_2d_inv"],
+            preprocess_outputs.proj_2d,
+            preprocess_outputs.conic_2d,
+            preprocess_outputs.conic_2d_inv,
             gs_per_pixel,
             weight_per_gs_pixel,
             x_mu,
