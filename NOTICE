@@ -1,0 +1,21 @@
+gswarp
+Copyright 2025 gswarp contributors
+
+This project is distributed under the Apache License 2.0.
+
+Third-party attribution and scope notes:
+
+- NVIDIA Warp is an external dependency used as the GPU kernel runtime.
+  NVIDIA Warp is licensed under Apache License 2.0.
+
+- This repository is intended to be an independent implementation of a
+  differentiable Gaussian rasterization backend compatible with 3D Gaussian
+  Splatting style pipelines. No source code from graphdeco-inria/
+  gaussian-splatting is intentionally included in this repository.
+
+- The tight AABB tile-culling approach is inspired by published research ideas.
+  No source code, figures, or paper text from that work are included here.
+
+If any file in this repository is later found to contain copied third-party
+code, that file remains subject to the original upstream license and must be
+handled separately.

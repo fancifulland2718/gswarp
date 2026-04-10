@@ -4,7 +4,7 @@
 
 一个基于 **纯 Python + NVIDIA Warp** 的可微高斯光栅化管线重新实现，原始版本以 CUDA C++ 编写，用于 [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)。本后端提供了与原生 CUDA 光栅化器的 **直接替换**（drop-in replacement）——无需 C++/CUDA 编译。
 
-> **许可证**：本项目继承 [Gaussian-Splatting 许可证](LICENSE)（Inria 和 MPII，仅限非商业研究使用）。
+> **许可证**：本仓库采用 [Apache License 2.0](LICENSE)。关于 Warp、3DGS 兼容性以及 AABB 启发式优化的第三方归属与适用边界，请参见 [NOTICE](NOTICE)。
 
 ---
 

@@ -4,7 +4,7 @@
 
 A **pure Python + NVIDIA Warp** reimplementation of the differentiable Gaussian rasterization pipeline. The original version was written in CUDA C++ for [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/). This backend provides a **drop-in replacement** for the native CUDA rasterizer — no C++/CUDA compilation is required.
 
-> **License**: This project inherits the [Gaussian-Splatting License](LICENSE) (Inria and MPII, for non-commercial research use only).
+> **License**: This repository is distributed under [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for third-party attribution and scope notes regarding Warp, 3DGS compatibility, and the AABB-inspired optimization.
 
 ---
 
