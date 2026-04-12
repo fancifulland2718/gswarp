@@ -49,15 +49,21 @@ gswarp is a pure-Python **NVIDIA Warp** backend for 3D Gaussian Splatting, reimp
 ## Installation
 
 ```bash
-pip install warp-lang>=1.12.0
-pip install git+https://github.com/fancifulland2718/gswarp.git
+pip install gswarp
 ```
 
-Or install locally:
+This installs `warp-lang` automatically via package dependencies. If you want to pin the Warp version explicitly, use:
+
+```bash
+pip install "warp-lang>=1.12.0" gswarp
+```
+
+Or install from source:
 
 ```bash
 git clone https://github.com/fancifulland2718/gswarp.git
-pip install ./gswarp
+cd gswarp
+pip install .
 ```
 
 No compilation steps are needed after installation. The first call to any Warp kernel triggers JIT compilation (a few seconds); subsequent runs use the cache.

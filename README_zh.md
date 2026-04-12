@@ -49,15 +49,21 @@ gswarp 是一个基于 **NVIDIA Warp** 的 3D Gaussian Splatting 加速后端，
 ## 安装
 
 ```bash
-pip install warp-lang>=1.12.0
-pip install git+https://github.com/fancifulland2718/gswarp.git
+pip install gswarp
 ```
 
-或本地安装：
+`gswarp` 会通过依赖自动安装 `warp-lang`。如果你希望显式固定 Warp 版本，可以使用：
+
+```bash
+pip install "warp-lang>=1.12.0" gswarp
+```
+
+或从源码安装：
 
 ```bash
 git clone https://github.com/fancifulland2718/gswarp.git
-pip install ./gswarp
+cd gswarp
+pip install .
 ```
 
 安装后无需额外编译步骤。首次调用任何 Warp 内核时会触发 JIT 编译（约数秒），之后使用缓存。

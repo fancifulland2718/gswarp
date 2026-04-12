@@ -1,7 +1,7 @@
+include LICENSE
+include NOTICE
 include README.md
 include README_zh.md
 include pyproject.toml
-include __init__.py
-include _warp_backend.py
-include warp.py
-recursive-include warp_backend *.py
+recursive-include gswarp *.py
+recursive-exclude gswarp __pycache__ *.py[cod]
