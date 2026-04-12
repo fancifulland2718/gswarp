@@ -1,9 +1,19 @@
-import os
+﻿import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import warp as wp
+
+from ._tuning import (
+    normalize_device as _normalize_runtime_device,
+    query_device_info as _query_runtime_device_info,
+    query_sm_properties as _query_sm_properties,
+    register_kernel_class as _register_kernel_class,
+    get_tuned_block_dim,
+    initialize_tuning as _tuning_initialize,
+    FAMILY_COMPUTE, FAMILY_WARP_SPECIALIZED,
+)
 
 __all__ = [
     "clear_warp_caches",
@@ -51,7 +61,7 @@ _BINNING_SORT_MODE = DEFAULT_BINNING_SORT_MODE
 WARP_RADIX_DETERMINISTIC_TIEBREAK = False
 TORCH_SINGLE_SORT_THRESHOLD = 1000000
 FORWARD_GEOM_FLOAT_WIDTH = 16
-# L2: clamped stored as int32 in geom_buffer (eliminates backward bool→int32 conversion)
+# L2: clamped stored as int32 in geom_buffer (eliminates backward bool鈫抜nt32 conversion)
 FORWARD_GEOM_CLAMP_WIDTH = NUM_CHANNELS * 4
 BINNING_AUTO_TUNE_GROWTH_CAP = 4.0
 BINNING_AUTO_TUNE_SWITCH_RATIO = 2.5
@@ -86,7 +96,7 @@ FORWARD_GEOM_STRIDE_BYTES = FORWARD_GEOM_FLOAT_WIDTH * 4 + FORWARD_GEOM_CLAMP_WI
 # B5: track point count for auto-clear after pruning
 _PREV_POINT_COUNT: int | None = None
 
-# C4: per-kernel Launch object caches — keyed by (device_str, dim)
+# C4: per-kernel Launch object caches 鈥?keyed by (device_str, dim)
 _C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_COV3D: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_RENDER_BWD: dict[tuple[str, int], Any] = {}
@@ -155,31 +165,6 @@ def _prep(tensor: torch.Tensor) -> torch.Tensor:
 # One-shot initialization flag — after first _require_warp() succeeds, all
 # subsequent calls short-circuit immediately.
 _WARP_INITIALIZED = False
-
-# Tuned kernel block dimensions — set once during initialize_runtime_tuning(),
-# used by all subsequent wp.launch() calls for the corresponding kernel class.
-_TUNED_BLOCK_DIM: dict[str, int] = {}  # kernel_class -> block_dim
-
-# SM architecture property table — keyed by (major, minor) compute capability.
-# Used for occupancy estimation when properties are not available via PyTorch.
-# Sources: NVIDIA CUDA Programming Guide Table 15 (Thread Block, Register, SM)
-#          Architecture whitepapers for L2 cache / shared memory.
-_SM_ARCHITECTURE_PROPS: dict[tuple[int, int], dict[str, int]] = {
-    # Volta
-    (7, 0): {"regs_per_sm": 65536, "max_warps_per_sm": 64, "max_blocks_per_sm": 32, "shared_mem_per_sm_bytes": 98304, "l2_cache_bytes": 6291456, "reg_alloc_unit": 256},
-    # Turing
-    (7, 5): {"regs_per_sm": 65536, "max_warps_per_sm": 32, "max_blocks_per_sm": 16, "shared_mem_per_sm_bytes": 65536, "l2_cache_bytes": 4194304, "reg_alloc_unit": 256},
-    # Ampere GA100
-    (8, 0): {"regs_per_sm": 65536, "max_warps_per_sm": 64, "max_blocks_per_sm": 32, "shared_mem_per_sm_bytes": 167936, "l2_cache_bytes": 41943040, "reg_alloc_unit": 256},
-    # Ampere GA10x
-    (8, 6): {"regs_per_sm": 65536, "max_warps_per_sm": 48, "max_blocks_per_sm": 16, "shared_mem_per_sm_bytes": 102400, "l2_cache_bytes": 4194304, "reg_alloc_unit": 256},
-    # Ada Lovelace
-    (8, 9): {"regs_per_sm": 65536, "max_warps_per_sm": 48, "max_blocks_per_sm": 24, "shared_mem_per_sm_bytes": 102400, "l2_cache_bytes": 33554432, "reg_alloc_unit": 256},
-    # Hopper
-    (9, 0): {"regs_per_sm": 65536, "max_warps_per_sm": 64, "max_blocks_per_sm": 32, "shared_mem_per_sm_bytes": 233472, "l2_cache_bytes": 52428800, "reg_alloc_unit": 256},
-    # Blackwell
-    (10, 0): {"regs_per_sm": 65536, "max_warps_per_sm": 64, "max_blocks_per_sm": 32, "shared_mem_per_sm_bytes": 233472, "l2_cache_bytes": 67108864, "reg_alloc_unit": 256},
-}
 
 _ANSI_RESET = "\033[0m"
 _ANSI_HEADER = "\033[96m"
@@ -274,147 +259,14 @@ def set_compute_depth(enabled: bool) -> None:
     _COMPUTE_DEPTH = bool(enabled)
 
 
-def _normalize_runtime_device(device: torch.device | str | None = None) -> torch.device:
-    if device is None:
-        if torch.cuda.is_available():
-            return torch.device("cuda", torch.cuda.current_device())
-        return torch.device("cpu")
-    if isinstance(device, str):
-        return torch.device(device)
-    return device
-
-
-def _query_runtime_device_info(runtime_device: torch.device) -> tuple[Any | None, int | None, int | None, torch.device]:
-    device_props = None
-    free_memory = None
-    total_memory = None
-    normalized_device = runtime_device
-    if runtime_device.type == "cuda" and torch.cuda.is_available():
-        device_index = runtime_device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
-            normalized_device = torch.device("cuda", device_index)
-        device_props = torch.cuda.get_device_properties(device_index)
-        free_memory, total_memory = torch.cuda.mem_get_info(device_index)
-    return device_props, free_memory, total_memory, normalized_device
-
-def _get_sm_architecture_props(major: int, minor: int) -> dict[str, int] | None:
-    """Look up SM architecture constants by compute capability.
-
-    Falls back to the nearest lower architecture if the exact (major, minor) is
-    not in the table."""
-    props = _SM_ARCHITECTURE_PROPS.get((major, minor))
-    if props is not None:
-        return dict(props)
-    for (m, n), p in sorted(_SM_ARCHITECTURE_PROPS.items(), reverse=True):
-        if m <= major:
-            return dict(p)
-    return None
-
-
-def _query_sm_properties(device_props: Any | None) -> dict[str, Any]:
-    """Build a comprehensive SM properties dict from *device_props* + the
-    architecture lookup table."""
-    if device_props is None:
-        return {}
-    major, minor = int(device_props.major), int(device_props.minor)
-    arch = _get_sm_architecture_props(major, minor)
-    max_threads_per_sm = int(getattr(device_props, "max_threads_per_multi_processor", 0))
-    warp_size = int(getattr(device_props, "warp_size", 32))
-    sm_count = int(device_props.multi_processor_count)
-    sm_props: dict[str, Any] = {
-        "compute_capability": f"{major}.{minor}",
-        "sm_count": sm_count,
-        "warp_size": warp_size,
-        "max_threads_per_sm": max_threads_per_sm,
-    }
-    if arch is not None:
-        sm_props["regs_per_sm"] = arch["regs_per_sm"]
-        sm_props["max_warps_per_sm"] = arch["max_warps_per_sm"]
-        sm_props["max_blocks_per_sm"] = arch["max_blocks_per_sm"]
-        sm_props["shared_mem_per_sm_bytes"] = arch["shared_mem_per_sm_bytes"]
-        sm_props["l2_cache_bytes"] = arch["l2_cache_bytes"]
-        sm_props["reg_alloc_unit"] = arch["reg_alloc_unit"]
-    else:
-        sm_props["regs_per_sm"] = 65536
-        sm_props["max_warps_per_sm"] = max_threads_per_sm // warp_size if max_threads_per_sm > 0 else 48
-        sm_props["max_blocks_per_sm"] = 16
-        sm_props["shared_mem_per_sm_bytes"] = 0
-        sm_props["l2_cache_bytes"] = 0
-        sm_props["reg_alloc_unit"] = 256
-    return sm_props
-
-
-def _estimate_occupancy(regs_per_thread: int, block_dim: int, sm_props: dict[str, Any]) -> dict[str, Any]:
-    """Estimate theoretical SM occupancy for a kernel with *regs_per_thread*
-    registers launched at *block_dim* threads per block."""
-    warp_size = sm_props.get("warp_size", 32)
-    warps_per_block = block_dim // warp_size
-    if warps_per_block <= 0:
-        return {"block_dim": block_dim, "occupancy": 0.0, "active_warps_per_sm": 0, "active_blocks_per_sm": 0}
-    reg_alloc_unit = sm_props.get("reg_alloc_unit", 256)
-    regs_per_sm = sm_props.get("regs_per_sm", 65536)
-    max_warps_per_sm = sm_props.get("max_warps_per_sm", 48)
-    max_blocks_per_sm = sm_props.get("max_blocks_per_sm", 16)
-    # Register allocation: rounded up to allocation-unit boundary per warp.
-    regs_per_warp = ((regs_per_thread * warp_size + reg_alloc_unit - 1) // reg_alloc_unit) * reg_alloc_unit
-    max_warps_by_regs = regs_per_sm // regs_per_warp if regs_per_warp > 0 else max_warps_per_sm
-    max_blocks_by_regs = max_warps_by_regs // warps_per_block
-    max_blocks_by_warps = max_warps_per_sm // warps_per_block
-    active_blocks = min(max_blocks_by_regs, max_blocks_by_warps, max_blocks_per_sm)
-    active_warps = active_blocks * warps_per_block
-    occupancy = active_warps / max_warps_per_sm if max_warps_per_sm > 0 else 0.0
-    return {
-        "block_dim": block_dim,
-        "warps_per_block": warps_per_block,
-        "regs_per_warp_alloc": regs_per_warp,
-        "active_blocks_per_sm": active_blocks,
-        "active_warps_per_sm": active_warps,
-        "occupancy": occupancy,
-    }
-
-
-# Expected register usage per kernel class (empirical, measured via NCU on sm_89
-# for the fused kernels).  Used as representative values when actual register
-# counts are unavailable.
-_KERNEL_REG_ESTIMATES: dict[str, int] = {
-    "render": 96,
-    "preprocess": 110,
-    "backward_preprocess": 127,
-    "backward_render": 96,
-    "light": 48,
-    "default": 96,
-}
-
-
-def _recommend_block_dim(sm_props: dict[str, Any], kernel_class: str = "default") -> int:
-    """Choose the block_dim that maximises warps-per-SM for *kernel_class*.
-
-    Among candidates with equal occupancy, prefers the largest block_dim to
-    benefit from intra-block scheduling."""
-    regs = _KERNEL_REG_ESTIMATES.get(kernel_class, _KERNEL_REG_ESTIMATES["default"])
-    best_dim = 256
-    best_warps = 0
-    for candidate in (64, 128, 192, 256):
-        occ = _estimate_occupancy(regs, candidate, sm_props)
-        warps = occ["active_warps_per_sm"]
-        if warps > best_warps or (warps == best_warps and candidate > best_dim):
-            best_warps = warps
-            best_dim = candidate
-    return best_dim
-
-
-def _build_block_dim_recommendations(sm_props: dict[str, Any]) -> dict[str, int]:
-    """Return per-kernel-class block_dim recommendations."""
-    recommendations: dict[str, int] = {}
-    for kc in _KERNEL_REG_ESTIMATES:
-        recommendations[kc] = _recommend_block_dim(sm_props, kc)
-    return recommendations
-
-
-def _get_block_dim(kernel_class: str) -> int:
-    """Return the tuned block_dim for *kernel_class*, or 256 as default."""
-    return _TUNED_BLOCK_DIM.get(kernel_class, _TUNED_BLOCK_DIM.get("default", 256))
+# Register rasterizer kernel classes with the shared tuning module.
+# These values are empirical (measured via NCU on sm_89 for the fused kernels).
+_register_kernel_class("render", 128, FAMILY_WARP_SPECIALIZED)
+_register_kernel_class("preprocess", 110, FAMILY_COMPUTE)
+_register_kernel_class("backward_preprocess", 127, FAMILY_COMPUTE)
+_register_kernel_class("backward_render", 128, FAMILY_WARP_SPECIALIZED)
+_register_kernel_class("light", 48, FAMILY_COMPUTE)
+_register_kernel_class("default", 96, FAMILY_COMPUTE)
 
 
 def _recommend_tile_shape(device_props: Any | None, free_memory_bytes: int | None) -> tuple[int, int]:
@@ -508,6 +360,9 @@ def _select_auto_binning_sort_mode(device: torch.device, point_count: int) -> tu
 
 
 def _build_runtime_tuning_report(device: torch.device | str | None = None) -> dict[str, Any]:
+    """Build the rasterizer runtime-tuning report, delegating block_dim computation
+    to the shared ``_tuning`` module so that SSIM and KNN kernels on the same
+    device inherit the plan without redundant device queries."""
     runtime_device = _normalize_runtime_device(device)
     device_props, free_memory, total_memory, runtime_device = _query_runtime_device_info(runtime_device)
     device_key = str(runtime_device)
@@ -515,19 +370,13 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
     recommended_tile_x, recommended_tile_y = _recommend_tile_shape(device_props, free_memory)
     recommended_binning_sort_mode, binning_policy = _recommend_binning_sort_mode(runtime_device, device_props, free_memory)
 
-    # Build comprehensive SM properties and occupancy-based block_dim plan.
-    sm_props = _query_sm_properties(device_props)
-    block_dim_plan = _build_block_dim_recommendations(sm_props) if sm_props else {}
-    # Populate the global _TUNED_BLOCK_DIM once.
-    if block_dim_plan and not _TUNED_BLOCK_DIM:
-        _TUNED_BLOCK_DIM.update(block_dim_plan)
-
-    # Build representative occupancy snapshot per kernel class.
-    occupancy_snapshot: dict[str, dict[str, Any]] = {}
-    if sm_props:
-        for kc, est_regs in _KERNEL_REG_ESTIMATES.items():
-            chosen_bd = block_dim_plan.get(kc, 256)
-            occupancy_snapshot[kc] = _estimate_occupancy(est_regs, chosen_bd, sm_props)
+    # Delegate block_dim planning to the shared tuning module.
+    # This also populates the per-device plan that get_tuned_block_dim() uses,
+    # so subsequent calls from ssim.py / knn.py on this device are free.
+    tuning_report = _tuning_initialize(runtime_device, verbose=False)
+    block_dim_plan = tuning_report.get("block_dim_plan", {})
+    sm_props = tuning_report.get("sm_properties", {})
+    occupancy_snapshot = tuning_report.get("occupancy_snapshot", {})
 
     report = {
         "device": device_key,
@@ -648,6 +497,9 @@ def initialize_runtime_tuning(device: torch.device | str | None = None, verbose:
     device_key = str(runtime_device)
     report = _RUNTIME_TUNING_CACHE.get(device_key)
     if report is None:
+        # Drive the shared tuning module first (verbose=True so it prints
+        # block_dim / occupancy info on first call for this device).
+        _tuning_initialize(runtime_device, verbose=verbose)
         report = _build_runtime_tuning_report(runtime_device)
         _RUNTIME_TUNING_CACHE[device_key] = report
     else:
@@ -816,7 +668,7 @@ def _pack_forward_aux_buffers(preprocess_outputs, binning_state, n_contrib):
     conic_opacity_tensor = _as_detached_contiguous_dtype(preprocess_outputs.conic_opacity, torch.float32)
     rgb_tensor = _as_detached_contiguous_dtype(preprocess_outputs.rgb, torch.float32)
     cov3d_tensor = _as_detached_contiguous_dtype(preprocess_outputs.cov3d_all, torch.float32)
-    # L2: store clamped as int32 — avoids backward int32 conversion allocation
+    # L2: store clamped as int32 鈥?avoids backward int32 conversion allocation
     clamped_tensor = _as_detached_contiguous_dtype(preprocess_outputs.clamped, torch.int32)
     point_list_tensor = _as_detached_contiguous_dtype(binning_state.point_list, torch.int32)
     ranges_tensor = _as_detached_contiguous_dtype(binning_state.ranges.reshape(-1), torch.int32)
@@ -869,7 +721,7 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     offset = offset + rgb_bytes
     cov3d_tensor = geom_buffer[offset : offset + cov_bytes].view(torch.float32).reshape(point_count, 6)
     offset = offset + cov_bytes
-    # L2: clamped stored as int32 — direct view, no backward conversion needed
+    # L2: clamped stored as int32 鈥?direct view, no backward conversion needed
     clamped_tensor = geom_buffer[offset:].view(torch.int32).reshape(point_count, NUM_CHANNELS)
     binning_tensor = binning_buffer.view(torch.int32)
     img_tensor = img_buffer.view(torch.int32)
@@ -906,7 +758,7 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# C4: Warp launch cache — eliminates wp.from_torch + wp.launch Python overhead
+# C4: Warp launch cache 鈥?eliminates wp.from_torch + wp.launch Python overhead
 # -----------------------------------------------------------------------------
 
 def _require_warp() -> None:
@@ -1257,9 +1109,9 @@ if wp is not None:
     _BLOCK_PIXELS_C = wp.constant(BLOCK_X * BLOCK_Y)
 
     # ---- Tiled-256 forward render kernel (cooperative Gaussian loading) ----
-    # Each block = 256 threads = one 16×16 pixel tile.
+    # Each block = 256 threads = one 16脳16 pixel tile.
     # Gaussians are loaded in batches of 256 via wp.tile() + wp.tile_extract(),
-    # eliminating 256× redundant global memory reads compared to per-pixel SIMT.
+    # eliminating 256脳 redundant global memory reads compared to per-pixel SIMT.
     @wp.kernel
     def _render_tiles_tiled256_warp_kernel(
         ranges_flat: wp.array(dtype=wp.int32),
@@ -1286,7 +1138,7 @@ if wp is not None:
         if tile_id >= num_tiles:
             return
 
-        # Map local_id → pixel within the 16×16 tile
+        # Map local_id 鈫?pixel within the 16脳16 tile
         tile_x = tile_id % grid_x
         tile_y = tile_id // grid_x
         pix_x = tile_x * BLOCK_X + (local_id % BLOCK_X)
@@ -1327,14 +1179,14 @@ if wp is not None:
 
             # ---- Cooperative load: each thread loads 1 Gaussian ----
             progress = i * 256 + local_id
-            # 2C: simplified safe_idx — end > start guaranteed by n_gs > 0
+            # 2C: simplified safe_idx 鈥?end > start guaranteed by n_gs > 0
             safe_idx = wp.min(start + progress, end - 1)
             my_id = point_list[safe_idx]
 
             my_xy = points_xy_image[my_id]
             my_co = conic_opacity[my_id]
 
-            # 2A: vec2/vec4 tiles — fewer tile_extract calls (3 vs 7)
+            # 2A: vec2/vec4 tiles 鈥?fewer tile_extract calls (3 vs 7)
             t_id = wp.tile(my_id)
             t_xy = wp.tile(my_xy, preserve_type=True)
             t_co = wp.tile(my_co, preserve_type=True)
@@ -1824,7 +1676,7 @@ if wp is not None:
 
     # ---- F1: vec3-typed SH backward kernels for improved memory coalescing ----
     # M1+SoA: SH backward kernel with SoA-transposed layout for coalesced memory access.
-    # Data arrives as (K, P, 3) → shs_v3[k * point_count + tid] gives coalesced vec3 reads.
+    # Data arrives as (K, P, 3) 鈫?shs_v3[k * point_count + tid] gives coalesced vec3 reads.
     # Eliminates 86% excessive sectors from AoS stride (192 bytes between threads).
     @wp.kernel
     def _backward_rgb_from_sh_v3_warp_kernel(
@@ -1862,7 +1714,7 @@ if wp is not None:
         acc_dz = wp.vec3(0.0, 0.0, 0.0)
 
         # SoA stride: shs_v3 and grad_sh_v3 are (K, P, 3) layout
-        # shs_v3[k * _P + tid] gives coalesced access (adjacent threads → adjacent vec3s)
+        # shs_v3[k * _P + tid] gives coalesced access (adjacent threads 鈫?adjacent vec3s)
         _P = point_count
 
         if coeff_count > 0:
@@ -2099,7 +1951,7 @@ if wp is not None:
         grad_means[tid] = _dnormvdv_wp(dir_orig, dL_ddir)
 
 
-    # P2b: vec3 forward SH — 3× fewer load/store instructions vs scalar version
+    # P2b: vec3 forward SH 鈥?3脳 fewer load/store instructions vs scalar version
     @wp.kernel
     def _forward_rgb_from_sh_v3_warp_kernel(
         means3d: wp.array(dtype=wp.vec3),
@@ -2499,7 +2351,7 @@ if wp is not None:
         rect_max_y = wp.min(grid_y, wp.max(0, wp.int32((point_y + float(radius_y) + float(BLOCK_Y - 1)) / float(BLOCK_Y))))
         return wp.vec4i(rect_min_x, rect_min_y, rect_max_x, rect_max_y)
 
-    # A2: AccuTile — per-row ellipse intersection for exact tile-x ranges.
+    # A2: AccuTile 鈥?per-row ellipse intersection for exact tile-x ranges.
     # Solves  con_a*dx^2 + 2*con_b*dx*dy + con_c*dy^2 = t  for dx at fixed dy
     # to narrow the tile-x loop per tile-y row in duplicate kernels.
     @wp.func
@@ -2870,9 +2722,9 @@ if wp is not None:
             range_flat[curr_tile * 2 + 1] = length
 
 
-    # ---- W1: Warp32 backward render — 32-thread warp-level gradient reduction ----
-    # Each 32-thread warp covers a spatial sub-tile (2 consecutive rows of a 16×16 screen tile).
-    # Benefits vs non-tiled: 32× fewer atomic writes per Gaussian.
+    # ---- W1: Warp32 backward render 鈥?32-thread warp-level gradient reduction ----
+    # Each 32-thread warp covers a spatial sub-tile (2 consecutive rows of a 16脳16 screen tile).
+    # Benefits vs non-tiled: 32脳 fewer atomic writes per Gaussian.
     @wp.kernel
     def _backward_render_tiles_warp32_kernel(
         ranges_flat: wp.array(dtype=wp.int32),
@@ -2953,7 +2805,7 @@ if wp is not None:
         last_color = wp.vec3(0.0, 0.0, 0.0)
         last_depth = float(0.0)
 
-        # W1: Warp-level max contributor — each 32-pixel sub-tile determines its own loop bound.
+        # W1: Warp-level max contributor 鈥?each 32-pixel sub-tile determines its own loop bound.
         t_lc = wp.tile(last_contributor)
         t_max_lc = wp.tile_reduce(wp.max, t_lc)
         warp_max_lc = wp.tile_extract(t_max_lc, 0)
@@ -3015,7 +2867,7 @@ if wp is not None:
                         my_grad_xy = wp.vec2(dL_dG * dG_ddelx * ddelx_dx, dL_dG * dG_ddely * ddely_dy)
                         my_grad_co = wp.vec4(-0.5 * gdx * d_x * dL_dG, -0.5 * gdx * d_y * dL_dG, -0.5 * gdy * d_y * dL_dG, G * dL_dopa)
 
-            # W1: Warp-level reduction — ALL 32 threads participate (UNIFORM path)
+            # W1: Warp-level reduction 鈥?ALL 32 threads participate (UNIFORM path)
             t_feat = wp.tile(my_grad_feat, preserve_type=True)
             s_feat = wp.tile_reduce(wp.add, t_feat)
             wp.tile_atomic_add(grad_feature, s_feat, offset=coll_id)
@@ -3435,7 +3287,7 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
 
     coeff_count = shs.shape[1]
     _dev = str(means3D.device)
-    # P2b: vec3 SH forward — 3× fewer load/store instructions
+    # P2b: vec3 SH forward 鈥?3脳 fewer load/store instructions
     _inp = [
         wp.from_torch(_prep(means3D), dtype=wp.vec3),
         wp.from_torch(_prep(campos).reshape(-1), dtype=wp.float32),
@@ -3497,8 +3349,8 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
                 _cmd.set_param_at_index(_i, _v)
         _cmd.launch()
     else:
-        # SoA layout for coalesced GPU access: (P, K, 3) → (K, P, 3)
-        # Adjacent threads access adjacent vec3s → eliminates 86% excessive sectors
+        # SoA layout for coalesced GPU access: (P, K, 3) 鈫?(K, P, 3)
+        # Adjacent threads access adjacent vec3s 鈫?eliminates 86% excessive sectors
         _w_shs_v3 = wp.from_torch(shs.permute(1, 0, 2).contiguous().reshape(-1, 3), dtype=wp.vec3)
         grad_sh_soa = torch.zeros((coeff_count, point_count, 3), dtype=shs.dtype, device=means3D.device)
         _w_grad_sh_v3 = wp.from_torch(grad_sh_soa.reshape(-1, 3), dtype=wp.vec3)
@@ -3645,7 +3497,7 @@ def _build_binning_state(
         if point_count > 0 and sort_mode == "warp_depth_stable_tile":
             device_key = str(device)
 
-            # Always sort — the O6 depth-order-unchanged check requires a GPU→CPU
+            # Always sort 鈥?the O6 depth-order-unchanged check requires a GPU鈫扖PU
             # sync (.item()) that costs more than the sort itself during training.
             # Use the shared i32 radix sort buffers for depth sorting, then clone
             # sorted_point_ids before those buffers are reused by the duplicate sort.
@@ -3678,7 +3530,7 @@ def _build_binning_state(
             cov2d_inv_wp = wp.from_torch(cov2d_inv_f32, dtype=wp.vec3)
             point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
 
-        # ----- Read num_rendered via GPU→CPU sync -----
+        # ----- Read num_rendered via GPU鈫扖PU sync -----
         device_key = str(device)
         if point_count > 0:
             num_rendered = int(point_offsets_i32[-1].item())
@@ -3857,7 +3709,7 @@ def _backward_render_tiles_warp(
     device = feature_ptr.device
     point_count = feature_ptr.shape[0]
 
-    # C3: Combined allocation — 1 memset instead of 4
+    # C3: Combined allocation 鈥?1 memset instead of 4
     _stride = 2 + 1 + 4 + NUM_CHANNELS  # 10
     _bwd_total = point_count * _stride
     _combined = torch.zeros(_bwd_total, dtype=torch.float32, device=device)
@@ -3886,7 +3738,7 @@ def _backward_render_tiles_warp(
     grad_depth = grad_depth.contiguous().reshape(-1)
     grad_alpha = grad_alpha.contiguous().reshape(-1)
 
-    # W1: Smart dispatch — warp32 for high density, non-tiled for low density
+    # W1: Smart dispatch 鈥?warp32 for high density, non-tiled for low density
     _grid_x = int(binning_state.grid_x)
     _grid_y = (image_height + BLOCK_Y - 1) // BLOCK_Y
     _num_tiles = _grid_x * _grid_y
@@ -3911,7 +3763,7 @@ def _backward_render_tiles_warp(
     _compute_depth_flag = int(1 if _COMPUTE_DEPTH else 0)
 
     _dim = _num_tiles * (BLOCK_X * BLOCK_Y)
-    # W1: warp32 backward — warp-level tile_reduce gives 32× fewer atomicAdd
+    # W1: warp32 backward 鈥?warp-level tile_reduce gives 32脳 fewer atomicAdd
     _inp = [_wp_ranges, _wp_point_list, _wp_points_xy, _wp_features, _wp_depths,
             _wp_conic_opacity, _wp_bg, _wp_out_alpha, _wp_n_contrib,
             _wp_grad_color, _wp_grad_depth, _wp_grad_alpha,
@@ -4086,7 +3938,7 @@ def preprocess_gaussians(
         grid_x = (image_width + BLOCK_X - 1) // BLOCK_X
         grid_y = (image_height + BLOCK_Y - 1) // BLOCK_Y
         if has_scale_rotation:
-          # E1: fused project + cov3d + cov2d — visibility, cov3d, and all
+          # E1: fused project + cov3d + cov2d 鈥?visibility, cov3d, and all
           # preprocess outputs produced in a single kernel launch.
           visible_mask = torch.empty((point_count,), dtype=torch.int32, device=device)
           if point_count > 0:
@@ -4129,7 +3981,7 @@ def preprocess_gaussians(
                       outputs=_e1_out,
                       device=str(device),
                       record_cmd=True,
-                      block_dim=_get_block_dim("preprocess"),
+                      block_dim=get_tuned_block_dim("preprocess", device),
                   )
                   _C4_LAUNCH_CACHE_FWD_PREPROCESS[_e1_key] = _e1_cmd
               else:
@@ -4159,7 +4011,7 @@ def preprocess_gaussians(
         if cov3d_all is None:
             cov3d_all = torch.zeros((point_count, 6), dtype=torch.float32, device=device)
 
-        # F3: E1 fused path processes all points — skip GPU→CPU sync
+        # F3: E1 fused path processes all points 鈥?skip GPU鈫扖PU sync
         visible_count = point_count if has_scale_rotation else (int(visible_mask.sum().item()) if point_count > 0 else 0)
 
         if point_count == 0 or visible_count == 0:
@@ -4368,7 +4220,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     opacities=_opacities,
                     prefiltered=False,
                 )
-            # Build binning unconditionally — num_rendered (Python int) avoids
+            # Build binning unconditionally 鈥?num_rendered (Python int) avoids
             # the host sync that bool((radii > 0).any()) would trigger.
             binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
             # Recover n_contrib from the saved img buffer instead of re-running
@@ -4385,7 +4237,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
         # Always use the saved alpha tensor from forward.
         render_alpha = _alphas
         background_float = _background.to(dtype=torch.float32)
-        # num_rendered is a Python int — no device sync.
+        # num_rendered is a Python int 鈥?no device sync.
         has_active_points = binning_state.num_rendered != 0
 
         if has_active_points:
@@ -4455,7 +4307,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
                 grad_scales = torch.empty(_scales.shape, dtype=_scales.dtype, device=device)
                 grad_rotations = torch.empty(_rotations.shape, dtype=_rotations.dtype, device=device)
-                # L3: when has_sh=False the kernel never reads grad_sh_means — reuse means3D to avoid zero alloc
+                # L3: when has_sh=False the kernel never reads grad_sh_means 鈥?reuse means3D to avoid zero alloc
                 _sh_grad = _grad_mean_sh if _has_sh else means3D
                 _proj_flat = _projmatrix.contiguous().reshape(-1)
                 _view_flat = _viewmatrix.contiguous().reshape(-1)
@@ -4494,7 +4346,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 if _e2_cmd is None:
                     _e2_cmd = wp.launch(kernel=_fused_backward_preprocess_accumulate_warp_kernel, dim=point_count,
                                         inputs=_e2_inp, outputs=_e2_out, device=str(device), record_cmd=True,
-                                        block_dim=_get_block_dim("backward_preprocess"))
+                                        block_dim=get_tuned_block_dim("backward_preprocess", device))
                     _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS[_e2_key] = _e2_cmd
                 else:
                     for _i, _v in enumerate(_e2_inp + _e2_out):
@@ -4523,7 +4375,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     grad_conic_2d_active,
                 )
 
-                # C3: Fused accumulation — replaces 2 torch.zeros + 3 torch.add + 1 slice-assign
+                # C3: Fused accumulation 鈥?replaces 2 torch.zeros + 3 torch.add + 1 slice-assign
                 grad_means3D = torch.empty(means3D.shape, dtype=means3D.dtype, device=device)
                 grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
                 _sh_grad_input = _grad_mean_sh if _has_sh else _grad_projected

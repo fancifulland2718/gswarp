@@ -1,9 +1,10 @@
-from typing import NamedTuple
+﻿from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
-from .. import _warp_backend
+from . import _rasterizer as _warp_backend
+from ._stream import ensure_aligned
 
 
 def rasterize_gaussians(
@@ -70,7 +71,18 @@ def set_compute_depth(enabled):
     _warp_backend.set_compute_depth(enabled)
 
 
+def clear_warp_caches():
+    """Release all grow-only Warp buffer caches.
+
+    Call after ``densify_and_prune`` or when switching scenes to reclaim GPU
+    memory held by stale high-water-mark allocations.  The caches will be
+    lazily re-populated on the next forward pass.
+    """
+    _warp_backend.clear_warp_caches()
+
+
 def _run_with_experimental_settings(raster_settings, fn):
+    ensure_aligned()
     previous_backward_mode = _warp_backend.get_backward_mode()
     previous_binning_sort_mode = _warp_backend.get_binning_sort_mode()
     previous_auto_tuning = None
@@ -346,17 +358,20 @@ class GaussianRasterizer(nn.Module):
 
 
 __all__ = [
+    # Core rasterizer types
     "GaussianRasterizationSettings",
     "GaussianRasterizer",
-    "get_default_parameter_info",
-    "get_backward_mode",
-    "get_binning_sort_mode",
-    "get_runtime_auto_tuning_config",
-    "get_runtime_tuning_report",
-    "initialize_runtime_tuning",
+    # Core functions
     "rasterize_gaussians",
+    # Setup & memory management
+    "initialize_runtime_tuning",
+    "get_runtime_tuning_report",
+    "clear_warp_caches",
+    # Runtime mode controls
+    "get_backward_mode",
     "set_backward_mode",
-    "set_binning_sort_mode",
     "get_compute_depth",
     "set_compute_depth",
+    "get_binning_sort_mode",
+    "set_binning_sort_mode",
 ]
