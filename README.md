@@ -41,8 +41,8 @@ gswarp is a pure-Python **NVIDIA Warp** backend for 3D Gaussian Splatting, reimp
 |-----------|---------|
 | Python | 3.10+ |
 | NVIDIA GPU | Compute capability ≥ 7.0 (Volta) |
-| PyTorch | 2.0+ (with CUDA support) |
-| NVIDIA Warp | 1.12.0+ |
+| PyTorch | 1.13+ (with CUDA support) |
+| NVIDIA Warp | 1.8.0+ |
 
 ---
 

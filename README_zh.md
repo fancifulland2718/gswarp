@@ -41,8 +41,8 @@ gswarp 是一个基于 **NVIDIA Warp** 的 3D Gaussian Splatting 加速后端，
 |------|---------|
 | Python | 3.10+ |
 | NVIDIA GPU | 计算能力 ≥ 7.0 (Volta) |
-| PyTorch | 2.0+（含 CUDA 支持） |
-| NVIDIA Warp | 1.12.0+ |
+| PyTorch | 1.13+（含 CUDA 支持） |
+| NVIDIA Warp | 1.8.0+ |
 
 ---
 
