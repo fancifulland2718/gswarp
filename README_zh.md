@@ -55,7 +55,7 @@ pip install gswarp
 `gswarp` 会通过依赖自动安装 `warp-lang`。如果你希望显式固定 Warp 版本，可以使用：
 
 ```bash
-pip install "warp-lang>=1.12.0" gswarp
+pip install "warp-lang>=1.8.0" gswarp
 ```
 
 或从源码安装：

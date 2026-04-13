@@ -55,7 +55,7 @@ pip install gswarp
 This installs `warp-lang` automatically via package dependencies. If you want to pin the Warp version explicitly, use:
 
 ```bash
-pip install "warp-lang>=1.12.0" gswarp
+pip install "warp-lang>=1.8.0" gswarp
 ```
 
 Or install from source:
