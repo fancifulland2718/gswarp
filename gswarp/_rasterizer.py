@@ -384,7 +384,7 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
         "device_name": getattr(device_props, "name", runtime_device.type.upper()),
         "compute_capability": None if device_props is None else f"{device_props.major}.{device_props.minor}",
         "sm_count": None if device_props is None else int(device_props.multi_processor_count),
-        "warp_size": None if device_props is None else int(device_props.warp_size),
+        "warp_size": None if device_props is None else int(getattr(device_props, "warp_size", 32)),
         "free_memory_bytes": None if free_memory is None else int(free_memory),
         "total_memory_bytes": None if total_memory is None else int(total_memory),
         "sm_properties": sm_props,
@@ -416,7 +416,7 @@ def _refresh_runtime_tuning_report_memory(report: dict[str, Any]) -> dict[str, A
     updated["device_name"] = getattr(device_props, "name", updated["device_name"])
     updated["compute_capability"] = None if device_props is None else f"{device_props.major}.{device_props.minor}"
     updated["sm_count"] = None if device_props is None else int(device_props.multi_processor_count)
-    updated["warp_size"] = None if device_props is None else int(device_props.warp_size)
+    updated["warp_size"] = None if device_props is None else int(getattr(device_props, "warp_size", 32))
     updated["free_memory_bytes"] = None if free_memory is None else int(free_memory)
     updated["total_memory_bytes"] = None if total_memory is None else int(total_memory)
     updated["recommended_tile"] = _recommend_tile_shape(device_props, free_memory)
@@ -636,6 +636,16 @@ def _allocate_warp_scalar_array(shape, dtype: torch.dtype, device: torch.device 
         warp_array = wp.ones(shape=shape, dtype=warp_dtype, device=warp_device)
     else:
         warp_array = wp.full(shape=shape, value=fill_value, dtype=warp_dtype, device=warp_device)
+    # Zero-element warp CUDA arrays have a host/null pointer; older PyTorch
+    # raises "pointer resides on host memory" in wp.to_torch.  Construct the
+    # empty torch tensor directly to maintain compatibility.
+    _numel = shape if isinstance(shape, int) else 1
+    if not isinstance(shape, int):
+        for s in shape:
+            _numel *= s
+    if _numel == 0:
+        torch_shape = (shape,) if isinstance(shape, int) else shape
+        return warp_array, torch.empty(torch_shape, dtype=dtype, device=warp_device)
     return warp_array, wp.to_torch(warp_array)
 
 
