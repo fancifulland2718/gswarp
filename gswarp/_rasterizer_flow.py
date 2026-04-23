@@ -1,4 +1,4 @@
-﻿import os
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,6 +76,10 @@ PREPROCESS_CULL_FOV_SCALE = 1.3
 # when depth output is not used in the loss.  Controlled globally or via
 # GSWARP_COMPUTE_DEPTH=0 environment variable.
 _COMPUTE_DEPTH = os.environ.get("GSWARP_COMPUTE_DEPTH", "1") != "0"
+# Flow-backend: per-pixel top-K auxiliary outputs (gs_per_pixel, weight_per_gs_pixel, x_mu).
+# Enabled by default because callers of the flow backend normally consume them.
+_COMPUTE_FLOW_AUX = os.environ.get("GSWARP_COMPUTE_FLOW_AUX", "1") != "0"
+_FLOW_TOPK = int(os.environ.get("GSWARP_FLOW_TOPK", "20"))
 DET_EPSILON = 1.0e-7
 ONE_MINUS_ALPHA_MIN = 1.0e-5
 _RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = {}
@@ -115,6 +119,7 @@ _C4_LAUNCH_CACHE_FWD_RENDER: dict[tuple[str, int], Any] = {}
 _C4_LAUNCH_CACHE_BINNING_DUPLICATE: dict[tuple[str, int], Any] = {}
 # T1: tiled256 forward render launch cache
 _C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[str, int], Any] = {}
+_C4_LAUNCH_CACHE_FLOW_GRAD: dict[tuple[str, int], Any] = {}
 
 
 # T1: Cooperative tile batch size for render kernels.
@@ -259,6 +264,42 @@ def set_compute_depth(enabled: bool) -> None:
     _COMPUTE_DEPTH = bool(enabled)
 
 
+def get_compute_flow_aux() -> bool:
+    """Return whether per-pixel top-K flow auxiliary tensors are produced."""
+    return _COMPUTE_FLOW_AUX
+
+
+def set_compute_flow_aux(enabled: bool) -> None:
+    """Enable / disable per-pixel top-K flow auxiliary output.
+
+    When enabled (default), the forward render kernel fills ``gs_per_pixel``,
+    ``weight_per_gs_pixel`` and ``x_mu`` with the first ``K`` successful
+    contributors per pixel (``K = get_flow_topk()``).  When disabled, those
+    tensors are allocated as zero-sized placeholders and the kernel skips the
+    extra stores (useful to save memory when the flow aux is not consumed).
+    """
+    global _COMPUTE_FLOW_AUX
+    _COMPUTE_FLOW_AUX = bool(enabled)
+
+
+def get_flow_topk() -> int:
+    """Return the top-K used for the per-pixel flow auxiliary tensors."""
+    return _FLOW_TOPK
+
+
+def set_flow_topk(k: int) -> None:
+    """Set the top-K for the per-pixel flow auxiliary tensors.
+
+    ``K`` controls the channel dimension of the ``gs_per_pixel``,
+    ``weight_per_gs_pixel`` and ``x_mu`` tensors.  Memory cost scales as
+    ``O(K * H * W)``.  Must be a positive integer.
+    """
+    global _FLOW_TOPK
+    if int(k) <= 0:
+        raise ValueError(f"flow top-K must be positive, got {k}")
+    _FLOW_TOPK = int(k)
+
+
 # Register rasterizer kernel classes with the shared tuning module.
 # These values are empirical (measured via NCU on sm_89 for the fused kernels).
 _register_kernel_class("render", 128, FAMILY_WARP_SPECIALIZED)
@@ -391,7 +432,7 @@ def _build_runtime_tuning_report(device: torch.device | str | None = None) -> di
         "current_tile": (BLOCK_X, BLOCK_Y),
         "recommended_tile": (recommended_tile_x, recommended_tile_y),
         "tile_runtime_mutable": False,
-        "compute_depth": _COMPUTE_DEPTH,
+                "compute_depth": _COMPUTE_DEPTH,
         "applied_binning_sort_mode": _BINNING_SORT_MODE,
         "recommended_binning_sort_mode": recommended_binning_sort_mode,
         "block_dim_plan": block_dim_plan,
@@ -555,6 +596,7 @@ def clear_warp_caches() -> None:
     _C4_LAUNCH_CACHE_SH.clear()
     _C4_LAUNCH_CACHE_COV3D.clear()
     _C4_LAUNCH_CACHE_RENDER_BWD.clear()
+    _C4_LAUNCH_CACHE_FLOW_GRAD.clear()
     _C4_LAUNCH_CACHE_PROJ_MEANS.clear()
     _C4_LAUNCH_CACHE_COV2D.clear()
     _C4_LAUNCH_CACHE_ACCUM.clear()
@@ -1006,6 +1048,23 @@ def _warp_radix_sort_i32_pairs_in_place(key_buffer: torch.Tensor, value_buffer: 
 
 if wp is not None:
 
+    @wp.kernel
+    def _fused_flow_grad_prep_warp_kernel(
+        grad_proj_2D: wp.array(dtype=wp.vec2),
+        render_grad_points: wp.array(dtype=wp.vec2),
+        grad_conic_2D: wp.array(dtype=wp.vec3),
+        render_grad_conic_opacity: wp.array(dtype=wp.vec4),
+        grad_proj_2d_out: wp.array(dtype=wp.vec2),
+        grad_conic_2d_out: wp.array(dtype=wp.vec3),
+    ):
+        i = wp.tid()
+        gp = grad_proj_2D[i]
+        rp = render_grad_points[i]
+        grad_proj_2d_out[i] = wp.vec2(gp[0] + rp[0], gp[1] + rp[1])
+        gc = grad_conic_2D[i]
+        rc = render_grad_conic_opacity[i]
+        grad_conic_2d_out[i] = wp.vec3(gc[0] + rc[0], gc[1] + rc[1], gc[2] + rc[2])
+
 
     @wp.kernel
     def _gather_i32_by_index_warp_kernel(
@@ -1135,10 +1194,15 @@ if wp is not None:
         grid_x: wp.int32,
         num_tiles: wp.int32,
         compute_depth: wp.int32,
+        write_aux: wp.int32,
+        top_k: wp.int32,
         out_color_flat: wp.array(dtype=wp.float32),
         out_depth_flat: wp.array(dtype=wp.float32),
         out_alpha_flat: wp.array(dtype=wp.float32),
         n_contrib: wp.array(dtype=wp.int32),
+        gs_per_pixel_flat: wp.array(dtype=wp.int32),
+        weight_per_gs_pixel_flat: wp.array(dtype=wp.float32),
+        x_mu_flat: wp.array(dtype=wp.float32),
     ):
         tid = wp.tid()
         tile_id = tid // _BLOCK_PIXELS_C
@@ -1166,6 +1230,7 @@ if wp is not None:
         T = float(1.0)
         contributor = int(0)
         last_contributor = int(0)
+        n_success = int(0)
         color0 = float(0.0)
         color1 = float(0.0)
         color2 = float(0.0)
@@ -1230,6 +1295,14 @@ if wp is not None:
                                 weight = weight + contribution
                                 if compute_depth != 0:
                                     depth_acc = depth_acc + depths[coll_id] * contribution
+                                # Flow aux: record up to top_k successful contributors.
+                                if write_aux != 0 and n_success < top_k:
+                                    aux_idx = n_success * total_pixels + pixel_id
+                                    gs_per_pixel_flat[aux_idx] = coll_id
+                                    weight_per_gs_pixel_flat[aux_idx] = contribution
+                                    x_mu_flat[aux_idx] = d_x
+                                    x_mu_flat[top_k * total_pixels + aux_idx] = d_y
+                                n_success = n_success + 1
                                 T = test_T
                                 last_contributor = contributor
 
@@ -3143,6 +3216,21 @@ def _make_empty_forward_outputs(means3D, image_height, image_width):
     proj_2d = _allocate_scalar_tensor((point_count, 2), torch.float32, means3D.device, fill_value=0.0)
     conic_2d = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
     conic_2d_inv = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
+    if _COMPUTE_FLOW_AUX:
+        K = _FLOW_TOPK
+        gs_per_pixel = torch.full(
+            (K, image_height, image_width), -1, dtype=torch.int32, device=means3D.device
+        )
+        weight_per_gs_pixel = torch.zeros(
+            (K, image_height, image_width), dtype=torch.float32, device=means3D.device
+        )
+        x_mu = torch.zeros(
+            (2, K, image_height, image_width), dtype=torch.float32, device=means3D.device
+        )
+    else:
+        gs_per_pixel = torch.empty((0,), dtype=torch.int32, device=means3D.device)
+        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=means3D.device)
+        x_mu = torch.empty((0,), dtype=torch.float32, device=means3D.device)
     geom_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     binning_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
     img_buffer = _allocate_scalar_tensor((0,), torch.uint8, means3D.device)
@@ -3159,6 +3247,9 @@ def _make_empty_forward_outputs(means3D, image_height, image_width):
         proj_2d,
         conic_2d,
         conic_2d_inv,
+        gs_per_pixel,
+        weight_per_gs_pixel,
+        x_mu,
     )
 
 
@@ -3419,12 +3510,25 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     out_alpha = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     n_contrib = torch.empty((total_pixels,), dtype=torch.int32, device=device)
 
+    # Flow auxiliary outputs: top-K successful contributors per pixel.
+    write_aux_flag = 1 if _COMPUTE_FLOW_AUX else 0
+    if write_aux_flag != 0:
+        K = _FLOW_TOPK
+        gs_per_pixel = torch.full((K, image_height, image_width), -1, dtype=torch.int32, device=device)
+        weight_per_gs_pixel = torch.zeros((K, image_height, image_width), dtype=torch.float32, device=device)
+        x_mu = torch.zeros((2, K, image_height, image_width), dtype=torch.float32, device=device)
+    else:
+        K = 0
+        gs_per_pixel = torch.empty((0,), dtype=torch.int32, device=device)
+        weight_per_gs_pixel = torch.empty((0,), dtype=torch.float32, device=device)
+        x_mu = torch.empty((0,), dtype=torch.float32, device=device)
+
     if binning_state.num_rendered == 0:
         out_color.zero_()
         out_depth.zero_()
         out_alpha.zero_()
         n_contrib.zero_()
-        return out_color, out_depth, out_alpha, n_contrib
+        return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
     # F6: preprocess outputs are already contiguous from torch.empty(); skip redundant .detach().contiguous()
     points_xy_image = preprocess_outputs.points_xy_image
@@ -3434,6 +3538,17 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     background = _prep(background.to(dtype=torch.float32, device=device))
     ranges = binning_state.ranges.reshape(-1)
     point_list = binning_state.point_list
+
+    # Warp requires valid (non-null) array bindings even when the kernel's
+    # write_aux branch is dormant; use tiny dummy tensors in that case.
+    if write_aux_flag != 0:
+        _gs_per_pixel_flat = gs_per_pixel.reshape(-1)
+        _weight_per_gs_pixel_flat = weight_per_gs_pixel.reshape(-1)
+        _x_mu_flat = x_mu.reshape(-1)
+    else:
+        _gs_per_pixel_flat = torch.empty((1,), dtype=torch.int32, device=device)
+        _weight_per_gs_pixel_flat = torch.empty((1,), dtype=torch.float32, device=device)
+        _x_mu_flat = torch.empty((1,), dtype=torch.float32, device=device)
 
     _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
     _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
@@ -3446,6 +3561,9 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     _wp_out_depth = wp.from_torch(out_depth.reshape(-1), dtype=wp.float32)
     _wp_out_alpha = wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32)
     _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
+    _wp_gs_per_pixel = wp.from_torch(_gs_per_pixel_flat, dtype=wp.int32)
+    _wp_weight_per_gs_pixel = wp.from_torch(_weight_per_gs_pixel_flat, dtype=wp.float32)
+    _wp_x_mu = wp.from_torch(_x_mu_flat, dtype=wp.float32)
     _compute_depth_flag = int(1 if _COMPUTE_DEPTH else 0)
     # T1: Tiled-256 cooperative forward render
     _grid_x_fwd = int(binning_state.grid_x)
@@ -3454,9 +3572,11 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     _dim = _num_tiles_fwd * (BLOCK_X * BLOCK_Y)
     _inp = [_wp_ranges, _wp_point_list, _wp_points_xy, _wp_features, _wp_depths,
             _wp_conic_opacity, _wp_bg, int(image_width), int(image_height),
-            _grid_x_fwd, _num_tiles_fwd, _compute_depth_flag]
-    _out = [_wp_out_color, _wp_out_depth, _wp_out_alpha, _wp_n_contrib]
-    _key = (str(device), _dim)
+            _grid_x_fwd, _num_tiles_fwd, _compute_depth_flag,
+            write_aux_flag, int(K)]
+    _out = [_wp_out_color, _wp_out_depth, _wp_out_alpha, _wp_n_contrib,
+            _wp_gs_per_pixel, _wp_weight_per_gs_pixel, _wp_x_mu]
+    _key = (str(device), _dim, write_aux_flag, int(K))
     _cmd = _C4_LAUNCH_CACHE_FWD_RENDER_TILED256.get(_key)
     if _cmd is None:
         _cmd = wp.launch(kernel=_render_tiles_tiled256_warp_kernel, dim=_dim,
@@ -3467,7 +3587,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
         for _i, _v in enumerate(_inp + _out):
             _cmd.set_param_at_index(_i, _v)
     _cmd.launch()
-    return out_color, out_depth, out_alpha, n_contrib
+    return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
 
 def _build_binning_state(
@@ -4160,6 +4280,9 @@ def _rasterize_gaussians_backward_python(*args: Any):
             grad_proj_2D,
             grad_conic_2D,
             _grad_conic_2D_inv,
+            _dummy_gs_per_pixel,
+            _dummy_weight_per_gs_pixel,
+            _grad_x_mu,
             _sh,
             _degree,
             _campos,
@@ -4168,6 +4291,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
             _binningBuffer,
             _imgBuffer,
             _alphas,
+            _enable_flow_grad,
         ) = args
 
         point_count = means3D.shape[0]
@@ -4240,7 +4364,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
         if has_active_points:
             # Fallback: if n_contrib could not be recovered, re-render.
             if n_contrib is None:
-                _, _, _, n_contrib = _render_tiles_warp(
+                _, _, _, _, _, _, n_contrib = _render_tiles_warp(
                         preprocess_outputs,
                         binning_state,
                         feature_ptr,
@@ -4267,9 +4391,33 @@ def _rasterize_gaussians_backward_python(*args: Any):
             render_grad_conic_opacity = torch.zeros((point_count, 4), dtype=torch.float32, device=device)
             render_grad_feature = torch.zeros((point_count, NUM_CHANNELS), dtype=torch.float32, device=device)
 
-
-        grad_proj_2d_active = grad_proj_2D
-        grad_conic_2d_active = grad_conic_2D
+        if _enable_flow_grad:
+                    grad_proj_2d_active = torch.empty((point_count, 2), dtype=torch.float32, device=device)
+                    grad_conic_2d_active = torch.empty((point_count, 3), dtype=torch.float32, device=device)
+                    # C4: cache wp.from_torch + Launch object
+                    _fg_inp = [
+                        wp.from_torch(grad_proj_2D.contiguous(), dtype=wp.vec2),
+                        wp.from_torch(render_grad_points.contiguous(), dtype=wp.vec2),
+                        wp.from_torch(grad_conic_2D.contiguous(), dtype=wp.vec3),
+                        wp.from_torch(render_grad_conic_opacity.contiguous(), dtype=wp.vec4),
+                    ]
+                    _fg_out = [
+                        wp.from_torch(grad_proj_2d_active, dtype=wp.vec2),
+                        wp.from_torch(grad_conic_2d_active, dtype=wp.vec3),
+                    ]
+                    _fg_key = (str(device), point_count)
+                    _fg_cmd = _C4_LAUNCH_CACHE_FLOW_GRAD.get(_fg_key)
+                    if _fg_cmd is None:
+                        _fg_cmd = wp.launch(kernel=_fused_flow_grad_prep_warp_kernel, dim=point_count,
+                                            inputs=_fg_inp, outputs=_fg_out, device=str(device), record_cmd=True)
+                        _C4_LAUNCH_CACHE_FLOW_GRAD[_fg_key] = _fg_cmd
+                    else:
+                        for _i, _v in enumerate(_fg_inp + _fg_out):
+                            _fg_cmd.set_param_at_index(_i, _v)
+                    _fg_cmd.launch()
+        else:
+                    grad_proj_2d_active = grad_proj_2D
+                    grad_conic_2d_active = grad_conic_2D
 
         focal_x = image_width / (2.0 * _tan_fovx)
         focal_y = image_height / (2.0 * _tan_fovy)
@@ -4495,7 +4643,7 @@ def rasterize_gaussians(*args: Any):
             feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs.rgb
 
         binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
-        out_color, out_depth, out_alpha, _n_contrib = _render_tiles_warp(
+        out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, _n_contrib = _render_tiles_warp(
                 preprocess_outputs,
                 binning_state,
                 feature_ptr,
@@ -4517,6 +4665,9 @@ def rasterize_gaussians(*args: Any):
             preprocess_outputs.proj_2d,
             preprocess_outputs.conic_2d,
             preprocess_outputs.conic_2d_inv,
+            gs_per_pixel,
+            weight_per_gs_pixel,
+            x_mu,
         )
 
 

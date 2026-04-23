@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gswarp"
 dynamic = ["version"]
 description = "Pure-Python NVIDIA Warp backend for 3D Gaussian Splatting"
-readme = "README.md"
+readme = "README_pypi.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]

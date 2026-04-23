@@ -94,16 +94,77 @@ from gswarp import (
 )
 ```
 
-`GaussianRasterizationSettings` is a `NamedTuple` with the same fields as the original (Warp-specific fields have defaults). `GaussianRasterizer.forward()` returns **additional outputs** compared to the original:
+`GaussianRasterizationSettings` is a `NamedTuple` with the same fields as the original (Warp-specific fields have defaults). `GaussianRasterizer.forward()` **returns a three-element tuple `(color, radii, meta)`**, where `meta` is a `RasterizerMeta` NamedTuple carrying five auxiliary outputs:
+
+| `meta` field | Meaning |
+|--------------|---------|
+| `meta.depth` | Per-pixel accumulated depth |
+| `meta.alpha` | Per-pixel accumulated opacity |
+| `meta.proj_2D` | 2D projected positions of each Gaussian |
+| `meta.conic_2D` | Conic representation of the 2D covariance |
+| `meta.conic_2D_inv` | Inverse of the 2D conic |
 
 ```python
-# Original CUDA:
+# Original CUDA (two outputs only):
 color, radii = rasterizer(means3D=..., means2D=..., ...)
 
-# gswarp:
+# gswarp (three-element tuple):
+color, radii, meta = rasterizer(means3D=..., means2D=..., ...)
+
+# Accessing meta fields:
+depth        = meta.depth          # (1, H, W)
+alpha        = meta.alpha          # (1, H, W)
+proj_2D      = meta.proj_2D        # (N, 2)
+conic_2D     = meta.conic_2D       # (N, 3)
+conic_2D_inv = meta.conic_2D_inv   # (N, 3)
+
+# If you only need color and radii, discard meta:
+color, radii, _ = rasterizer(means3D=..., means2D=..., ...)
+```
+
+### Flow Backend (optional)
+
+For optical-flow pipelines that need per-pixel top-K contributor information, use the dedicated flow backend `gswarp.rasterizer_flow` instead.
+
+**Key differences from the standard backend:**
+
+**1. `GaussianRasterizationSettings` adds two flow-specific fields**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable_flow_grad` | `bool` | `True` | Enable flow gradient computation (absent in the standard backend) |
+| `compute_flow_aux` | `bool \| None` | `None` (runtime default: `True`) | Whether to fill the top-K auxiliary outputs |
+
+**2. `forward()` returns a flat 10-tuple — no `meta`**
+
+```python
+from gswarp.rasterizer_flow import GaussianRasterizationSettings, GaussianRasterizer
+
+raster_settings = GaussianRasterizationSettings(
+    ...,                    # same shared fields as the standard backend
+    enable_flow_grad=True,  # default True
+    compute_flow_aux=True,  # default None (runtime True)
+)
+
 color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, \
     gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer(...)
-# Extra outputs can be ignored when only color and radii are needed
+```
+
+Shapes and dtypes of the three auxiliary outputs:
+
+| Output | Shape | dtype | Meaning |
+|--------|-------|-------|---------|
+| `gs_per_pixel` | `(K, H, W)` | `int32` | Index of the top-K contributing Gaussian per pixel (`-1` for unfilled slots) |
+| `weight_per_gs_pixel` | `(K, H, W)` | `float32` | Alpha-compositing weight of each contributing Gaussian |
+| `x_mu` | `(2, K, H, W)` | `float32` | Offset `(dx, dy)` from each Gaussian's projected center to the pixel center |
+
+`K` defaults to `20` and can be changed at runtime:
+
+```python
+from gswarp.rasterizer_flow import set_flow_topk, set_compute_flow_aux
+
+set_flow_topk(32)            # change K (clear launch cache; call before first render)
+set_compute_flow_aux(False)  # temporarily disable aux outputs to save VRAM
 ```
 
 **Optional runtime configuration** (call once before the training loop):

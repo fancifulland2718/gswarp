@@ -94,16 +94,77 @@ from gswarp import (
 )
 ```
 
-`GaussianRasterizationSettings` 是 `NamedTuple`，字段与原版完全一致（额外的 Warp 专有字段均有默认值）。`GaussianRasterizer.forward()` 的返回值比原版**多额外输出**：
+`GaussianRasterizationSettings` 是 `NamedTuple`，字段与原版完全一致（额外的 Warp 专有字段均有默认值）。`GaussianRasterizer.forward()` **返回三值元组 `(color, radii, meta)`**，其中 `meta` 是 `RasterizerMeta` NamedTuple，携带五个附加输出：
+
+| `meta` 字段 | 含义 |
+|-------------|------|
+| `meta.depth` | 每像素累积深度 |
+| `meta.alpha` | 每像素累积不透明度 |
+| `meta.proj_2D` | 各高斯在图像平面上的 2D 投影坐标 |
+| `meta.conic_2D` | 2D 协方差的 conic 表示 |
+| `meta.conic_2D_inv` | 2D conic 的逆 |
 
 ```python
-# 原版 CUDA：
+# 原版 CUDA（仅两个输出）：
 color, radii = rasterizer(means3D=..., means2D=..., ...)
 
-# gswarp：
+# gswarp（三值元组）：
+color, radii, meta = rasterizer(means3D=..., means2D=..., ...)
+
+# 使用 meta 中的附加输出：
+depth      = meta.depth        # (1, H, W)
+alpha      = meta.alpha        # (1, H, W)
+proj_2D    = meta.proj_2D      # (N, 2)
+conic_2D   = meta.conic_2D     # (N, 3)
+conic_2D_inv = meta.conic_2D_inv  # (N, 3)
+
+# 仅需 color 与 radii 时可忽略 meta：
+color, radii, _ = rasterizer(means3D=..., means2D=..., ...)
+```
+
+### 光流后端（可选）
+
+光流管线需要逐像素 Top-K 贡献信息时，请改用独立的光流后端 `gswarp.rasterizer_flow`。
+
+与非光流版本的主要差异：
+
+**1. `GaussianRasterizationSettings` 新增两个专有字段**
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enable_flow_grad` | `bool` | `True` | 启用光流梯度计算（非光流版本无此字段） |
+| `compute_flow_aux` | `bool \| None` | `None`（运行时默认 `True`） | 控制是否填充 Top-K 辅助输出 |
+
+**2. `forward()` 返回完整的 10 元组，不再使用 `meta`**
+
+```python
+from gswarp.rasterizer_flow import GaussianRasterizationSettings, GaussianRasterizer
+
+raster_settings = GaussianRasterizationSettings(
+    ...,                    # 与非光流版本相同的公共字段
+    enable_flow_grad=True,  # 默认 True
+    compute_flow_aux=True,  # 默认 None（运行时 True）
+)
+
 color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, \
     gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer(...)
-# 仅使用 color 和 radii 时可以忽略其余输出
+```
+
+三个辅助输出的形状与含义：
+
+| 输出名称 | 形状 | dtype | 含义 |
+|----------|------|-------|------|
+| `gs_per_pixel` | `(K, H, W)` | `int32` | 每像素 Top-K 贡献高斯的索引（未填满槽位置为 `-1`） |
+| `weight_per_gs_pixel` | `(K, H, W)` | `float32` | 对应高斯的混合权重 |
+| `x_mu` | `(2, K, H, W)` | `float32` | 对应高斯投影中心到像素中心的偏移 `(dx, dy)` |
+
+其中 `K` 默认为 `20`，可通过运行时 API 调整：
+
+```python
+from gswarp.rasterizer_flow import set_flow_topk, set_compute_flow_aux
+
+set_flow_topk(32)            # 修改 K（需在首次渲染前调用，改变 K 会清空 Warp 内核启动缓存）
+set_compute_flow_aux(False)  # 临时禁用辅助输出以节省显存
 ```
 
 **可选的运行时配置**（在训练循环开始前调用一次）：

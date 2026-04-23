@@ -1,23 +1,10 @@
-﻿from typing import NamedTuple
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
-from . import _rasterizer as _warp_backend
+from . import _rasterizer_flow as _warp_backend
 from ._stream import ensure_aligned
-
-
-class RasterizerMeta(NamedTuple):
-    """Auxiliary outputs from the (non-flow) rasterizer forward pass.
-
-    All tensors are on the same device as ``means3D``.
-    """
-
-    depth: torch.Tensor          # (1, H, W)
-    alpha: torch.Tensor          # (1, H, W)
-    proj_2D: torch.Tensor        # (N, 2)
-    conic_2D: torch.Tensor       # (N, 3)
-    conic_2D_inv: torch.Tensor   # (N, 3)
 
 
 def rasterize_gaussians(
@@ -31,7 +18,7 @@ def rasterize_gaussians(
     cov3Ds_precomp,
     raster_settings,
 ):
-    outputs = _WarpRasterizeGaussians.apply(
+    return _WarpRasterizeGaussians.apply(
         means3D,
         means2D,
         sh,
@@ -42,15 +29,6 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         raster_settings,
     )
-    color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv = outputs
-    meta = RasterizerMeta(
-        depth=depth,
-        alpha=alpha,
-        proj_2D=proj_2D,
-        conic_2D=conic_2D,
-        conic_2D_inv=conic_2D_inv,
-    )
-    return color, radii, meta
 
 
 def get_backward_mode():
@@ -93,6 +71,22 @@ def set_compute_depth(enabled):
     _warp_backend.set_compute_depth(enabled)
 
 
+def get_compute_flow_aux():
+    return _warp_backend.get_compute_flow_aux()
+
+
+def set_compute_flow_aux(enabled):
+    _warp_backend.set_compute_flow_aux(enabled)
+
+
+def get_flow_topk():
+    return _warp_backend.get_flow_topk()
+
+
+def set_flow_topk(k):
+    _warp_backend.set_flow_topk(k)
+
+
 def clear_warp_caches():
     """Release all grow-only Warp buffer caches.
 
@@ -107,9 +101,11 @@ def _run_with_experimental_settings(raster_settings, fn):
     ensure_aligned()
     previous_backward_mode = _warp_backend.get_backward_mode()
     previous_binning_sort_mode = _warp_backend.get_binning_sort_mode()
+    previous_compute_flow_aux = _warp_backend.get_compute_flow_aux()
     previous_auto_tuning = None
     backward_mode = getattr(raster_settings, "backward_mode", None)
     binning_sort_mode = getattr(raster_settings, "binning_sort_mode", None)
+    compute_flow_aux = getattr(raster_settings, "compute_flow_aux", None)
     auto_tune = getattr(raster_settings, "auto_tune", True)
     auto_tune_verbose = getattr(raster_settings, "auto_tune_verbose", True)
 
@@ -125,6 +121,10 @@ def _run_with_experimental_settings(raster_settings, fn):
             if binning_sort_mode != previous_binning_sort_mode:
                 _warp_backend.set_binning_sort_mode(binning_sort_mode)
 
+        if compute_flow_aux is not None:
+            if bool(compute_flow_aux) != previous_compute_flow_aux:
+                _warp_backend.set_compute_flow_aux(bool(compute_flow_aux))
+
         return fn()
     finally:
         if previous_auto_tuning is not None:
@@ -134,6 +134,8 @@ def _run_with_experimental_settings(raster_settings, fn):
                     enabled=previous_auto_tuning["enabled"],
                     verbose=previous_auto_tuning["verbose"],
                 )
+        if _warp_backend.get_compute_flow_aux() != previous_compute_flow_aux:
+            _warp_backend.set_compute_flow_aux(previous_compute_flow_aux)
         if _warp_backend.get_binning_sort_mode() != previous_binning_sort_mode:
             _warp_backend.set_binning_sort_mode(previous_binning_sort_mode)
         if _warp_backend.get_backward_mode() != previous_backward_mode:
@@ -189,6 +191,9 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             proj_2D,
             conic_2D,
             conic_2D_inv,
+            gs_per_pixel,
+            weight_per_gs_pixel,
+            x_mu,
         ) = outputs
 
         ctx.raster_settings = raster_settings
@@ -207,7 +212,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             imgBuffer,
             alpha,
         )
-        return color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv
+        return color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu
 
     @staticmethod
     def backward(
@@ -219,6 +224,9 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
         grad_proj_2D,
         grad_conic_2D,
         grad_conic_2D_inv,
+        dummy_gs_per_pixel,
+        dummy_weight_per_gs_pixel,
+        grad_x_mu,
     ):
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
@@ -244,6 +252,9 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             grad_proj_2D,
             grad_conic_2D,
             grad_conic_2D_inv,
+            dummy_gs_per_pixel,
+            dummy_weight_per_gs_pixel,
+            grad_x_mu,
             sh,
             raster_settings.sh_degree,
             raster_settings.campos,
@@ -252,6 +263,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             binningBuffer,
             imgBuffer,
             alpha,
+            raster_settings.enable_flow_grad,
         )
 
         grads = _run_with_experimental_settings(raster_settings, lambda: _warp_backend.rasterize_gaussians_backward(*args))
@@ -294,6 +306,8 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered: bool
     debug: bool = False
     antialiasing: bool = False
+    enable_flow_grad: bool = True
+    compute_flow_aux: bool | None = None
     backward_mode: str | None = None
     binning_sort_mode: str | None = None
     auto_tune: bool = True
@@ -373,7 +387,6 @@ __all__ = [
     # Core rasterizer types
     "GaussianRasterizationSettings",
     "GaussianRasterizer",
-    "RasterizerMeta",
     # Core functions
     "rasterize_gaussians",
     # Setup & memory management
@@ -387,4 +400,8 @@ __all__ = [
     "set_compute_depth",
     "get_binning_sort_mode",
     "set_binning_sort_mode",
+    "get_compute_flow_aux",
+    "set_compute_flow_aux",
+    "get_flow_topk",
+    "set_flow_topk",
 ]
