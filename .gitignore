@@ -53,3 +53,5 @@ coverage.xml
 # mypy / type checkers
 .mypy_cache/
 .pytype/
+
+docs/plans
