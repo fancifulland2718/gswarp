@@ -77,8 +77,20 @@ This is memory-saturated. Investigate vertical-pass intermediate traffic only
 if Warp can express safe on-chip reuse; block-size tuning alone is unlikely to
 help.
 
+### PERF-005: Transfers and KNN Attribution (P2, Measure First)
+
+- Nsight Systems observed 616 H2D copies totaling 81.7 MB over warm-up plus
+  five iterations. One-time setup is present, so this is not proof of a steady
+  state regression.
+- `_box_mean_dist_kernel` consumed 5.651 ms once. KNN is initialization and
+  densification work, not a steady per-iteration hotspot.
+
+Add an NVTX or CUDA-profiler capture range around warmed-up iterations before
+attributing H2D copies or changing KNN.
+
 ## Guardrails
 
 - Keep generated wheels, logs, Nsight reports, and helper scripts out of Git.
 - Rebuild a clean isolated package before every comparison and record Git SHA,
   wheel SHA-256, import path, and backend choices in benchmark metadata.
+- Every optimization must rerun the full 50k numerical/performance gate.
