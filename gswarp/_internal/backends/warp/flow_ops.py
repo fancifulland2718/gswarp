@@ -63,7 +63,7 @@ def _make_empty_forward_outputs(means3D, background, image_height, image_width):
     proj_2d = _allocate_scalar_tensor((point_count, 2), torch.float32, means3D.device, fill_value=0.0)
     conic_2d = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
     conic_2d_inv = _allocate_scalar_tensor((point_count, 3), torch.float32, means3D.device, fill_value=0.0)
-    if _COMPUTE_FLOW_AUX:
+    if _runtime.get_active_compute_flow_aux(_COMPUTE_FLOW_AUX):
         K = _FLOW_TOPK
         gs_per_pixel = torch.full(
             (K, image_height, image_width), -1, dtype=torch.int32, device=means3D.device
@@ -110,7 +110,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     background = _prep(background.to(dtype=torch.float32, device=device))
 
     # Flow auxiliary outputs: top-K successful contributors per pixel.
-    write_aux_flag = 1 if _COMPUTE_FLOW_AUX else 0
+    write_aux_flag = 1 if _runtime.get_active_compute_flow_aux(_COMPUTE_FLOW_AUX) else 0
     if write_aux_flag != 0:
         K = _FLOW_TOPK
         gs_per_pixel = torch.full((K, image_height, image_width), -1, dtype=torch.int32, device=device)
@@ -162,7 +162,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     _wp_gs_per_pixel = wp.from_torch(_gs_per_pixel_flat, dtype=wp.int32)
     _wp_weight_per_gs_pixel = wp.from_torch(_weight_per_gs_pixel_flat, dtype=wp.float32)
     _wp_x_mu = wp.from_torch(_x_mu_flat, dtype=wp.float32)
-    _compute_depth_flag = int(1 if _runtime._COMPUTE_DEPTH else 0)
+    _compute_depth_flag = int(1 if _runtime.get_active_compute_depth() else 0)
     # T1: Tiled-256 cooperative forward render
     _grid_x_fwd = int(binning_state.grid_x)
     _grid_y_fwd = (image_height + BLOCK_Y - 1) // BLOCK_Y

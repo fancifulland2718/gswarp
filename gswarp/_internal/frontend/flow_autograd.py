@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from gswarp._internal.api.runtime_context import run_with_runtime_overrides
+from gswarp._internal.api.runtime_context import resolve_execution_options, run_with_runtime_overrides
 
 
 def rasterize_gaussians(
@@ -69,11 +69,13 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
         )
 
+        execution_options = resolve_execution_options(backend, raster_settings, flow=True)
         outputs = run_with_runtime_overrides(
             backend,
             raster_settings,
             lambda: backend.rasterize_gaussians(*args),
             flow=True,
+            options=execution_options,
         )
 
         (
@@ -95,6 +97,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
 
         ctx.backend = backend
         ctx.raster_settings = raster_settings
+        ctx.execution_options = execution_options
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(
             colors_precomp,
@@ -183,6 +186,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             raster_settings,
             lambda: backend.rasterize_gaussians_backward(*args),
             flow=True,
+            options=ctx.execution_options,
         )
 
         (

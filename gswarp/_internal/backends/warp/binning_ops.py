@@ -41,7 +41,7 @@ def _build_binning_state(
 
         requested_sort_mode = sort_mode
         if sort_mode is None:
-            sort_mode, _ = _select_auto_binning_sort_mode(device, point_count)
+            sort_mode = _runtime.get_active_binning_sort_mode()
 
         if sort_mode not in BINNING_SORT_MODES:
             raise ValueError("sort_mode must be one of 'torch', 'warp_radix', or 'warp_depth_stable_tile'")

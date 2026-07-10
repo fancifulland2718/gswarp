@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -30,6 +33,56 @@ _RUNTIME_BINNING_POLICY_STATE: dict[str, dict[str, Any]] = {}
 _AUTO_TUNE_ENABLED = True
 _AUTO_TUNE_VERBOSE = True
 _WARP_INITIALIZED = False
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionOptions:
+    """Immutable runtime choices owned by one frontend invocation."""
+
+    backward_mode: str
+    binning_sort_mode: str
+    compute_depth: bool
+    auto_tune: bool
+    auto_tune_verbose: bool
+    compute_flow_aux: bool | None = None
+
+
+_ACTIVE_EXECUTION_OPTIONS: ContextVar[ExecutionOptions | None] = ContextVar(
+    "gswarp_active_execution_options", default=None
+)
+
+
+@contextmanager
+def execution_options(options: ExecutionOptions):
+    token = _ACTIVE_EXECUTION_OPTIONS.set(options)
+    try:
+        yield options
+    finally:
+        _ACTIVE_EXECUTION_OPTIONS.reset(token)
+
+
+def get_active_compute_depth() -> bool:
+    options = _ACTIVE_EXECUTION_OPTIONS.get()
+    return _COMPUTE_DEPTH if options is None else options.compute_depth
+
+
+def get_active_binning_sort_mode() -> str:
+    options = _ACTIVE_EXECUTION_OPTIONS.get()
+    return _BINNING_SORT_MODE if options is None else options.binning_sort_mode
+
+
+def get_active_auto_tuning_config() -> tuple[bool, bool]:
+    options = _ACTIVE_EXECUTION_OPTIONS.get()
+    if options is None:
+        return _AUTO_TUNE_ENABLED, _AUTO_TUNE_VERBOSE
+    return options.auto_tune, options.auto_tune_verbose
+
+
+def get_active_compute_flow_aux(default: bool) -> bool:
+    options = _ACTIVE_EXECUTION_OPTIONS.get()
+    if options is None or options.compute_flow_aux is None:
+        return default
+    return options.compute_flow_aux
 
 _ANSI_RESET = "\033[0m"
 _ANSI_HEADER = "\033[96m"
@@ -406,8 +459,9 @@ def _require_warp() -> None:
         return
     if wp is None:
         raise ImportError("warp-lang is required for the Warp backend.")
-    if _AUTO_TUNE_ENABLED:
-        initialize_runtime_tuning(verbose=_AUTO_TUNE_VERBOSE)
+    auto_tune, auto_tune_verbose = get_active_auto_tuning_config()
+    if auto_tune:
+        initialize_runtime_tuning(verbose=auto_tune_verbose)
     else:
         wp.init()
     _WARP_INITIALIZED = True
@@ -426,4 +480,10 @@ __all__ = [
     "set_backward_mode",
     "get_binning_sort_mode",
     "set_binning_sort_mode",
+    "ExecutionOptions",
+    "execution_options",
+    "get_active_compute_depth",
+    "get_active_binning_sort_mode",
+    "get_active_auto_tuning_config",
+    "get_active_compute_flow_aux",
 ]

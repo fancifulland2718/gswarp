@@ -46,7 +46,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     _wp_out_depth = wp.from_torch(out_depth.reshape(-1), dtype=wp.float32)
     _wp_out_alpha = wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32)
     _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
-    _compute_depth_flag = int(1 if _runtime._COMPUTE_DEPTH else 0)
+    _compute_depth_flag = int(1 if _runtime.get_active_compute_depth() else 0)
     # T1: Tiled-256 cooperative forward render
     _grid_x_fwd = int(binning_state.grid_x)
     _grid_y_fwd = (image_height + BLOCK_Y - 1) // BLOCK_Y

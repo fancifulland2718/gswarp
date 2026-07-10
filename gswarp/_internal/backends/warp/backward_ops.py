@@ -189,7 +189,7 @@ def _backward_render_tiles_warp(
     _wp_grad_d = wp.from_torch(grad_depths, dtype=wp.float32)
     _wp_grad_co = wp.from_torch(grad_conic_opacity, dtype=wp.vec4)
     _wp_grad_f = wp.from_torch(grad_feature, dtype=wp.vec3)
-    _compute_depth_flag = int(1 if _runtime._COMPUTE_DEPTH else 0)
+    _compute_depth_flag = int(1 if _runtime.get_active_compute_depth() else 0)
 
     _dim = _num_tiles * (BLOCK_X * BLOCK_Y)
     # W1: warp32 backward 鈥?warp-level tile_reduce gives 32脳 fewer atomicAdd
