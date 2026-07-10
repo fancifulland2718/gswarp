@@ -8,8 +8,7 @@ dynamic = ["version"]
 description = "Pure-Python NVIDIA Warp backend for 3D Gaussian Splatting"
 readme = "README_pypi.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license = { text = "Apache-2.0" }
 authors = [
   { name = "GSWarp contributors" }
 ]
