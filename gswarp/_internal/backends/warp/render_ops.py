@@ -5,11 +5,11 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import *
+from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from . import runtime as _runtime
-from .memory import *
-from .packing import *
-from .render_kernels import *
+from .memory import _C4_LAUNCH_CACHE_FWD_RENDER_TILED256
+from .packing import _prep
+from .render_kernels import _render_tiles_tiled256_warp_kernel
 
 def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, background, image_height, image_width):
     device = feature_ptr.device

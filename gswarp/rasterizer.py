@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from gswarp._stream import ensure_aligned
-from gswarp._internal.api.outputs import pack_standard_outputs
 from gswarp._internal.api.validation import normalize_gaussian_inputs, validate_rasterizer_inputs
 from gswarp._internal.frontend import common, standard_autograd
 from gswarp.methods.baseline_3dgs import METHOD
@@ -22,6 +21,10 @@ class RasterizerMeta(NamedTuple):
 
 def _backend():
     return common.backend_for(METHOD)
+
+
+def _plan():
+    return common.plan_for(METHOD)
 
 
 def rasterize_gaussians(
@@ -47,8 +50,9 @@ def rasterize_gaussians(
         raster_settings,
     )
     ensure_aligned(means3D.device)
+    plan = _plan()
     outputs = standard_autograd.rasterize_gaussians(
-        _backend(),
+        plan,
         means3D,
         means2D,
         sh,
@@ -59,7 +63,7 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         raster_settings,
     )
-    return pack_standard_outputs(outputs, RasterizerMeta)
+    return common.adapt_outputs(plan, outputs, RasterizerMeta)
 
 
 def get_backward_mode():
@@ -139,7 +143,7 @@ class GaussianRasterizer(nn.Module):
 
     def markVisible(self, positions):
         with torch.no_grad():
-            return common.mark_visible(_backend(), positions, self.raster_settings)
+            return common.mark_visible(_plan(), positions, self.raster_settings)
 
     def forward(
         self,

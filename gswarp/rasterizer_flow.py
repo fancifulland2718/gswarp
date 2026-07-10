@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from gswarp._stream import ensure_aligned
-from gswarp._internal.api.outputs import pack_flow_outputs
 from gswarp._internal.api.validation import normalize_gaussian_inputs, validate_rasterizer_inputs
 from gswarp._internal.frontend import common, flow_autograd
 from gswarp.methods.flow_aux import METHOD
@@ -12,6 +11,10 @@ from gswarp.methods.flow_aux import METHOD
 
 def _backend():
     return common.backend_for(METHOD)
+
+
+def _plan():
+    return common.plan_for(METHOD)
 
 
 def rasterize_gaussians(
@@ -37,8 +40,9 @@ def rasterize_gaussians(
         raster_settings,
     )
     ensure_aligned(means3D.device)
+    plan = _plan()
     outputs = flow_autograd.rasterize_gaussians(
-        _backend(),
+        plan,
         means3D,
         means2D,
         sh,
@@ -49,7 +53,7 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         raster_settings,
     )
-    return pack_flow_outputs(outputs)
+    return common.adapt_outputs(plan, outputs)
 
 
 def get_backward_mode():
@@ -147,7 +151,7 @@ class GaussianRasterizer(nn.Module):
 
     def markVisible(self, positions):
         with torch.no_grad():
-            return common.mark_visible(_backend(), positions, self.raster_settings)
+            return common.mark_visible(_plan(), positions, self.raster_settings)
 
     def forward(
         self,

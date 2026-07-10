@@ -28,6 +28,8 @@ from .render_ops import _render_tiles_warp
 from .backward_ops import rasterize_gaussians_backward, rasterize_gaussians_backward_typed
 from .state import ForwardResult, ForwardState
 
+BACKEND_CAPABILITIES = frozenset({"stable_warp", "typed_forward", "typed_backward", "mark_visible"})
+
 
 def clear_warp_caches() -> None:
     clear_common_warp_caches()

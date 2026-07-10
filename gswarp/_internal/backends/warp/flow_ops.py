@@ -16,11 +16,16 @@ from ...._tuning import (
     FAMILY_WARP_SPECIALIZED,
 )
 
-from .constants import *
-from .state import *
+from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from . import runtime as _runtime
-from .memory import *
-from .packing import *
+from .memory import (
+    _C4_LAUNCH_CACHE_ACCUM,
+    _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS,
+    _C4_LAUNCH_CACHE_FLOW_GRAD,
+    _C4_LAUNCH_CACHE_FWD_RENDER_TILED256,
+    _allocate_scalar_tensor,
+)
+from .packing import _prep, _unpack_forward_aux_buffers
 from .preprocess_ops import _compute_cov3d_from_scale_rotation_warp, _compute_rgb_from_sh_warp, preprocess_gaussians
 from .binning_ops import _build_binning_state
 from .backward_ops import (
@@ -30,8 +35,8 @@ from .backward_ops import (
     _backward_cov2d_warp,
     _backward_cov3d_from_scale_rotation_warp,
 )
-from .backward_kernels import *
-from .flow_kernels import *
+from .backward_kernels import _fused_backward_accumulate_warp_kernel, _fused_backward_preprocess_accumulate_warp_kernel
+from .flow_kernels import _fused_flow_grad_prep_warp_kernel, _render_tiles_tiled256_warp_kernel
 
 _COMPUTE_FLOW_AUX = __import__("os").environ.get("GSWARP_COMPUTE_FLOW_AUX", "1") != "0"
 _FLOW_TOPK = int(__import__("os").environ.get("GSWARP_FLOW_TOPK", "20"))

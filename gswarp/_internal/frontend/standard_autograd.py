@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from gswarp._internal.api.runtime_context import resolve_execution_options, run_with_runtime_overrides
+from gswarp._internal.frontend import common
 
 
 def rasterize_gaussians(
-    backend,
+    plan,
     means3D,
     means2D,
     sh,
@@ -20,7 +20,7 @@ def rasterize_gaussians(
     raster_settings,
 ):
     return _WarpRasterizeGaussians.apply(
-        backend,
+        plan,
         means3D,
         means2D,
         sh,
@@ -37,7 +37,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        backend,
+        plan,
         means3D,
         means2D,
         sh,
@@ -69,15 +69,9 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             raster_settings.prefiltered,
         )
 
-        execution_options = resolve_execution_options(backend, raster_settings)
-        result = run_with_runtime_overrides(
-            backend,
-            raster_settings,
-            lambda: backend.rasterize_gaussians_typed(*args),
-            options=execution_options,
-        )
+        result, execution_options = common.run_typed_forward(plan, raster_settings, args)
 
-        ctx.backend = backend
+        ctx.plan = plan
         ctx.raster_settings = raster_settings
         ctx.execution_options = execution_options
         ctx.num_rendered = result.num_rendered
@@ -114,7 +108,7 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
         grad_conic_2D,
         grad_conic_2D_inv,
     ):
-        backend = ctx.backend
+        plan = ctx.plan
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
         (
@@ -162,11 +156,8 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
         )
 
         try:
-            grads = run_with_runtime_overrides(
-                backend,
-                raster_settings,
-                lambda: backend.rasterize_gaussians_backward_typed(*args, forward_state=ctx.forward_state),
-                options=ctx.execution_options,
+            grads = common.run_typed_backward(
+                plan, raster_settings, args, ctx.execution_options, ctx.forward_state
             )
         finally:
             # Arbitrary autograd context attributes are not released by PyTorch.

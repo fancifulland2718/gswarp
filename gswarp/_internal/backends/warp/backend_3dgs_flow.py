@@ -36,6 +36,10 @@ from .flow_ops import (
 )
 from .state import ForwardResult, ForwardState
 
+BACKEND_CAPABILITIES = frozenset(
+    {"stable_warp", "typed_forward", "typed_backward", "mark_visible", "flow_aux"}
+)
+
 
 def clear_warp_caches() -> None:
     clear_common_warp_caches()

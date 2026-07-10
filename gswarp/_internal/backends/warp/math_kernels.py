@@ -5,7 +5,7 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import *
+from .constants import BLOCK_X, BLOCK_Y, PREPROCESS_CULL_FOV_SCALE, PREPROCESS_CULL_SIGMA
 
 
 if wp is not None:

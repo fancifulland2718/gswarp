@@ -5,7 +5,7 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import *
+from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 
 if wp is not None:
     _BLOCK_PIXELS_C = wp.constant(BLOCK_X * BLOCK_Y)

@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from gswarp.methods.baseline_3dgs import METHOD as BASELINE_3DGS
 from gswarp.methods.flow_aux import METHOD as FLOW_AUX
+from gswarp._internal.methods.spec import MethodSpec
 
-METHODS = {
+METHODS = MappingProxyType({
     "baseline_3dgs": BASELINE_3DGS,
     "flow_aux": FLOW_AUX,
-}
+})
 
-__all__ = ["BASELINE_3DGS", "FLOW_AUX", "METHODS"]
+
+def get_method(method: str | MethodSpec) -> MethodSpec:
+    """Return the canonical explicitly registered method specification."""
+    if isinstance(method, MethodSpec):
+        registered = METHODS.get(method.name)
+        if registered != method:
+            raise ValueError(f"Method {method.name!r} is not registered with this specification")
+        return registered
+    try:
+        return METHODS[method]
+    except KeyError as exc:
+        raise ValueError(f"Unknown gswarp method: {method!r}") from exc
+
+__all__ = ["BASELINE_3DGS", "FLOW_AUX", "METHODS", "get_method"]

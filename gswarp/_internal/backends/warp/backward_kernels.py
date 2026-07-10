@@ -5,8 +5,27 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import *
-from .math_kernels import *
+from .constants import (
+    BLOCK_X,
+    BLOCK_Y,
+    NUM_CHANNELS,
+    ONE_MINUS_ALPHA_MIN,
+    sh_c0,
+    sh_c1,
+    sh_c2_0,
+    sh_c2_1,
+    sh_c2_2,
+    sh_c2_3,
+    sh_c2_4,
+    sh_c3_0,
+    sh_c3_1,
+    sh_c3_2,
+    sh_c3_3,
+    sh_c3_4,
+    sh_c3_5,
+    sh_c3_6,
+)
+from .math_kernels import _compute_alpha, _compute_power, _conic_denom2inv_wp, _dnormvdv_wp
 
 
 if wp is not None:

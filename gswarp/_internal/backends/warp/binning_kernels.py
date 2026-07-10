@@ -5,8 +5,8 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import *
-from .math_kernels import *
+from .constants import BLOCK_X, BLOCK_Y
+from .math_kernels import _accutile_row_x_range_wp, _compute_tile_rect_snugbox_cov2d_wp
 
 
 if wp is not None:
