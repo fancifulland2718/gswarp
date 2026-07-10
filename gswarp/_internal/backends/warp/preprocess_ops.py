@@ -29,9 +29,10 @@ def reset_preprocess_tracking() -> None:
     global _PREV_POINT_COUNT
     _PREV_POINT_COUNT = None
 
-def _make_empty_forward_outputs(means3D, image_height, image_width):
+def _make_empty_forward_outputs(means3D, background, image_height, image_width):
     point_count = means3D.shape[0]
-    out_color = _allocate_scalar_tensor((NUM_CHANNELS, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
+    background = background.to(device=means3D.device, dtype=torch.float32).reshape(NUM_CHANNELS, 1, 1)
+    out_color = background.expand(NUM_CHANNELS, image_height, image_width).clone()
     out_depth = _allocate_scalar_tensor((1, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
     out_alpha = _allocate_scalar_tensor((1, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
     radii = _allocate_scalar_tensor((point_count,), torch.int32, means3D.device, fill_value=0)

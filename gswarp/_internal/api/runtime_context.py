@@ -10,7 +10,7 @@ from gswarp._stream import ensure_aligned
 @contextmanager
 def runtime_overrides(backend, raster_settings, *, flow: bool = False):
     """Temporarily apply per-settings backend runtime overrides."""
-    ensure_aligned()
+    ensure_aligned(raster_settings.bg.device)
 
     previous_backward_mode = backend.get_backward_mode()
     previous_binning_sort_mode = backend.get_binning_sort_mode()

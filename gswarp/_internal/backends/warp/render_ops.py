@@ -18,9 +18,10 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     out_depth = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     out_alpha = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     n_contrib = torch.empty((total_pixels,), dtype=torch.int32, device=device)
+    background = _prep(background.to(dtype=torch.float32, device=device))
 
     if binning_state.num_rendered == 0:
-        out_color.zero_()
+        out_color.copy_(background.reshape(NUM_CHANNELS, 1, 1).expand_as(out_color))
         out_depth.zero_()
         out_alpha.zero_()
         n_contrib.zero_()
@@ -31,7 +32,6 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     conic_opacity = preprocess_outputs.conic_opacity
     depths = preprocess_outputs.depths
     feature_ptr = _prep(feature_ptr)
-    background = _prep(background.to(dtype=torch.float32, device=device))
     ranges = binning_state.ranges.reshape(-1)
     point_list = binning_state.point_list
 

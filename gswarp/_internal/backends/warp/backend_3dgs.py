@@ -60,7 +60,7 @@ def rasterize_gaussians(*args: Any):
             raise ValueError("means3D must have dimensions (num_points, 3)")
 
         if means3D.shape[0] == 0:
-            return _make_empty_forward_outputs(means3D, image_height, image_width)
+            return _make_empty_forward_outputs(means3D, _background, image_height, image_width)
 
         feature_ptr = None
 

@@ -48,6 +48,7 @@ if wp is not None:
         focal_y: wp.float32,
         grad_conic_opacity: wp.array(dtype=wp.vec4),
         grad_conic_2d_flat: wp.array(dtype=wp.float32),
+        grad_conic_2d_inv_flat: wp.array(dtype=wp.float32),
         scales: wp.array(dtype=wp.vec3),
         rotations: wp.array(dtype=wp.vec4),
         scale_modifier: wp.float32,
@@ -165,6 +166,9 @@ if wp is not None:
             dL_da = denom2inv * (-cc * cc * total_conic0 + 2.0 * bb * cc * total_conic1 - bb * bb * total_conic2)
             dL_dc = denom2inv * (-aa * aa * total_conic2 + 2.0 * aa * bb * total_conic1 - bb * bb  * total_conic0)
             dL_db = denom2inv * 2.0 * (bb * cc * total_conic0 - (aa * cc + bb * bb) * total_conic1 + aa * bb * total_conic2)
+            dL_da = dL_da + grad_conic_2d_inv_flat[grad_conic2_base + 0]
+            dL_db = dL_db + grad_conic_2d_inv_flat[grad_conic2_base + 1]
+            dL_dc = dL_dc + grad_conic_2d_inv_flat[grad_conic2_base + 2]
 
             gc0 = t00 * t00 * dL_da + t00 * t01 * dL_db + t01 * t01 * dL_dc
             gc3 = t10 * t10 * dL_da + t10 * t11 * dL_db + t11 * t11 * dL_dc
@@ -683,6 +687,7 @@ if wp is not None:
         focal_y: wp.float32,
         grad_conic_flat: wp.array(dtype=wp.float32),
         grad_conic_2d_flat: wp.array(dtype=wp.float32),
+        grad_conic_2d_inv_flat: wp.array(dtype=wp.float32),
         grad_means_out: wp.array(dtype=wp.vec3),
         grad_cov_out_flat: wp.array(dtype=wp.float32),
     ):
@@ -761,6 +766,9 @@ if wp is not None:
         dL_da = denom2inv * (-c * c * total_conic0 + 2.0 * b * c * total_conic1 + (denom - a * c) * total_conic2)
         dL_dc = denom2inv * (-a * a * total_conic2 + 2.0 * a * b * total_conic1 + (denom - a * c) * total_conic0)
         dL_db = denom2inv * 2.0 * (b * c * total_conic0 - (denom + 2.0 * b * b) * total_conic1 + a * b * total_conic2)
+        dL_da = dL_da + grad_conic_2d_inv_flat[grad_conic2_base + 0]
+        dL_db = dL_db + grad_conic_2d_inv_flat[grad_conic2_base + 1]
+        dL_dc = dL_dc + grad_conic_2d_inv_flat[grad_conic2_base + 2]
 
         grad_cov_out_flat[base + 0] = t00 * t00 * dL_da + t00 * t01 * dL_db + t01 * t01 * dL_dc
         grad_cov_out_flat[base + 3] = t10 * t10 * dL_da + t10 * t11 * dL_db + t11 * t11 * dL_dc

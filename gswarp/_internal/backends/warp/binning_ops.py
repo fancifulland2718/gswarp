@@ -89,6 +89,10 @@ def _build_binning_state(
             num_rendered = int(point_offsets_i32[-1].item())
         else:
             num_rendered = 0
+        if num_rendered < 0:
+            raise OverflowError(
+                "binning tile-reference count overflowed signed int32; reduce Gaussian footprint or image size"
+            )
 
         if num_rendered == 0:
             return BinningState(

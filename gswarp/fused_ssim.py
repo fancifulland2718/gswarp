@@ -72,15 +72,13 @@ def _gw(i: wp.int32) -> wp.float32:
 
 
 # ---------------------------------------------------------------------------
-# C4++: Pre-recorded launch plan for fixed image shapes (training fast path)
+# Per-autograd-node training workspace.
 #
-# All workspace buffers and launch commands are allocated/recorded ONCE.
-# Subsequent calls only update the 2-3 parameters that actually change
-# (img1, img2, upstream grad), reducing set_param_at_index from ~37 to 5
-# and eliminating per-call torch.empty / wp.from_torch for intermediates.
+# A forward and its backward must own the same intermediate tensors. A global
+# plan keyed only by tensor shape lets a second forward overwrite the first
+# forward's workspace before autograd reaches it, so training plans are not
+# shared across live forward calls.
 # ---------------------------------------------------------------------------
-
-_PLAN_CACHE: dict = {}   # (dev, B, CH, H, W, padding) -> _SSIMPlan
 
 # Inference launch caches (rarely used, kept lightweight)
 _C4_FWD_H_INF: dict = {}
@@ -102,10 +100,10 @@ def _launch_cached(cache, kernel, dim, inputs, device, block_dim=256):
 
 
 class _SSIMPlan:
-    """Pre-recorded launch plan for fixed-shape SSIM training.
+    """Private training workspace and launch plan for one SSIM forward.
 
-    All workspace buffers and launch commands are allocated/recorded once.
-    Subsequent calls only update img1, img2, and upstream grad pointers.
+    The owning autograd context keeps this object alive until its backward
+    call, preventing another forward from replacing its saved intermediates.
     """
 
     def __init__(self, B, CH, H, W, C1, C2, padding, device):
@@ -735,15 +733,11 @@ class FusedSSIMMap(torch.autograd.Function):
 
         img1 = img1.contiguous()
         img2 = img2.contiguous()
+        ctx.train = train
 
         if train:
-            # --- Fast plan-based path: only update img1/img2 pointers ---
-            key = (dev, B, CH, H, W, padding)
-            plan = _PLAN_CACHE.get(key)
-            if plan is None:
-                plan = _SSIMPlan(B, CH, H, W, C1, C2, padding, device)
-                _PLAN_CACHE[key] = plan
-
+            # The workspace is intentionally private to this autograd node.
+            plan = _SSIMPlan(B, CH, H, W, C1, C2, padding, device)
             loss, w_img1, w_img2 = plan.forward(img1, img2)
 
             ctx.plan = plan
@@ -786,6 +780,8 @@ class FusedSSIMMap(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, opt_grad):
+        if not ctx.train:
+            return None, None, None, None, None, None
         plan = ctx.plan
         dL_dimg1 = plan.backward(ctx.w_img1, ctx.w_img2, opt_grad)
         return None, None, dL_dimg1, None, None, None
@@ -796,6 +792,25 @@ class FusedSSIMMap(torch.autograd.Function):
 # ---------------------------------------------------------------------------
 
 _ALLOWED_PADDING = ("same", "valid")
+
+
+def _validate_fused_ssim_inputs(img1, img2, padding, train) -> None:
+    if not isinstance(img1, torch.Tensor) or not isinstance(img2, torch.Tensor):
+        raise ValueError("img1 and img2 must be torch.Tensor instances")
+    if img1.ndim != 4 or img2.ndim != 4:
+        raise ValueError("img1 and img2 must have shape (B, C, H, W)")
+    if img1.shape != img2.shape:
+        raise ValueError(f"img1 and img2 must have the same shape, got {tuple(img1.shape)} and {tuple(img2.shape)}")
+    if not img1.is_cuda or not img2.is_cuda or img1.device != img2.device:
+        raise ValueError("img1 and img2 must be on the same CUDA device")
+    if img1.dtype != torch.float32 or img2.dtype != torch.float32:
+        raise ValueError("img1 and img2 must have dtype torch.float32")
+    if padding not in _ALLOWED_PADDING:
+        raise ValueError(f"padding must be one of {_ALLOWED_PADDING}, got {padding!r}")
+    if padding == "valid" and (img1.shape[2] < 11 or img1.shape[3] < 11):
+        raise ValueError("padding='valid' requires image height and width of at least 11")
+    if not isinstance(train, bool):
+        raise ValueError("train must be a bool")
 
 
 def fused_ssim(img1, img2, padding="same", train=True):
@@ -817,8 +832,8 @@ def fused_ssim(img1, img2, padding="same", train=True):
     torch.Tensor
         Scalar - mean SSIM across all pixels.
     """
-    ensure_aligned()
+    _validate_fused_ssim_inputs(img1, img2, padding, train)
+    ensure_aligned(img1.device)
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
-    assert padding in _ALLOWED_PADDING
     return FusedSSIMMap.apply(C1, C2, img1, img2, padding, train)

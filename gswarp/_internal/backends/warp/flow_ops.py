@@ -53,9 +53,10 @@ def set_flow_topk(k: int) -> None:
     _FLOW_TOPK = int(k)
 
 
-def _make_empty_forward_outputs(means3D, image_height, image_width):
+def _make_empty_forward_outputs(means3D, background, image_height, image_width):
     point_count = means3D.shape[0]
-    out_color = _allocate_scalar_tensor((NUM_CHANNELS, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
+    background = background.to(device=means3D.device, dtype=torch.float32).reshape(NUM_CHANNELS, 1, 1)
+    out_color = background.expand(NUM_CHANNELS, image_height, image_width).clone()
     out_depth = _allocate_scalar_tensor((1, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
     out_alpha = _allocate_scalar_tensor((1, image_height, image_width), torch.float32, means3D.device, fill_value=0.0)
     radii = _allocate_scalar_tensor((point_count,), torch.int32, means3D.device, fill_value=0)
@@ -106,6 +107,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     out_depth = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     out_alpha = torch.empty((1, image_height, image_width), dtype=torch.float32, device=device)
     n_contrib = torch.empty((total_pixels,), dtype=torch.int32, device=device)
+    background = _prep(background.to(dtype=torch.float32, device=device))
 
     # Flow auxiliary outputs: top-K successful contributors per pixel.
     write_aux_flag = 1 if _COMPUTE_FLOW_AUX else 0
@@ -121,7 +123,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
         x_mu = torch.empty((0,), dtype=torch.float32, device=device)
 
     if binning_state.num_rendered == 0:
-        out_color.zero_()
+        out_color.copy_(background.reshape(NUM_CHANNELS, 1, 1).expand_as(out_color))
         out_depth.zero_()
         out_alpha.zero_()
         n_contrib.zero_()
@@ -132,7 +134,6 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     conic_opacity = preprocess_outputs.conic_opacity
     depths = preprocess_outputs.depths
     feature_ptr = _prep(feature_ptr)
-    background = _prep(background.to(dtype=torch.float32, device=device))
     ranges = binning_state.ranges.reshape(-1)
     point_list = binning_state.point_list
 
@@ -207,7 +208,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
             grad_alpha,
             grad_proj_2D,
             grad_conic_2D,
-            _grad_conic_2D_inv,
+            grad_conic_2D_inv,
             _dummy_gs_per_pixel,
             _dummy_weight_per_gs_pixel,
             _grad_x_mu,
@@ -343,9 +344,11 @@ def _rasterize_gaussians_backward_python(*args: Any):
                         for _i, _v in enumerate(_fg_inp + _fg_out):
                             _fg_cmd.set_param_at_index(_i, _v)
                     _fg_cmd.launch()
+                    grad_conic_2d_inv_active = grad_conic_2D_inv
         else:
                     grad_proj_2d_active = grad_proj_2D
                     grad_conic_2d_active = grad_conic_2D
+                    grad_conic_2d_inv_active = grad_conic_2D_inv
 
         focal_x = image_width / (2.0 * _tan_fovx)
         focal_y = image_height / (2.0 * _tan_fovy)
@@ -385,6 +388,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 _proj_flat = _projmatrix.contiguous().reshape(-1)
                 _view_flat = _viewmatrix.contiguous().reshape(-1)
                 _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
+                _grad_conic_2d_inv_flat = grad_conic_2d_inv_active.contiguous().reshape(-1)
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
                     wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
@@ -401,6 +405,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     float(focal_y),
                     wp.from_torch(render_grad_conic_opacity, dtype=wp.vec4),
                     wp.from_torch(_grad_conic_2d_flat, dtype=wp.float32),
+                    wp.from_torch(_grad_conic_2d_inv_flat, dtype=wp.float32),
                     wp.from_torch(_scales.contiguous(), dtype=wp.vec3),
                     wp.from_torch(_rotations.contiguous(), dtype=wp.vec4),
                     float(_scale_modifier),
@@ -446,6 +451,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     focal_y,
                     render_grad_conic_opacity[:, :3],
                     grad_conic_2d_active,
+                    grad_conic_2d_inv_active,
                 )
 
                 # C3: Fused accumulation 鈥?replaces 2 torch.zeros + 3 torch.add + 1 slice-assign

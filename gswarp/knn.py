@@ -276,7 +276,8 @@ def distCUDA2(points: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         Shape ``(P,)``, dtype ``float32``, on the same device.
     """
-    ensure_aligned()
+    if not isinstance(points, torch.Tensor):
+        raise ValueError("points must be a torch.Tensor")
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Expected (P, 3) tensor, got {tuple(points.shape)}")
 
@@ -287,8 +288,17 @@ def distCUDA2(points: torch.Tensor) -> torch.Tensor:
         return torch.empty((0,), dtype=torch.float32, device=device)
     if P == 1:
         return torch.zeros((1,), dtype=torch.float32, device=device)
+    if P < 4:
+        raise ValueError("distCUDA2 requires at least 4 points to compute 3 nearest neighbours")
+    if not points.is_cuda:
+        raise ValueError("points must be on a CUDA device")
+    if points.dtype != torch.float32:
+        raise ValueError(f"points must have dtype torch.float32, got {points.dtype}")
+    if not bool(torch.isfinite(points).all()):
+        raise ValueError("points contains NaN or Inf values")
 
-    points = points.contiguous().float()
+    ensure_aligned(points.device)
+    points = points.contiguous()
     dev_str = str(device)
 
     # Step 1: compute global AABB

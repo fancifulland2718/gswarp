@@ -244,7 +244,19 @@ def _backward_projected_means_warp(means3D, radii, projmatrix, viewmatrix,      
     return out
 
 
-def _backward_cov2d_warp(means3D, radii, cov3D, viewmatrix, tanfovx, tanfovy, focal_x, focal_y, grad_conic, grad_conic_2d):
+def _backward_cov2d_warp(
+    means3D,
+    radii,
+    cov3D,
+    viewmatrix,
+    tanfovx,
+    tanfovy,
+    focal_x,
+    focal_y,
+    grad_conic,
+    grad_conic_2d,
+    grad_conic_2d_inv,
+):
     grad_means = torch.zeros(means3D.shape, dtype=means3D.dtype, device=means3D.device)
     grad_cov = torch.zeros(cov3D.shape, dtype=cov3D.dtype, device=cov3D.device)
     if means3D.numel() == 0:
@@ -265,6 +277,7 @@ def _backward_cov2d_warp(means3D, radii, cov3D, viewmatrix, tanfovx, tanfovy, fo
         float(focal_y),
         wp.from_torch(grad_conic.contiguous().reshape(-1), dtype=wp.float32),
         wp.from_torch(grad_conic_2d.contiguous().reshape(-1), dtype=wp.float32),
+        wp.from_torch(grad_conic_2d_inv.contiguous().reshape(-1), dtype=wp.float32),
     ]
     _out = [
         wp.from_torch(grad_means, dtype=wp.vec3),
@@ -303,7 +316,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
             grad_alpha,
             grad_proj_2D,
             grad_conic_2D,
-            _grad_conic_2D_inv,
+            grad_conic_2D_inv,
             _sh,
             _degree,
             _campos,
@@ -414,6 +427,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
         grad_proj_2d_active = grad_proj_2D
         grad_conic_2d_active = grad_conic_2D
+        grad_conic_2d_inv_active = grad_conic_2D_inv
 
         focal_x = image_width / (2.0 * _tan_fovx)
         focal_y = image_height / (2.0 * _tan_fovy)
@@ -453,6 +467,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                 _proj_flat = _projmatrix.contiguous().reshape(-1)
                 _view_flat = _viewmatrix.contiguous().reshape(-1)
                 _grad_conic_2d_flat = grad_conic_2d_active.contiguous().reshape(-1)
+                _grad_conic_2d_inv_flat = grad_conic_2d_inv_active.contiguous().reshape(-1)
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
                     wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
@@ -469,6 +484,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     float(focal_y),
                     wp.from_torch(render_grad_conic_opacity, dtype=wp.vec4),
                     wp.from_torch(_grad_conic_2d_flat, dtype=wp.float32),
+                    wp.from_torch(_grad_conic_2d_inv_flat, dtype=wp.float32),
                     wp.from_torch(_scales.contiguous(), dtype=wp.vec3),
                     wp.from_torch(_rotations.contiguous(), dtype=wp.vec4),
                     float(_scale_modifier),
@@ -514,6 +530,7 @@ def _rasterize_gaussians_backward_python(*args: Any):
                     focal_y,
                     render_grad_conic_opacity[:, :3],
                     grad_conic_2d_active,
+                    grad_conic_2d_inv_active,
                 )
 
                 # C3: Fused accumulation 鈥?replaces 2 torch.zeros + 3 torch.add + 1 slice-assign
