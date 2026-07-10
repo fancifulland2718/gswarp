@@ -161,12 +161,16 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             alpha,
         )
 
-        grads = run_with_runtime_overrides(
-            backend,
-            raster_settings,
-            lambda: backend.rasterize_gaussians_backward_typed(*args, forward_state=ctx.forward_state),
-            options=ctx.execution_options,
-        )
+        try:
+            grads = run_with_runtime_overrides(
+                backend,
+                raster_settings,
+                lambda: backend.rasterize_gaussians_backward_typed(*args, forward_state=ctx.forward_state),
+                options=ctx.execution_options,
+            )
+        finally:
+            # Arbitrary autograd context attributes are not released by PyTorch.
+            ctx.forward_state = None
 
         (
             grad_means2D,
