@@ -126,7 +126,6 @@ def _build_binning_state(
                 num_rendered=0,
             )
 
-        point_list = _allocate_scalar_tensor((num_rendered,), torch.int32, device)
         if sort_mode == "warp_radix":
             point_list_keys_buffer, point_list_buffer, _, _ = _get_radix_sort_buffers(device, num_rendered * 2)
             point_list_keys = point_list_keys_buffer[:num_rendered]
