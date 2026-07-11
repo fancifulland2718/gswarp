@@ -154,7 +154,9 @@ def _build_binning_state(
 
             point_list_keys, point_list = _warp_radix_sort_pairs_in_place(point_list_keys_buffer, point_list_buffer, num_rendered)
         elif sort_mode == "warp_depth_stable_tile":
-            tile_id_buffer, point_list_buffer, _, _ = _get_radix_sort_i32_buffers(device, num_rendered * 2)
+            tile_id_buffer, point_list_buffer, tile_id_buffer_wp, point_list_buffer_wp = (
+                _get_radix_sort_i32_buffers(device, num_rendered * 2)
+            )
             sorted_point_ids_i32 = _as_detached_contiguous_dtype(sorted_point_ids, torch.int32)
             _dev = str(radii.device)
             _g1_inp = [
@@ -168,8 +170,12 @@ def _build_binning_state(
                 int(grid_y),
             ]
             _g1_out = [
-                wp.from_torch(tile_id_buffer[:num_rendered], dtype=wp.int32),
-                wp.from_torch(point_list_buffer[:num_rendered], dtype=wp.int32),
+                tile_id_buffer_wp
+                if tile_id_buffer_wp is not None
+                else wp.from_torch(tile_id_buffer, dtype=wp.int32),
+                point_list_buffer_wp
+                if point_list_buffer_wp is not None
+                else wp.from_torch(point_list_buffer, dtype=wp.int32),
             ]
             _g1_key = (_dev, point_count)
             _g1_cmd = _C4_LAUNCH_CACHE_BINNING_DUPLICATE.get(_g1_key)
@@ -247,11 +253,16 @@ def _build_binning_state(
             )
         else:
             tile_ids_i32 = _as_detached_contiguous_dtype(tile_ids, torch.int32)
+            tile_ids_wp = None
+            if sort_mode == "warp_depth_stable_tile":
+                tile_ids_wp = tile_id_buffer_wp
             wp.launch(
                 kernel=_identify_tile_ranges_warp_kernel,
                 dim=tile_ids_i32.shape[0],
                 inputs=[
-                    wp.from_torch(tile_ids_i32, dtype=wp.int32),
+                    tile_ids_wp
+                    if tile_ids_wp is not None
+                    else wp.from_torch(tile_ids_i32, dtype=wp.int32),
                     ranges_warp if ranges_warp is not None else wp.from_torch(ranges.reshape(-1), dtype=wp.int32),
                     int(tile_ids_i32.shape[0]),
                 ],
