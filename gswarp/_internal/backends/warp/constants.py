@@ -37,6 +37,5 @@ PREPROCESS_CULL_SIGMA = 3.0
 PREPROCESS_CULL_FOV_SCALE = 1.3
 DET_EPSILON = 1.0e-7
 ONE_MINUS_ALPHA_MIN = 1.0e-5
-RENDER_TILE_BATCH = 32
 
 __all__ = [name for name in globals() if name.isupper() or name.startswith("sh_c")]

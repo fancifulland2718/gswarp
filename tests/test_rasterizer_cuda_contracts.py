@@ -149,6 +149,40 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(scales.grad).all())
         self.assertGreater(scales.grad.abs().sum().item(), 0.0)
 
+    def test_pending_forward_owns_its_binning_state(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        first_points = torch.tensor(
+            [[-0.25, 0.0, 2.0], [0.25, 0.0, 2.0]], dtype=torch.float32, device=DEVICE
+        )
+
+        reference_scales = torch.full(
+            (2, 3), 0.5, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        reference_color, _, _ = rasterize_standard(
+            **_inputs(first_points, scales=reference_scales),
+            raster_settings=_settings(background),
+        )
+        reference_color.sum().backward()
+        reference_grad = reference_scales.grad.detach().clone()
+
+        clear_standard_caches()
+        pending_scales = torch.full(
+            (2, 3), 0.5, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        pending_color, _, _ = rasterize_standard(
+            **_inputs(first_points, scales=pending_scales),
+            raster_settings=_settings(background),
+        )
+        rasterize_standard(
+            **_inputs(
+                torch.tensor([[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE),
+            ),
+            raster_settings=_settings(background),
+        )
+        pending_color.sum().backward()
+
+        torch.testing.assert_close(pending_scales.grad, reference_grad)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,6 @@ from .constants import (
     FORWARD_GEOM_CLAMP_WIDTH,
     FORWARD_GEOM_STRIDE_BYTES,
     NUM_CHANNELS,
-    RENDER_TILE_BATCH,
 )
 from .state import BinningState, PreprocessOutputs
 from .memory import _allocate_scalar_tensor
@@ -75,10 +74,8 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     rgb_bytes = point_count * 3 * 4
     cov_bytes = point_count * 6 * 4
     geom_clamp_bytes = point_count * FORWARD_GEOM_CLAMP_WIDTH
-    # point_list in binning_buffer includes RENDER_TILE_BATCH padding appended
-    # by _build_binning_state, so account for it when validating buffer size.
     _i32_size = 4  # torch.int32 element size
-    expected_binning_bytes = (num_rendered + RENDER_TILE_BATCH + tile_count * 2) * _i32_size
+    expected_binning_bytes = (num_rendered + tile_count * 2) * _i32_size
     expected_img_bytes = image_height * image_width * _i32_size
     if geom_buffer.numel() != points_xy_bytes + depths_bytes + conic_opacity_bytes + rgb_bytes + cov_bytes + geom_clamp_bytes or binning_buffer.numel() != expected_binning_bytes or img_buffer.numel() != expected_img_bytes:
         return None
@@ -116,10 +113,8 @@ def _unpack_forward_aux_buffers(geom_buffer, binning_buffer, img_buffer, num_ren
     binning_state = BinningState(
         grid_x=grid_x,
         grid_y=grid_y,
-        point_offsets=torch.empty((0,), dtype=torch.int32, device=geom_buffer.device),
-        point_list=binning_tensor[:num_rendered + RENDER_TILE_BATCH],
-        point_list_keys=torch.empty((0,), dtype=torch.int64, device=geom_buffer.device),
-        ranges=binning_tensor[num_rendered + RENDER_TILE_BATCH:].reshape(tile_count, 2),
+        point_list=binning_tensor[:num_rendered],
+        ranges=binning_tensor[num_rendered:].reshape(tile_count, 2),
         num_rendered=num_rendered,
     )
     n_contrib = img_tensor.reshape(image_height, image_width)

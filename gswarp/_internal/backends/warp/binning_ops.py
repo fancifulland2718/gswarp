@@ -1,28 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 import warp as wp
 
-from ...._tuning import (
-    normalize_device as _normalize_runtime_device,
-    query_device_info as _query_runtime_device_info,
-    query_sm_properties as _query_sm_properties,
-    register_kernel_class as _register_kernel_class,
-    get_tuned_block_dim,
-    initialize_tuning as _tuning_initialize,
-    FAMILY_COMPUTE,
-    FAMILY_WARP_SPECIALIZED,
-)
-
-from .constants import BINNING_SORT_MODES, BLOCK_X, BLOCK_Y, RENDER_TILE_BATCH, TORCH_SINGLE_SORT_THRESHOLD
+from .constants import BINNING_SORT_MODES, BLOCK_X, BLOCK_Y, TORCH_SINGLE_SORT_THRESHOLD
 from .state import BinningState
 from . import runtime as _runtime
-from .runtime import _select_auto_binning_sort_mode
 from .memory import (
     _C4_LAUNCH_CACHE_BINNING_DUPLICATE,
-    _DEPTH_SORT_ORDER_CACHE,
     _allocate_scalar_tensor,
     _allocate_warp_scalar_array,
     _can_use_warp_scalar_alloc,
@@ -60,7 +45,6 @@ def _build_binning_state(
         grid_y = (image_height + BLOCK_Y - 1) // BLOCK_Y
         tile_count = grid_x * grid_y
 
-        requested_sort_mode = sort_mode
         if sort_mode is None:
             sort_mode = _runtime.get_active_binning_sort_mode()
 
@@ -69,8 +53,6 @@ def _build_binning_state(
 
         sorted_point_ids: torch.Tensor | None = None
         if point_count > 0 and sort_mode == "warp_depth_stable_tile":
-            device_key = str(device)
-
             # Always sort 鈥?the O6 depth-order-unchanged check requires a GPU鈫扖PU
             # sync (.item()) that costs more than the sort itself during training.
             # Use the shared i32 radix sort buffers for depth sorting, then clone
@@ -82,7 +64,6 @@ def _build_binning_state(
             sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
             point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(_ds_key_buf, _ds_val_buf, point_count)
             sorted_point_ids = sorted_point_ids.clone()
-            _DEPTH_SORT_ORDER_CACHE[device_key] = (sorted_point_ids, point_count)
 
             sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
@@ -94,7 +75,6 @@ def _build_binning_state(
         # work while waiting for the inclusive-scan result.
         ranges_warp = None
         ranges = torch.zeros((tile_count + 1, 2), dtype=torch.int32, device=device)
-        point_list_keys = _allocate_scalar_tensor((0,), torch.int64, device)
         if point_count > 0:
             points_xy_image_vec2 = _as_detached_contiguous_dtype(points_xy_image, torch.float32)
             radii_i32 = _as_detached_contiguous_dtype(radii, torch.int32)
@@ -105,7 +85,6 @@ def _build_binning_state(
             point_offsets_i32 = _as_detached_contiguous_dtype(point_offsets, torch.int32)
 
         # ----- Read num_rendered via GPU鈫扖PU sync -----
-        device_key = str(device)
         if point_count > 0:
             num_rendered = int(point_offsets_i32[-1].item())
         else:
@@ -119,9 +98,7 @@ def _build_binning_state(
             return BinningState(
                 grid_x=grid_x,
                 grid_y=grid_y,
-                point_offsets=point_offsets,
                 point_list=_allocate_scalar_tensor((0,), torch.int32, device),
-                point_list_keys=_allocate_scalar_tensor((0,), torch.int64, device),
                 ranges=_allocate_scalar_tensor((tile_count, 2), torch.int32, device, fill_value=0),
                 num_rendered=0,
             )
@@ -267,18 +244,16 @@ def _build_binning_state(
                 ],
                 device=str(radii.device),
             )
-        # T1: pad point_list with RENDER_TILE_BATCH zeros so tile_load at the
-        # tail of any tile's range never reads out-of-bounds memory.
-        point_list = torch.cat([point_list, torch.zeros(RENDER_TILE_BATCH, dtype=point_list.dtype, device=device)])
+        # The sort buffers are reused by later forwards. Keep only the exact
+        # immutable list needed by render/backward; kernel reads are range-clamped.
+        point_list = point_list.clone()
 
         return BinningState(
             grid_x=grid_x,
             grid_y=grid_y,
-            point_offsets=point_offsets,
             point_list=point_list,
-            point_list_keys=point_list_keys,
             ranges=ranges[:tile_count],
-            num_rendered=int(point_list.numel()) - RENDER_TILE_BATCH,
+            num_rendered=num_rendered,
         )
 
 

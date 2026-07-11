@@ -5,18 +5,8 @@ from typing import Any
 import torch
 import warp as wp
 
-from ...._tuning import (
-    normalize_device as _normalize_runtime_device,
-    query_device_info as _query_runtime_device_info,
-    query_sm_properties as _query_sm_properties,
-    register_kernel_class as _register_kernel_class,
-    get_tuned_block_dim,
-    initialize_tuning as _tuning_initialize,
-    FAMILY_COMPUTE,
-    FAMILY_WARP_SPECIALIZED,
-)
+from ...._tuning import normalize_device as _normalize_runtime_device
 
-from . import runtime as _runtime
 from .binning_kernels import _gather_i32_by_index_warp_kernel, _pack_binning_keys_warp_kernel
 
 _MAX_WORKSPACE_CACHE_DEVICES = 4
@@ -43,8 +33,6 @@ _INDEX_GATHER_I64_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = _Bo
 _SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, int]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
 _PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
 _SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_DEPTH_SORT_ORDER_CACHE: dict[str, tuple[torch.Tensor, int]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_DEPTH_SORT_CHECK_FLAG: dict[str, torch.Tensor] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
 _C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 _C4_LAUNCH_CACHE_COV3D: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 _C4_LAUNCH_CACHE_RENDER_BWD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
@@ -63,7 +51,7 @@ _C4_LAUNCH_CACHE_FLOW_GRAD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUN
 _WORKSPACE_CACHES = (
     _RADIX_SORT_BUFFER_CACHE, _RADIX_SORT_I32_BUFFER_CACHE, _INDEX_GATHER_I32_BUFFER_CACHE,
     _INDEX_GATHER_I64_BUFFER_CACHE, _SCAN_I32_BUFFER_CACHE, _PROJECT_VISIBLE_BUFFER_CACHE,
-    _SEQUENCE_BUFFER_CACHE, _DEPTH_SORT_ORDER_CACHE, _DEPTH_SORT_CHECK_FLAG,
+    _SEQUENCE_BUFFER_CACHE,
 )
 _COMMON_LAUNCH_CACHES = (
     _C4_LAUNCH_CACHE_SH, _C4_LAUNCH_CACHE_COV3D, _C4_LAUNCH_CACHE_RENDER_BWD,

@@ -27,9 +27,7 @@ class PreprocessOutputs:
 class BinningState:
     grid_x: int
     grid_y: int
-    point_offsets: torch.Tensor
     point_list: torch.Tensor
-    point_list_keys: torch.Tensor
     ranges: torch.Tensor
     num_rendered: int
 

@@ -7,6 +7,8 @@ import unittest
 import torch
 
 from gswarp._internal.api.validation import normalize_gaussian_inputs
+from gswarp._internal.backends.warp.packing import _pack_forward_aux_buffers, _unpack_forward_aux_buffers
+from gswarp._internal.backends.warp.state import BinningState, PreprocessOutputs
 from gswarp.knn import distCUDA2
 
 
@@ -48,6 +50,45 @@ class KNNContractTests(unittest.TestCase):
             with self.subTest(point_count=point_count):
                 with self.assertRaisesRegex(ValueError, "at least 4 points"):
                     distCUDA2(points)
+
+
+class PackedStateContractTests(unittest.TestCase):
+    def test_binning_buffer_stores_exact_point_list_without_padding(self) -> None:
+        point_count = 2
+        preprocess = PreprocessOutputs(
+            visible=torch.ones(point_count, dtype=torch.bool),
+            depths=torch.tensor([1.0, 2.0]),
+            radii=torch.ones(point_count, dtype=torch.int32),
+            proj_2d=torch.zeros((point_count, 2)),
+            conic_2d=torch.zeros((point_count, 3)),
+            conic_2d_inv=torch.zeros((point_count, 3)),
+            points_xy_image=torch.zeros((point_count, 2)),
+            tiles_touched=torch.ones(point_count, dtype=torch.int32),
+            rgb=torch.zeros((point_count, 3)),
+            clamped=torch.zeros((point_count, 3), dtype=torch.int32),
+            conic_opacity=torch.zeros((point_count, 4)),
+            cov3d_all=torch.zeros((point_count, 6)),
+        )
+        binning = BinningState(
+            grid_x=1,
+            grid_y=1,
+            point_list=torch.tensor([1, 0, 1], dtype=torch.int32),
+            ranges=torch.tensor([[0, 3]], dtype=torch.int32),
+            num_rendered=3,
+        )
+
+        geom_buffer, binning_buffer, img_buffer = _pack_forward_aux_buffers(
+            preprocess, binning, torch.zeros((4, 4), dtype=torch.int32)
+        )
+        unpacked = _unpack_forward_aux_buffers(
+            geom_buffer, binning_buffer, img_buffer, binning.num_rendered, 4, 4
+        )
+
+        self.assertEqual(binning_buffer.numel(), (binning.num_rendered + 2) * 4)
+        self.assertIsNotNone(unpacked)
+        _, unpacked_binning, _ = unpacked
+        torch.testing.assert_close(unpacked_binning.point_list, binning.point_list)
+        torch.testing.assert_close(unpacked_binning.ranges, binning.ranges)
 
 
 if __name__ == "__main__":
