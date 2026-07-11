@@ -15,7 +15,7 @@ No C++/CUDA compilation required.
 import torch
 import warp as wp
 
-from ._stream import ensure_aligned
+from ._stream import execution_context, submission_guard
 from ._tuning import register_kernel_class, get_tuned_block_dim, FAMILY_MEMORY
 
 wp.init()
@@ -726,6 +726,13 @@ def _bwd_v(
 class FusedSSIMMap(torch.autograd.Function):
     @staticmethod
     def forward(ctx, C1, C2, img1, img2, padding, train):
+        with execution_context(img1.device):
+            return FusedSSIMMap._forward_impl(
+                ctx, C1, C2, img1, img2, padding, train
+            )
+
+    @staticmethod
+    def _forward_impl(ctx, C1, C2, img1, img2, padding, train):
         B, CH, H, W = img1.shape
         device = img1.device
         dev = str(device)
@@ -780,6 +787,12 @@ class FusedSSIMMap(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, opt_grad):
+        device = ctx.saved_tensors[0].device if ctx.train else opt_grad.device
+        with execution_context(device):
+            return FusedSSIMMap._backward_impl(ctx, opt_grad)
+
+    @staticmethod
+    def _backward_impl(ctx, opt_grad):
         if not ctx.train:
             return None, None, None, None, None, None
         plan = ctx.plan
@@ -833,7 +846,34 @@ def fused_ssim(img1, img2, padding="same", train=True):
         Scalar - mean SSIM across all pixels.
     """
     _validate_fused_ssim_inputs(img1, img2, padding, train)
-    ensure_aligned(img1.device)
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
     return FusedSSIMMap.apply(C1, C2, img1, img2, padding, train)
+
+
+def clear_fused_ssim_caches(device=None) -> None:
+    """Clear inference launch caches for one device or all known devices."""
+
+    caches = (_C4_FWD_H_INF, _C4_FWD_VI, _C4_FWD_VIV)
+    resolved_device = None if device is None else torch.device(device)
+    if (
+        resolved_device is not None
+        and resolved_device.type == "cuda"
+        and resolved_device.index is None
+        and torch.cuda.is_available()
+    ):
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    device_key = None if resolved_device is None else str(resolved_device)
+    known_devices = {
+        key[0]
+        for cache in caches
+        for key in cache
+        if isinstance(key, tuple) and isinstance(key[0], str)
+    }
+    targets = known_devices if device_key is None else {device_key}
+    for target in sorted(targets):
+        with submission_guard(target):
+            for cache in caches:
+                for key in tuple(cache):
+                    if key[0] == target:
+                        del cache[key]

@@ -80,14 +80,15 @@ class RuntimeOptionsTests(unittest.TestCase):
     def test_cache_report_and_bounds_are_cpu_safe(self) -> None:
         cache = memory._C4_LAUNCH_CACHE_SH
         cache.clear()
-        memory._SEQUENCE_BUFFER_CACHE.clear()
+        memory._WORKSPACE_SLOT_CACHE.clear()
         for index in range(memory._MAX_LAUNCH_CACHE_ENTRIES + 1):
             cache[("cpu", index)] = object()
 
-        memory._SEQUENCE_BUFFER_CACHE["cpu"] = torch.empty(4, dtype=torch.float32)
+        memory._get_workspace_slot("cpu").sequence = torch.empty(4, dtype=torch.float32)
         report = memory.get_warp_cache_report()
 
         self.assertEqual(len(cache), memory._MAX_LAUNCH_CACHE_ENTRIES)
+        self.assertEqual(report["workspace_entries"], 1)
         self.assertEqual(report["by_cache"]["_C4_LAUNCH_CACHE_SH"]["entries"], memory._MAX_LAUNCH_CACHE_ENTRIES)
         self.assertEqual(report["by_cache"]["_SEQUENCE_BUFFER_CACHE"]["tensor_bytes"], 16)
 

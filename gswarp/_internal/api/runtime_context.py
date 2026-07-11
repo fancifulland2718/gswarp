@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from gswarp._stream import ensure_aligned
+from gswarp._stream import execution_context
 from gswarp._internal.backends.warp.runtime import ExecutionOptions, execution_options
 
 
@@ -28,10 +28,10 @@ def resolve_execution_options(backend, raster_settings, *, flow: bool = False) -
 @contextmanager
 def runtime_overrides(backend, raster_settings, *, flow: bool = False, options: ExecutionOptions | None = None):
     """Bind one immutable option snapshot and the matching CUDA stream."""
-    ensure_aligned(raster_settings.bg.device)
     options = resolve_execution_options(backend, raster_settings, flow=flow) if options is None else options
-    with execution_options(options):
-        yield options
+    with execution_context(raster_settings.bg.device):
+        with execution_options(options):
+            yield options
 
 
 def run_with_runtime_overrides(backend, raster_settings, fn, *, flow: bool = False, options: ExecutionOptions | None = None):

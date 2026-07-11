@@ -3,7 +3,6 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 
-from gswarp._stream import ensure_aligned
 from gswarp._internal.api.validation import normalize_gaussian_inputs, validate_rasterizer_inputs
 from gswarp._internal.frontend import common, flow_autograd
 from gswarp.methods.flow_aux import METHOD
@@ -39,7 +38,6 @@ def rasterize_gaussians(
         cov3Ds_precomp,
         raster_settings,
     )
-    ensure_aligned(means3D.device)
     plan = _plan()
     outputs = flow_autograd.rasterize_gaussians(
         plan,

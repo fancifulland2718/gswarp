@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from gswarp._stream import execution_context
 from gswarp._internal.backends.select import resolve_backend
 from gswarp._internal.api.runtime_context import resolve_execution_options, run_with_runtime_overrides
 
@@ -42,11 +43,12 @@ def adapt_outputs(plan, outputs, meta_type=None):
 
 
 def mark_visible(plan, positions, raster_settings):
-    return plan.stages.mark_visible(
-        positions,
-        raster_settings.viewmatrix,
-        raster_settings.projmatrix,
-    )
+    with execution_context(positions.device):
+        return plan.stages.mark_visible(
+            positions,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+        )
 
 
 __all__ = [

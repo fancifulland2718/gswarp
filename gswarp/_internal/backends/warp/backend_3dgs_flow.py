@@ -42,8 +42,13 @@ BACKEND_CAPABILITIES = frozenset(
 
 
 def clear_warp_caches() -> None:
+    from gswarp._stream import clear_execution_stream_cache
+    from gswarp.fused_ssim import clear_fused_ssim_caches
+
     clear_common_warp_caches()
     clear_flow_warp_caches()
+    clear_fused_ssim_caches()
+    clear_execution_stream_cache()
 
 
 def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):

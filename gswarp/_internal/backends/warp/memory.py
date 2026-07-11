@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import torch
 import warp as wp
 
+from gswarp._stream import (
+    current_execution_context,
+    resolve_execution_context,
+    submission_guard,
+)
 from ...._tuning import normalize_device as _normalize_runtime_device
 
 from .binning_kernels import _gather_i32_by_index_warp_kernel, _pack_binning_keys_warp_kernel
 
-_MAX_WORKSPACE_CACHE_DEVICES = 4
+_MAX_WORKSPACE_CACHE_STREAMS = 4
+_MAX_WORKSPACE_CACHE_DEVICES = _MAX_WORKSPACE_CACHE_STREAMS
 _MAX_LAUNCH_CACHE_ENTRIES = 32
 
 
@@ -26,13 +35,42 @@ class _BoundedCache(dict):
         super().__setitem__(key, value)
 
 
-_RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_RADIX_SORT_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_INDEX_GATHER_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_INDEX_GATHER_I64_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, int]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
-_SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+
+@dataclass(slots=True)
+class _WorkspaceSlot:
+    device_key: str
+    stream_handle: int
+    warp_stream: Any | None
+    radix_sort: tuple[Any | None, torch.Tensor, Any | None, torch.Tensor] | None = None
+    radix_sort_i32: tuple[Any | None, torch.Tensor, Any | None, torch.Tensor] | None = None
+    index_gather_i32: tuple[Any | None, torch.Tensor] | None = None
+    index_gather_i64: tuple[Any | None, torch.Tensor] | None = None
+    scan_i32: tuple[Any | None, torch.Tensor, int] | None = None
+    project_visible: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    sequence: torch.Tensor | None = None
+
+    @property
+    def key(self) -> tuple[str, int]:
+        return self.device_key, self.stream_handle
+
+    def tensor_bytes(self) -> int:
+        return sum(
+            _cached_tensor_bytes(value)
+            for value in (
+                self.radix_sort,
+                self.radix_sort_i32,
+                self.index_gather_i32,
+                self.index_gather_i64,
+                self.scan_i32,
+                self.project_visible,
+                self.sequence,
+            )
+        )
+
+
+_WORKSPACE_SLOT_CACHE: OrderedDict[tuple[str, int], _WorkspaceSlot] = OrderedDict()
+_WORKSPACE_SLOT_LOCK = RLock()
+_WORKSPACE_EVICTIONS = 0
 _C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 _C4_LAUNCH_CACHE_COV3D: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 _C4_LAUNCH_CACHE_RENDER_BWD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
@@ -48,11 +86,6 @@ _C4_LAUNCH_CACHE_BINNING_DUPLICATE: dict[tuple[str, int], Any] = _BoundedCache(_
 _C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[Any, ...], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 _C4_LAUNCH_CACHE_FLOW_GRAD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
 
-_WORKSPACE_CACHES = (
-    _RADIX_SORT_BUFFER_CACHE, _RADIX_SORT_I32_BUFFER_CACHE, _INDEX_GATHER_I32_BUFFER_CACHE,
-    _INDEX_GATHER_I64_BUFFER_CACHE, _SCAN_I32_BUFFER_CACHE, _PROJECT_VISIBLE_BUFFER_CACHE,
-    _SEQUENCE_BUFFER_CACHE,
-)
 _COMMON_LAUNCH_CACHES = (
     _C4_LAUNCH_CACHE_SH, _C4_LAUNCH_CACHE_COV3D, _C4_LAUNCH_CACHE_RENDER_BWD,
     _C4_LAUNCH_CACHE_PROJ_MEANS, _C4_LAUNCH_CACHE_COV2D, _C4_LAUNCH_CACHE_ACCUM,
@@ -73,22 +106,55 @@ def _cached_tensor_bytes(value: Any) -> int:
 
 def get_warp_cache_report() -> dict[str, Any]:
     """Return bounded-cache occupancy without synchronizing the device."""
-    workspace_entries = sum(len(cache) for cache in _WORKSPACE_CACHES)
+    with _WORKSPACE_SLOT_LOCK:
+        slots = tuple(_WORKSPACE_SLOT_CACHE.values())
     launch_entries = sum(len(cache) for cache in _LAUNCH_CACHES)
-    workspace_bytes = sum(
-        _cached_tensor_bytes(value) for cache in _WORKSPACE_CACHES for value in cache.values()
+    workspace_bytes = sum(slot.tensor_bytes() for slot in slots)
+    workspace_fields = {
+        "_RADIX_SORT_BUFFER_CACHE": "radix_sort",
+        "_RADIX_SORT_I32_BUFFER_CACHE": "radix_sort_i32",
+        "_INDEX_GATHER_I32_BUFFER_CACHE": "index_gather_i32",
+        "_INDEX_GATHER_I64_BUFFER_CACHE": "index_gather_i64",
+        "_SCAN_I32_BUFFER_CACHE": "scan_i32",
+        "_PROJECT_VISIBLE_BUFFER_CACHE": "project_visible",
+        "_SEQUENCE_BUFFER_CACHE": "sequence",
+    }
+    by_cache = {
+        name: {
+            "entries": sum(getattr(slot, field) is not None for slot in slots),
+            "tensor_bytes": sum(
+                _cached_tensor_bytes(getattr(slot, field)) for slot in slots
+            ),
+        }
+        for name, field in workspace_fields.items()
+    }
+    by_cache.update(
+        {
+            name: {
+                "entries": len(cache),
+                "tensor_bytes": sum(
+                    _cached_tensor_bytes(value) for value in cache.values()
+                ),
+            }
+            for name, cache in globals().items()
+            if isinstance(cache, _BoundedCache)
+        }
     )
     return {
-        "workspace_entries": workspace_entries,
+        "workspace_entries": len(slots),
         "workspace_tensor_bytes": workspace_bytes,
         "launch_entries": launch_entries,
         "workspace_device_limit": _MAX_WORKSPACE_CACHE_DEVICES,
-        "launch_entry_limit": _MAX_LAUNCH_CACHE_ENTRIES,
-        "by_cache": {
-            name: {"entries": len(cache), "tensor_bytes": sum(_cached_tensor_bytes(value) for value in cache.values())}
-            for name, cache in globals().items()
-            if isinstance(cache, _BoundedCache)
+        "workspace_stream_limit": _MAX_WORKSPACE_CACHE_STREAMS,
+        "workspace_evictions": _WORKSPACE_EVICTIONS,
+        "workspace_by_stream": {
+            f"{slot.device_key}@{slot.stream_handle}": {
+                "tensor_bytes": slot.tensor_bytes()
+            }
+            for slot in slots
         },
+        "launch_entry_limit": _MAX_LAUNCH_CACHE_ENTRIES,
+        "by_cache": by_cache,
     }
 
 
@@ -97,32 +163,80 @@ def _clear_cache_entries(caches, device: torch.device | str | None) -> None:
         for cache in caches:
             cache.clear()
         return
-    device_key = str(torch.device(device))
+    device_key = str(_normalize_runtime_device(device))
     for cache in caches:
         for key in tuple(cache):
-            cache_device = key[0] if isinstance(key, tuple) else key
+            cache_device = _cache_key_device(key)
             if cache_device == device_key:
                 del cache[key]
 
 
-def _synchronize_cache_device(device: torch.device | str | None) -> None:
-    if not torch.cuda.is_available():
-        return
-    if device is None:
-        torch.cuda.synchronize()
-    elif torch.device(device).type == "cuda":
-        torch.cuda.synchronize(device)
+def _cache_key_device(key: Any) -> str | None:
+    values = key if isinstance(key, tuple) else (key,)
+    for value in values:
+        if isinstance(value, str) and (
+            value == "cpu" or value == "cuda" or value.startswith("cuda:")
+        ):
+            return str(_normalize_runtime_device(value))
+    return None
+
+
+def _clear_workspace_slots(device: torch.device | str | None) -> None:
+    device_key = None if device is None else str(_normalize_runtime_device(device))
+    with _WORKSPACE_SLOT_LOCK:
+        for key in tuple(_WORKSPACE_SLOT_CACHE):
+            if device_key is None or key[0] == device_key:
+                del _WORKSPACE_SLOT_CACHE[key]
+
+
+def _workspace_device_keys() -> set[str]:
+    with _WORKSPACE_SLOT_LOCK:
+        return {key[0] for key in _WORKSPACE_SLOT_CACHE}
+
+
+def _launch_device_keys(caches) -> set[str]:
+    return {
+        device_key
+        for cache in caches
+        for key in cache
+        if (device_key := _cache_key_device(key)) is not None
+    }
+
+
+def _synchronize_workspace_slots(device_key: str) -> None:
+    with _WORKSPACE_SLOT_LOCK:
+        streams = {
+            slot.stream_handle: slot.warp_stream
+            for slot in _WORKSPACE_SLOT_CACHE.values()
+            if slot.device_key == device_key and slot.warp_stream is not None
+        }
+    for stream in streams.values():
+        wp.synchronize_stream(stream)
 
 
 def clear_common_warp_caches(device: torch.device | str | None = None) -> None:
-    _synchronize_cache_device(device)
-    _clear_cache_entries(_WORKSPACE_CACHES, device)
-    _clear_cache_entries(_COMMON_LAUNCH_CACHES, device)
+    device_keys = (
+        {str(_normalize_runtime_device(device))}
+        if device is not None
+        else _workspace_device_keys() | _launch_device_keys(_COMMON_LAUNCH_CACHES)
+    )
+    for device_key in sorted(device_keys):
+        with submission_guard(device_key):
+            _synchronize_workspace_slots(device_key)
+            _clear_workspace_slots(device_key)
+            _clear_cache_entries(_COMMON_LAUNCH_CACHES, device_key)
 
 
 def clear_flow_warp_caches(device: torch.device | str | None = None) -> None:
-    _synchronize_cache_device(device)
-    _clear_cache_entries((_C4_LAUNCH_CACHE_FLOW_GRAD,), device)
+    caches = (_C4_LAUNCH_CACHE_FLOW_GRAD,)
+    device_keys = (
+        {str(_normalize_runtime_device(device))}
+        if device is not None
+        else _launch_device_keys(caches)
+    )
+    for device_key in sorted(device_keys):
+        with submission_guard(device_key):
+            _clear_cache_entries(caches, device_key)
 
 
 
@@ -220,9 +334,65 @@ def _pack_binning_sort_keys(tile_ids: torch.Tensor, point_list: torch.Tensor, de
         return packed_keys
 
 
+def _get_workspace_slot(device: torch.device | str) -> _WorkspaceSlot:
+    global _WORKSPACE_EVICTIONS
+
+    context = current_execution_context()
+    if context is not None:
+        requested_device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
+        if requested_device != context.device:
+            raise RuntimeError(
+                f"active workspace device is {context.device}, requested {requested_device}"
+            )
+        key = context.workspace_key
+        warp_stream = context.warp_stream
+    else:
+        runtime_device = _normalize_runtime_device(device)
+        if runtime_device.type == "cuda":
+            context = resolve_execution_context(runtime_device)
+        else:
+            context = None
+        if context is not None:
+            key = context.workspace_key
+            warp_stream = context.warp_stream
+        else:
+            key = (str(runtime_device), 0)
+            warp_stream = None
+
+    slot = _WORKSPACE_SLOT_CACHE.get(key)
+    if slot is not None:
+        return slot
+
+    with _WORKSPACE_SLOT_LOCK:
+        slot = _WORKSPACE_SLOT_CACHE.get(key)
+        if slot is not None:
+            return slot
+
+        same_device_keys = [
+            slot_key
+            for slot_key in _WORKSPACE_SLOT_CACHE
+            if slot_key[0] == key[0]
+        ]
+        if len(same_device_keys) >= _MAX_WORKSPACE_CACHE_STREAMS:
+            evicted = _WORKSPACE_SLOT_CACHE.pop(same_device_keys[0])
+            if evicted.warp_stream is not None:
+                wp.synchronize_stream(evicted.warp_stream)
+            _WORKSPACE_EVICTIONS += 1
+
+        slot = _WorkspaceSlot(
+            device_key=key[0],
+            stream_handle=key[1],
+            warp_stream=warp_stream,
+        )
+        _WORKSPACE_SLOT_CACHE[key] = slot
+        return slot
+
+
 def _get_radix_sort_buffers(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _RADIX_SORT_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.radix_sort
     if cached is not None:
         key_warp, key_buffer, value_warp, value_buffer = cached
         if key_buffer.numel() >= required_count and value_buffer.numel() >= required_count:
@@ -236,13 +406,13 @@ def _get_radix_sort_buffers(device: torch.device, required_count: int):
         value_warp = None
         key_buffer = torch.empty((required_count,), dtype=torch.int64, device=device)
         value_buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
-    _RADIX_SORT_BUFFER_CACHE[device_key] = (key_warp, key_buffer, value_warp, value_buffer)
+    slot.radix_sort = (key_warp, key_buffer, value_warp, value_buffer)
     return key_buffer, value_buffer, key_warp, value_warp
 
 
 def _get_radix_sort_i32_buffers(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _RADIX_SORT_I32_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.radix_sort_i32
     if cached is not None:
         key_warp, key_buffer, value_warp, value_buffer = cached
         if key_buffer.numel() >= required_count and value_buffer.numel() >= required_count:
@@ -256,13 +426,13 @@ def _get_radix_sort_i32_buffers(device: torch.device, required_count: int):
         value_warp = None
         key_buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
         value_buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
-    _RADIX_SORT_I32_BUFFER_CACHE[device_key] = (key_warp, key_buffer, value_warp, value_buffer)
+    slot.radix_sort_i32 = (key_warp, key_buffer, value_warp, value_buffer)
     return key_buffer, value_buffer, key_warp, value_warp
 
 
 def _get_index_gather_i32_buffer(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _INDEX_GATHER_I32_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.index_gather_i32
     if cached is not None:
         warp_buffer, tensor_buffer = cached
         if tensor_buffer.numel() >= required_count:
@@ -273,13 +443,13 @@ def _get_index_gather_i32_buffer(device: torch.device, required_count: int):
     else:
         warp_buffer = None
         buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
-    _INDEX_GATHER_I32_BUFFER_CACHE[device_key] = (warp_buffer, buffer)
+    slot.index_gather_i32 = (warp_buffer, buffer)
     return buffer, warp_buffer
 
 
 def _get_index_gather_i64_buffer(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _INDEX_GATHER_I64_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.index_gather_i64
     if cached is not None:
         warp_buffer, tensor_buffer = cached
         if tensor_buffer.numel() >= required_count:
@@ -290,13 +460,13 @@ def _get_index_gather_i64_buffer(device: torch.device, required_count: int):
     else:
         warp_buffer = None
         buffer = torch.empty((required_count,), dtype=torch.int64, device=device)
-    _INDEX_GATHER_I64_BUFFER_CACHE[device_key] = (warp_buffer, buffer)
+    slot.index_gather_i64 = (warp_buffer, buffer)
     return buffer, warp_buffer
 
 
 def _get_scan_i32_buffer(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _SCAN_I32_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.scan_i32
     if cached is not None:
         warp_buffer, tensor_buffer, warp_size = cached
         if tensor_buffer.numel() >= required_count:
@@ -304,7 +474,7 @@ def _get_scan_i32_buffer(device: torch.device, required_count: int):
             if warp_buffer is not None and warp_size == required_count:
                 return sliced, warp_buffer
             new_warp = wp.from_torch(sliced, dtype=wp.int32) if _can_use_warp_scalar_alloc(device) else None
-            _SCAN_I32_BUFFER_CACHE[device_key] = (new_warp, tensor_buffer, required_count)
+            slot.scan_i32 = (new_warp, tensor_buffer, required_count)
             return sliced, new_warp
 
     if _can_use_warp_scalar_alloc(device):
@@ -312,13 +482,13 @@ def _get_scan_i32_buffer(device: torch.device, required_count: int):
     else:
         warp_buffer = None
         buffer = torch.empty((required_count,), dtype=torch.int32, device=device)
-    _SCAN_I32_BUFFER_CACHE[device_key] = (warp_buffer, buffer, required_count)
+    slot.scan_i32 = (warp_buffer, buffer, required_count)
     return buffer, warp_buffer
 
 
 def _get_project_visible_buffers(device: torch.device, point_count: int):
-    device_key = str(device)
-    cached = _PROJECT_VISIBLE_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.project_visible
     if cached is not None:
         visible_mask, p_proj, p_view_z = cached
         if visible_mask.shape[0] >= point_count and p_proj.shape[0] >= point_count and p_view_z.shape[0] >= point_count:
@@ -327,18 +497,18 @@ def _get_project_visible_buffers(device: torch.device, point_count: int):
     visible_mask = torch.empty((point_count,), dtype=torch.int32, device=device)
     p_proj = torch.empty((point_count, 3), dtype=torch.float32, device=device)
     p_view_z = torch.empty((point_count,), dtype=torch.float32, device=device)
-    _PROJECT_VISIBLE_BUFFER_CACHE[device_key] = (visible_mask, p_proj, p_view_z)
+    slot.project_visible = (visible_mask, p_proj, p_view_z)
     return visible_mask, p_proj, p_view_z
 
 
 def _get_sequence_buffer(device: torch.device, required_count: int):
-    device_key = str(device)
-    cached = _SEQUENCE_BUFFER_CACHE.get(device_key)
+    slot = _get_workspace_slot(device)
+    cached = slot.sequence
     if cached is not None and cached.numel() >= required_count:
         return cached[:required_count]
 
     sequence = torch.arange(required_count, dtype=torch.int32, device=device)
-    _SEQUENCE_BUFFER_CACHE[device_key] = sequence
+    slot.sequence = sequence
     return sequence
 
 
@@ -374,15 +544,13 @@ def _gather_i32_by_index(src: torch.Tensor, indices: torch.Tensor):
     return gathered
 
 
-def _warp_radix_sort_pairs_in_place(key_buffer: torch.Tensor, value_buffer: torch.Tensor, count: int):
-    key_warp = None
-    value_warp = None
-    cached = _RADIX_SORT_BUFFER_CACHE.get(str(key_buffer.device))
-    if cached is not None:
-        cached_key_warp, cached_key_buffer, cached_value_warp, cached_value_buffer = cached
-        if cached_key_buffer.data_ptr() == key_buffer.data_ptr() and cached_value_buffer.data_ptr() == value_buffer.data_ptr():
-            key_warp = cached_key_warp
-            value_warp = cached_value_warp
+def _warp_radix_sort_pairs_in_place(
+    key_buffer: torch.Tensor,
+    value_buffer: torch.Tensor,
+    count: int,
+    key_warp=None,
+    value_warp=None,
+):
     wp.utils.radix_sort_pairs(
         key_warp if key_warp is not None else wp.from_torch(key_buffer, dtype=wp.int64),
         value_warp if value_warp is not None else wp.from_torch(value_buffer, dtype=wp.int32),
@@ -391,15 +559,13 @@ def _warp_radix_sort_pairs_in_place(key_buffer: torch.Tensor, value_buffer: torc
     return key_buffer[:count], value_buffer[:count]
 
 
-def _warp_radix_sort_i32_pairs_in_place(key_buffer: torch.Tensor, value_buffer: torch.Tensor, count: int):
-    key_warp = None
-    value_warp = None
-    cached = _RADIX_SORT_I32_BUFFER_CACHE.get(str(key_buffer.device))
-    if cached is not None:
-        cached_key_warp, cached_key_buffer, cached_value_warp, cached_value_buffer = cached
-        if cached_key_buffer.data_ptr() == key_buffer.data_ptr() and cached_value_buffer.data_ptr() == value_buffer.data_ptr():
-            key_warp = cached_key_warp
-            value_warp = cached_value_warp
+def _warp_radix_sort_i32_pairs_in_place(
+    key_buffer: torch.Tensor,
+    value_buffer: torch.Tensor,
+    count: int,
+    key_warp=None,
+    value_warp=None,
+):
     _key_arr = key_warp if key_warp is not None else wp.from_torch(key_buffer, dtype=wp.int32)
     _val_arr = value_warp if value_warp is not None else wp.from_torch(value_buffer, dtype=wp.int32)
     wp.utils.radix_sort_pairs(

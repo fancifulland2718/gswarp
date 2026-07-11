@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 import unittest
 
 import torch
 
 from gswarp.rasterizer import (
+    GaussianRasterizer as StandardRasterizer,
     GaussianRasterizationSettings as StandardSettings,
     clear_warp_caches as clear_standard_caches,
+    get_warp_cache_report as get_standard_cache_report,
     rasterize_gaussians as rasterize_standard,
 )
 from gswarp.rasterizer_flow import (
@@ -97,6 +101,24 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(radii, torch.zeros_like(radii))
         torch.testing.assert_close(flow_outputs[1], torch.zeros_like(flow_outputs[1]))
 
+    def test_mark_visible_returns_owned_bool_tensor(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        rasterizer = StandardRasterizer(_settings(background))
+        first = rasterizer.markVisible(
+            torch.tensor([[0.0, 0.0, 2.0], [0.2, 0.0, 2.0]], device=DEVICE)
+        )
+        torch.cuda.synchronize(DEVICE)
+        expected = first.clone()
+        second = rasterizer.markVisible(
+            torch.tensor([[0.0, 0.0, -2.0], [0.2, 0.0, -2.0]], device=DEVICE)
+        )
+        torch.cuda.synchronize(DEVICE)
+
+        self.assertEqual(first.dtype, torch.bool)
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, torch.zeros_like(second))
+
     def test_conic_inverse_gradient_matches_finite_difference_in_fused_path(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
         means3d = torch.tensor([[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE)
@@ -182,6 +204,144 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         pending_color.sum().backward()
 
         torch.testing.assert_close(pending_scales.grad, reference_grad)
+
+    def test_two_stream_forward_backward_matches_isolated_references(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        settings = _settings(background)
+        points_a = torch.tensor(
+            [[-0.25, 0.0, 2.0], [0.25, 0.0, 2.0]], device=DEVICE
+        )
+        points_b = torch.tensor([[0.0, 0.0, 2.0]], device=DEVICE)
+
+        def isolated(points):
+            scales = torch.full(
+                (points.shape[0], 3),
+                0.5,
+                dtype=torch.float32,
+                device=DEVICE,
+                requires_grad=True,
+            )
+            color, _, _ = rasterize_standard(
+                **_inputs(points, scales=scales), raster_settings=settings
+            )
+            color.square().mean().backward()
+            torch.cuda.synchronize(DEVICE)
+            return color.detach().clone(), scales.grad.detach().clone()
+
+        expected_a = isolated(points_a)
+        expected_b = isolated(points_b)
+        clear_standard_caches()
+
+        scales_a = torch.full(
+            (2, 3), 0.5, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        scales_b = torch.full(
+            (1, 3), 0.5, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        stream_a = torch.cuda.Stream(device=DEVICE)
+        stream_b = torch.cuda.Stream(device=DEVICE)
+        with torch.cuda.stream(stream_a):
+            color_a, _, _ = rasterize_standard(
+                **_inputs(points_a, scales=scales_a), raster_settings=settings
+            )
+            loss_a = color_a.square().mean()
+        with torch.cuda.stream(stream_b):
+            color_b, _, _ = rasterize_standard(
+                **_inputs(points_b, scales=scales_b), raster_settings=settings
+            )
+            loss_b = color_b.square().mean()
+        with torch.cuda.stream(stream_a):
+            loss_a.backward()
+        with torch.cuda.stream(stream_b):
+            loss_b.backward()
+        stream_a.synchronize()
+        stream_b.synchronize()
+
+        torch.testing.assert_close(color_a, expected_a[0])
+        torch.testing.assert_close(scales_a.grad, expected_a[1])
+        torch.testing.assert_close(color_b, expected_b[0])
+        torch.testing.assert_close(scales_b.grad, expected_b[1])
+        report = get_standard_cache_report()
+        self.assertEqual(report["workspace_entries"], 2)
+
+    def test_two_threads_submit_on_independent_streams(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        settings = _settings(background)
+        points = (
+            torch.tensor(
+                [[-0.2, 0.0, 2.0], [0.2, 0.0, 2.0]], device=DEVICE
+            ),
+            torch.tensor([[0.0, 0.0, 2.0]], device=DEVICE),
+        )
+        inputs = tuple(_inputs(value) for value in points)
+        with torch.no_grad():
+            expected = tuple(
+                rasterize_standard(**value, raster_settings=settings)[0].clone()
+                for value in inputs
+            )
+        torch.cuda.synchronize(DEVICE)
+        clear_standard_caches()
+
+        streams = (
+            torch.cuda.Stream(device=DEVICE),
+            torch.cuda.Stream(device=DEVICE),
+        )
+        barrier = Barrier(2)
+
+        def submit(index):
+            with torch.cuda.stream(streams[index]), torch.no_grad():
+                barrier.wait()
+                color, _, _ = rasterize_standard(
+                    **inputs[index], raster_settings=settings
+                )
+            streams[index].synchronize()
+            return color
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(submit, index) for index in range(2)]
+            actual = tuple(future.result() for future in futures)
+
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1])
+
+    def test_workspace_stream_slots_are_bounded_and_evict_safely(self) -> None:
+        from gswarp._internal.backends.warp import memory
+
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        rasterizer = StandardRasterizer(_settings(background))
+        points = torch.tensor([[0.0, 0.0, 2.0]], device=DEVICE)
+        streams = [
+            torch.cuda.Stream(device=DEVICE)
+            for _ in range(memory._MAX_WORKSPACE_CACHE_STREAMS + 1)
+        ]
+        before = memory.get_warp_cache_report()["workspace_evictions"]
+        outputs = []
+        for stream in streams:
+            with torch.cuda.stream(stream):
+                outputs.append(rasterizer.markVisible(points))
+        for stream in streams:
+            stream.synchronize()
+
+        report = memory.get_warp_cache_report()
+        self.assertEqual(
+            report["workspace_entries"], memory._MAX_WORKSPACE_CACHE_STREAMS
+        )
+        self.assertGreaterEqual(report["workspace_evictions"], before + 1)
+        for output in outputs:
+            torch.testing.assert_close(output, torch.ones_like(output))
+
+    def test_cache_clear_waits_for_inflight_workspace_stream(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        rasterizer = StandardRasterizer(_settings(background))
+        points = torch.zeros((4096, 3), dtype=torch.float32, device=DEVICE)
+        points[:, 2] = 2.0
+        stream = torch.cuda.Stream(device=DEVICE)
+        with torch.cuda.stream(stream):
+            visible = rasterizer.markVisible(points)
+
+        clear_standard_caches()
+
+        torch.testing.assert_close(visible, torch.ones_like(visible))
 
 
 if __name__ == "__main__":

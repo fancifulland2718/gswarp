@@ -496,7 +496,7 @@ def mark_visible(*args: Any):
     if points.shape[0] == 0:
         return torch.empty((0,), dtype=torch.bool, device=points.device)
     visible, _p_proj, _p_view_z = _project_visible_points_warp(points, viewmatrix, projmatrix)
-    return visible
+    return visible.to(torch.bool)
 
 
 __all__ = ["preprocess_gaussians", "mark_visible", "_make_empty_forward_outputs", "_compute_cov3d_from_scale_rotation_warp", "_project_visible_points_warp", "_compute_rgb_from_sh_warp"]

@@ -20,7 +20,11 @@ from .runtime import (
     get_binning_sort_mode,
     set_binning_sort_mode,
 )
-from .memory import clear_common_warp_caches, get_warp_cache_report
+from .memory import (
+    clear_common_warp_caches,
+    clear_flow_warp_caches,
+    get_warp_cache_report,
+)
 from .packing import _pack_forward_aux_buffers
 from .preprocess_ops import _make_empty_forward_outputs, preprocess_gaussians, mark_visible
 from .binning_ops import _build_binning_state
@@ -32,7 +36,13 @@ BACKEND_CAPABILITIES = frozenset({"stable_warp", "typed_forward", "typed_backwar
 
 
 def clear_warp_caches() -> None:
+    from gswarp._stream import clear_execution_stream_cache
+    from gswarp.fused_ssim import clear_fused_ssim_caches
+
     clear_common_warp_caches()
+    clear_flow_warp_caches()
+    clear_fused_ssim_caches()
+    clear_execution_stream_cache()
 
 
 def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):

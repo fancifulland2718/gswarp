@@ -18,7 +18,7 @@ No C++/CUDA compilation required.
 import torch
 import warp as wp
 
-from ._stream import ensure_aligned
+from ._stream import execution_context
 from ._tuning import register_kernel_class, get_tuned_block_dim, FAMILY_COMPUTE, FAMILY_MEMORY, FAMILY_ATOMIC
 
 wp.init()
@@ -261,7 +261,7 @@ def _box_mean_dist_kernel(
 # ---------------------------------------------------------------------------
 
 
-def distCUDA2(points: torch.Tensor) -> torch.Tensor:
+def _distCUDA2_impl(points: torch.Tensor) -> torch.Tensor:
     """Compute mean squared distance to 3 nearest neighbours for each point.
 
     Drop-in replacement for ``simple_knn._C.distCUDA2``.
@@ -297,7 +297,6 @@ def distCUDA2(points: torch.Tensor) -> torch.Tensor:
     if not bool(torch.isfinite(points).all()):
         raise ValueError("points contains NaN or Inf values")
 
-    ensure_aligned(points.device)
     points = points.contiguous()
     dev_str = str(device)
 
@@ -400,3 +399,12 @@ def distCUDA2(points: torch.Tensor) -> torch.Tensor:
     )
 
     return mean_dists
+
+
+def distCUDA2(points: torch.Tensor) -> torch.Tensor:
+    """Compute mean squared distance to three nearest neighbours."""
+
+    if isinstance(points, torch.Tensor) and points.is_cuda:
+        with execution_context(points.device):
+            return _distCUDA2_impl(points)
+    return _distCUDA2_impl(points)

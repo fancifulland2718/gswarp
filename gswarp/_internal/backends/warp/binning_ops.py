@@ -57,12 +57,14 @@ def _build_binning_state(
             # sync (.item()) that costs more than the sort itself during training.
             # Use the shared i32 radix sort buffers for depth sorting, then clone
             # sorted_point_ids before those buffers are reused by the duplicate sort.
-            _ds_key_buf, _ds_val_buf, _, _ = _get_radix_sort_i32_buffers(device, point_count * 2)
+            _ds_key_buf, _ds_val_buf, _ds_key_wp, _ds_val_wp = _get_radix_sort_i32_buffers(device, point_count * 2)
             point_depth_keys = _ds_key_buf[:point_count]
             sorted_point_ids = _ds_val_buf[:point_count]
             point_depth_keys.copy_(depths.view(torch.int32))
             sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
-            point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(_ds_key_buf, _ds_val_buf, point_count)
+            point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(
+                _ds_key_buf, _ds_val_buf, point_count, _ds_key_wp, _ds_val_wp
+            )
             sorted_point_ids = sorted_point_ids.clone()
 
             sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
@@ -104,7 +106,7 @@ def _build_binning_state(
             )
 
         if sort_mode == "warp_radix":
-            point_list_keys_buffer, point_list_buffer, _, _ = _get_radix_sort_buffers(device, num_rendered * 2)
+            point_list_keys_buffer, point_list_buffer, point_list_keys_wp, point_list_wp = _get_radix_sort_buffers(device, num_rendered * 2)
             point_list_keys = point_list_keys_buffer[:num_rendered]
             point_list = point_list_buffer[:num_rendered]
             depths_f32 = _as_detached_contiguous_dtype(depths, torch.float32)
@@ -128,7 +130,13 @@ def _build_binning_state(
                 device=str(radii.device),
             )
 
-            point_list_keys, point_list = _warp_radix_sort_pairs_in_place(point_list_keys_buffer, point_list_buffer, num_rendered)
+            point_list_keys, point_list = _warp_radix_sort_pairs_in_place(
+                point_list_keys_buffer,
+                point_list_buffer,
+                num_rendered,
+                point_list_keys_wp,
+                point_list_wp,
+            )
         elif sort_mode == "warp_depth_stable_tile":
             tile_id_buffer, point_list_buffer, tile_id_buffer_wp, point_list_buffer_wp = (
                 _get_radix_sort_i32_buffers(device, num_rendered * 2)
@@ -168,7 +176,13 @@ def _build_binning_state(
             _g1_cmd.launch()
             tile_ids = tile_id_buffer[:num_rendered]
             point_list = point_list_buffer[:num_rendered]
-            tile_ids, point_list = _warp_radix_sort_i32_pairs_in_place(tile_id_buffer, point_list_buffer, num_rendered)
+            tile_ids, point_list = _warp_radix_sort_i32_pairs_in_place(
+                tile_id_buffer,
+                point_list_buffer,
+                num_rendered,
+                tile_id_buffer_wp,
+                point_list_buffer_wp,
+            )
         else:
             if _can_use_warp_scalar_alloc(device):
                 tile_ids_warp, tile_ids = _allocate_warp_scalar_array(num_rendered, torch.int32, device)
