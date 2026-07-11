@@ -10,6 +10,10 @@ from unittest.mock import patch
 import torch
 
 import gswarp._stream as stream_interop
+from gswarp._rasterizer import (
+    rasterize_gaussians as rasterize_standard_raw,
+    rasterize_gaussians_backward as rasterize_standard_backward_raw,
+)
 from gswarp.rasterizer import (
     GaussianRasterizer as StandardRasterizer,
     GaussianRasterizationSettings as StandardSettings,
@@ -216,13 +220,21 @@ class RasterizerCUDAContractTests(unittest.TestCase):
             device=DEVICE,
             requires_grad=True,
         )
-        color, _, _ = rasterize_standard(
-            **_inputs(
-                torch.tensor(
-                    [[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE
-                ),
-                scales=scales,
+        inputs = _inputs(
+            torch.tensor(
+                [[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE
             ),
+            scales=scales,
+        )
+        inputs["colors_precomp"] = _empty()
+        inputs["sh"] = torch.randn(
+            (1, 16, 3),
+            dtype=torch.float32,
+            device=DEVICE,
+            requires_grad=True,
+        )
+        color, _, _ = rasterize_standard(
+            **inputs,
             raster_settings=_settings(background),
         )
         original = stream_interop.wp.from_torch
@@ -233,9 +245,84 @@ class RasterizerCUDAContractTests(unittest.TestCase):
             color.sum().backward()
 
         self.assertGreater(len(wrapped.call_args_list), 0)
+        self.assertLessEqual(len(wrapped.call_args_list), 23)
         for call in wrapped.call_args_list:
             self.assertIs(call.kwargs["requires_grad"], False)
             self.assertIs(call.kwargs["return_ctype"], False)
+
+    def test_raw_forward_backward_compatibility_round_trip(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        settings = _settings(background)
+        means3d = torch.tensor(
+            [[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE
+        )
+        inputs = _inputs(means3d)
+        forward = rasterize_standard_raw(
+            background,
+            means3d,
+            inputs["colors_precomp"],
+            inputs["opacities"],
+            inputs["scales"],
+            inputs["rotations"],
+            settings.scale_modifier,
+            inputs["cov3Ds_precomp"],
+            settings.viewmatrix,
+            settings.projmatrix,
+            settings.tanfovx,
+            settings.tanfovy,
+            settings.image_height,
+            settings.image_width,
+            inputs["sh"],
+            settings.sh_degree,
+            settings.campos,
+            settings.prefiltered,
+        )
+        (
+            num_rendered,
+            color,
+            depth,
+            alpha,
+            radii,
+            geom_buffer,
+            binning_buffer,
+            img_buffer,
+            proj_2d,
+            conic_2d,
+            conic_2d_inv,
+        ) = forward
+        grads = rasterize_standard_backward_raw(
+            background,
+            means3d,
+            radii,
+            inputs["colors_precomp"],
+            inputs["opacities"],
+            inputs["scales"],
+            inputs["rotations"],
+            settings.scale_modifier,
+            inputs["cov3Ds_precomp"],
+            settings.viewmatrix,
+            settings.projmatrix,
+            settings.tanfovx,
+            settings.tanfovy,
+            torch.ones_like(color),
+            torch.zeros_like(depth),
+            torch.zeros_like(alpha),
+            torch.zeros_like(proj_2d),
+            torch.zeros_like(conic_2d),
+            torch.zeros_like(conic_2d_inv),
+            inputs["sh"],
+            settings.sh_degree,
+            settings.campos,
+            geom_buffer,
+            num_rendered,
+            binning_buffer,
+            img_buffer,
+            alpha,
+        )
+
+        self.assertEqual(len(grads), 8)
+        self.assertTrue(all(torch.isfinite(grad).all() for grad in grads))
+        self.assertGreater(grads[6].abs().sum().item(), 0.0)
 
     def test_two_stream_forward_backward_matches_isolated_references(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)

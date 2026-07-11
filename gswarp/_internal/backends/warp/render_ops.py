@@ -5,13 +5,24 @@ from typing import Any
 import torch
 import warp as wp
 
+from ...._stream import torch_launch_array
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from . import runtime as _runtime
 from .memory import _C4_LAUNCH_CACHE_FWD_RENDER_TILED256
 from .packing import _prep
 from .render_kernels import _render_tiles_tiled256_warp_kernel
+from .state import RenderBackwardInterop
 
-def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, background, image_height, image_width):
+def _render_tiles_warp(
+    preprocess_outputs,
+    binning_state,
+    feature_ptr,
+    background,
+    image_height,
+    image_width,
+    *,
+    capture_backward_interop=False,
+):
     device = feature_ptr.device
     total_pixels = image_height * image_width
     out_color = torch.empty((NUM_CHANNELS, image_height, image_width), dtype=torch.float32, device=device)
@@ -25,7 +36,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
         out_depth.zero_()
         out_alpha.zero_()
         n_contrib.zero_()
-        return out_color, out_depth, out_alpha, n_contrib
+        return out_color, out_depth, out_alpha, n_contrib, None
 
     # F6: preprocess outputs are already contiguous from torch.empty(); skip redundant .detach().contiguous()
     points_xy_image = preprocess_outputs.points_xy_image
@@ -35,17 +46,17 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
     ranges = binning_state.ranges.reshape(-1)
     point_list = binning_state.point_list
 
-    _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
-    _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
-    _wp_points_xy = wp.from_torch(points_xy_image, dtype=wp.vec2)
-    _wp_features = wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32)
-    _wp_depths = wp.from_torch(depths, dtype=wp.float32)
-    _wp_conic_opacity = wp.from_torch(conic_opacity, dtype=wp.vec4)
-    _wp_bg = wp.from_torch(background.reshape(-1), dtype=wp.float32)
-    _wp_out_color = wp.from_torch(out_color.reshape(-1), dtype=wp.float32)
-    _wp_out_depth = wp.from_torch(out_depth.reshape(-1), dtype=wp.float32)
-    _wp_out_alpha = wp.from_torch(out_alpha.reshape(-1), dtype=wp.float32)
-    _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
+    _wp_ranges = torch_launch_array(ranges, dtype=wp.int32)
+    _wp_point_list = torch_launch_array(point_list, dtype=wp.int32)
+    _wp_points_xy = torch_launch_array(points_xy_image, dtype=wp.vec2)
+    _wp_features = torch_launch_array(feature_ptr.reshape(-1), dtype=wp.float32)
+    _wp_depths = torch_launch_array(depths, dtype=wp.float32)
+    _wp_conic_opacity = torch_launch_array(conic_opacity, dtype=wp.vec4)
+    _wp_bg = torch_launch_array(background.reshape(-1), dtype=wp.float32)
+    _wp_out_color = torch_launch_array(out_color.reshape(-1), dtype=wp.float32)
+    _wp_out_depth = torch_launch_array(out_depth.reshape(-1), dtype=wp.float32)
+    _wp_out_alpha = torch_launch_array(out_alpha.reshape(-1), dtype=wp.float32)
+    _wp_n_contrib = torch_launch_array(n_contrib, dtype=wp.int32)
     _compute_depth_flag = int(1 if _runtime.get_active_compute_depth() else 0)
     # T1: Tiled-256 cooperative forward render
     _grid_x_fwd = int(binning_state.grid_x)
@@ -67,7 +78,20 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
         for _i, _v in enumerate(_inp + _out):
             _cmd.set_param_at_index(_i, _v)
     _cmd.launch()
-    return out_color, out_depth, out_alpha, n_contrib
+    backward_interop = None
+    if capture_backward_interop:
+        backward_interop = RenderBackwardInterop(
+            ranges=_wp_ranges,
+            point_list=_wp_point_list,
+            points_xy=_wp_points_xy,
+            features=_wp_features,
+            depths=_wp_depths,
+            conic_opacity=_wp_conic_opacity,
+            background=_wp_bg,
+            out_alpha=_wp_out_alpha,
+            n_contrib=_wp_n_contrib,
+        )
+    return out_color, out_depth, out_alpha, n_contrib, backward_interop
 
 
 render_gaussians = _render_tiles_warp

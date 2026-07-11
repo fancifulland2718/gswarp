@@ -15,9 +15,10 @@ from ...._tuning import (
     FAMILY_COMPUTE,
     FAMILY_WARP_SPECIALIZED,
 )
+from ...._stream import torch_launch_array
 
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
-from .state import PreprocessOutputs
+from .state import PreprocessBackwardInterop, PreprocessOutputs
 from . import runtime as _runtime
 from .memory import (
     _C4_LAUNCH_CACHE_FWD_PREPROCESS,
@@ -182,12 +183,19 @@ def _project_preprocess_visible_points_warp(
     return visible_mask, p_proj, p_view_z
 
 
-def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
+def _compute_rgb_from_sh_warp(
+    means3D,
+    campos,
+    shs,
+    degree,
+    *,
+    capture_backward_interop=False,
+):
     point_count = means3D.shape[0]
     if point_count == 0 or shs.numel() == 0:
         rgb = torch.zeros((point_count, NUM_CHANNELS), dtype=torch.float32, device=means3D.device)
         clamped_int = torch.zeros((point_count, NUM_CHANNELS), dtype=torch.int32, device=means3D.device)
-        return rgb, clamped_int
+        return rgb, clamped_int, None
 
     rgb = torch.empty((point_count, NUM_CHANNELS), dtype=torch.float32, device=means3D.device)
     clamped_int = torch.empty((point_count, NUM_CHANNELS), dtype=torch.int32, device=means3D.device)
@@ -196,15 +204,15 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
     _dev = str(means3D.device)
     # P2b: vec3 SH forward 鈥?3脳 fewer load/store instructions
     _inp = [
-        wp.from_torch(_prep(means3D), dtype=wp.vec3),
-        wp.from_torch(_prep(campos).reshape(-1), dtype=wp.float32),
-        wp.from_torch(_prep(shs).reshape(-1, 3), dtype=wp.vec3),
+        torch_launch_array(_prep(means3D), dtype=wp.vec3),
+        torch_launch_array(_prep(campos).reshape(-1), dtype=wp.float32),
+        torch_launch_array(_prep(shs).reshape(-1, 3), dtype=wp.vec3),
         int(degree),
         int(coeff_count),
     ]
     _out = [
-        wp.from_torch(rgb.reshape(-1, 3), dtype=wp.vec3),
-        wp.from_torch(clamped_int.reshape(-1), dtype=wp.int32),
+        torch_launch_array(rgb.reshape(-1, 3), dtype=wp.vec3),
+        torch_launch_array(clamped_int.reshape(-1), dtype=wp.int32),
     ]
     _key = (_dev, point_count)
     _cmd = _C4_LAUNCH_CACHE_FWD_SH.get(_key)
@@ -216,7 +224,14 @@ def _compute_rgb_from_sh_warp(means3D, campos, shs, degree):
         for _i, _v in enumerate(_inp + _out):
             _cmd.set_param_at_index(_i, _v)
     _cmd.launch()
-    return rgb, clamped_int
+    backward_interop = None
+    if capture_backward_interop:
+        backward_interop = PreprocessBackwardInterop(
+            means3d=_inp[0],
+            campos=_inp[1],
+            clamped=_out[1],
+        )
+    return rgb, clamped_int, backward_interop
 
 
 def preprocess_gaussians(
@@ -237,6 +252,7 @@ def preprocess_gaussians(
     colors_precomp=None,
     opacities=None,
     prefiltered=False,
+    capture_backward_interop=False,
 ):
         _runtime._require_warp()
         if means3D.ndim != 2 or means3D.shape[1] != 3:
@@ -251,6 +267,9 @@ def preprocess_gaussians(
             raise ValueError("Provide exactly one of cov3D_precomp or scales/rotations")
 
         device = means3D.device
+        backward_interop = (
+            PreprocessBackwardInterop() if capture_backward_interop else None
+        )
 
         cov3d_all = None
         # E1: for scale_rotation Warp path, defer cov3d to fused kernel
@@ -294,13 +313,13 @@ def preprocess_gaussians(
           visible_mask = torch.empty((point_count,), dtype=torch.int32, device=device)
           if point_count > 0:
               _e1_inp = [
-                  wp.from_torch(_prep(means3D), dtype=wp.vec3),
-                  wp.from_torch(_prep(scales), dtype=wp.vec3),
-                  wp.from_torch(_prep(rotations), dtype=wp.vec4),
+                  torch_launch_array(_prep(means3D), dtype=wp.vec3),
+                  torch_launch_array(_prep(scales), dtype=wp.vec3),
+                  torch_launch_array(_prep(rotations), dtype=wp.vec4),
                   float(scale_modifier),
-                  wp.from_torch(_prep(opacities.reshape(-1)), dtype=wp.float32),
-                  wp.from_torch(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
-                  wp.from_torch(_prep(projmatrix).reshape(-1), dtype=wp.float32),
+                  torch_launch_array(_prep(opacities.reshape(-1)), dtype=wp.float32),
+                  torch_launch_array(_prep(viewmatrix).reshape(-1), dtype=wp.float32),
+                  torch_launch_array(_prep(projmatrix).reshape(-1), dtype=wp.float32),
                   float(tanfovx),
                   float(tanfovy),
                   float(focal_x),
@@ -311,16 +330,16 @@ def preprocess_gaussians(
                   int(grid_y),
               ]
               _e1_out = [
-                  wp.from_torch(cov3d_all.reshape(-1), dtype=wp.float32),
-                  wp.from_torch(visible_mask, dtype=wp.int32),
-                  wp.from_torch(depths, dtype=wp.float32),
-                  wp.from_torch(radii, dtype=wp.int32),
-                  wp.from_torch(proj_2d, dtype=wp.vec2),
-                  wp.from_torch(conic_2d, dtype=wp.vec3),
-                  wp.from_torch(conic_2d_inv, dtype=wp.vec3),
-                  wp.from_torch(points_xy_image, dtype=wp.vec2),
-                  wp.from_torch(tiles_touched, dtype=wp.int32),
-                  wp.from_torch(conic_opacity, dtype=wp.vec4),
+                  torch_launch_array(cov3d_all.reshape(-1), dtype=wp.float32),
+                  torch_launch_array(visible_mask, dtype=wp.int32),
+                  torch_launch_array(depths, dtype=wp.float32),
+                  torch_launch_array(radii, dtype=wp.int32),
+                  torch_launch_array(proj_2d, dtype=wp.vec2),
+                  torch_launch_array(conic_2d, dtype=wp.vec3),
+                  torch_launch_array(conic_2d_inv, dtype=wp.vec3),
+                  torch_launch_array(points_xy_image, dtype=wp.vec2),
+                  torch_launch_array(tiles_touched, dtype=wp.int32),
+                  torch_launch_array(conic_opacity, dtype=wp.vec4),
               ]
               _e1_key = (str(device), point_count)
               _e1_cmd = _C4_LAUNCH_CACHE_FWD_PREPROCESS.get(_e1_key)
@@ -339,6 +358,14 @@ def preprocess_gaussians(
                   for _i, _v in enumerate(_e1_inp + _e1_out):
                       _e1_cmd.set_param_at_index(_i, _v)
               _e1_cmd.launch()
+              if backward_interop is not None:
+                  backward_interop.means3d = _e1_inp[0]
+                  backward_interop.scales = _e1_inp[1]
+                  backward_interop.rotations = _e1_inp[2]
+                  backward_interop.viewmatrix = _e1_inp[5]
+                  backward_interop.projmatrix = _e1_inp[6]
+                  backward_interop.cov3d = _e1_out[0]
+                  backward_interop.radii = _e1_out[3]
           p_proj_all = None
           p_view_z_all = None
         elif has_precomputed_cov:
@@ -387,6 +414,7 @@ def preprocess_gaussians(
                 clamped=clamped,
                 conic_opacity=conic_opacity,
                 cov3d_all=cov3d_all.to(dtype=torch.float32),
+                backward_interop=backward_interop,
             )
 
         if has_scale_rotation:
@@ -467,7 +495,17 @@ def preprocess_gaussians(
                 raise ValueError("campos is required when computing colors from SH coefficients")
             shs = shs.to(device=device, dtype=torch.float32)
             campos = campos.to(device=device, dtype=torch.float32)
-            rgb, clamped = _compute_rgb_from_sh_warp(means3D, campos, shs, degree)
+            rgb, clamped, sh_backward_interop = _compute_rgb_from_sh_warp(
+                means3D,
+                campos,
+                shs,
+                degree,
+                capture_backward_interop=capture_backward_interop,
+            )
+            if backward_interop is not None and sh_backward_interop is not None:
+                backward_interop.means3d = sh_backward_interop.means3d
+                backward_interop.campos = sh_backward_interop.campos
+                backward_interop.clamped = sh_backward_interop.clamped
 
         return PreprocessOutputs(
             visible=visible,
@@ -482,6 +520,7 @@ def preprocess_gaussians(
             clamped=clamped,
             conic_opacity=conic_opacity,
             cov3d_all=cov3d_all.to(dtype=torch.float32),
+            backward_interop=backward_interop,
         )
 
 

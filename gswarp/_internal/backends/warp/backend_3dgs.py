@@ -30,7 +30,7 @@ from .preprocess_ops import _make_empty_forward_outputs, preprocess_gaussians, m
 from .binning_ops import _build_binning_state
 from .render_ops import _render_tiles_warp
 from .backward_ops import rasterize_gaussians_backward, rasterize_gaussians_backward_typed
-from .state import ForwardResult, ForwardState
+from .state import ForwardResult, ForwardState, StandardBackwardInterop
 
 BACKEND_CAPABILITIES = frozenset({"stable_warp", "typed_forward", "typed_backward", "mark_visible"})
 
@@ -99,6 +99,7 @@ def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):
                     colors_precomp=_colors if _colors.numel() != 0 else None,
                     opacities=_opacity,
                     prefiltered=_prefiltered,
+                    capture_backward_interop=not pack_compatibility_state,
                 )
             feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs.rgb
 
@@ -120,17 +121,25 @@ def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):
                     colors_precomp=_colors if _colors.numel() != 0 else None,
                     opacities=_opacity,
                     prefiltered=_prefiltered,
+                    capture_backward_interop=not pack_compatibility_state,
                 )
             feature_ptr = _colors.reshape(means3D.shape[0], NUM_CHANNELS).to(dtype=torch.float32) if _colors.numel() != 0 else preprocess_outputs.rgb
 
         binning_state = _build_binning_state(preprocess_outputs, image_height, image_width)
-        out_color, out_depth, out_alpha, _n_contrib = _render_tiles_warp(
+        (
+            out_color,
+            out_depth,
+            out_alpha,
+            _n_contrib,
+            render_backward_interop,
+        ) = _render_tiles_warp(
                 preprocess_outputs,
                 binning_state,
                 feature_ptr,
                 _background.to(dtype=torch.float32),
                 image_height,
                 image_width,
+                capture_backward_interop=not pack_compatibility_state,
             )
 
         if not pack_compatibility_state:
@@ -139,7 +148,15 @@ def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):
                 color=out_color, depth=out_depth, alpha=out_alpha, radii=preprocess_outputs.radii,
                 proj_2d=preprocess_outputs.proj_2d, conic_2d=preprocess_outputs.conic_2d,
                 conic_2d_inv=preprocess_outputs.conic_2d_inv,
-                state=ForwardState(preprocess_outputs, binning_state, _n_contrib),
+                state=ForwardState(
+                    preprocess_outputs,
+                    binning_state,
+                    _n_contrib,
+                    StandardBackwardInterop(
+                        render=render_backward_interop,
+                        preprocess=preprocess_outputs.backward_interop,
+                    ),
+                ),
             )
         geom_buffer, binning_buffer, img_buffer = _pack_forward_aux_buffers(preprocess_outputs, binning_state, _n_contrib)
         return (

@@ -6,6 +6,7 @@ import unittest
 
 import torch
 
+from gswarp._stream import set_launch_params
 from gswarp._internal.api.validation import normalize_gaussian_inputs
 from gswarp._internal.backends.warp.packing import _pack_forward_aux_buffers, _unpack_forward_aux_buffers
 from gswarp._internal.backends.warp.state import BinningState, PreprocessOutputs
@@ -50,6 +51,26 @@ class KNNContractTests(unittest.TestCase):
             with self.subTest(point_count=point_count):
                 with self.assertRaisesRegex(ValueError, "at least 4 points"):
                     distCUDA2(points)
+
+
+class LaunchParameterPackingTests(unittest.TestCase):
+    def test_converts_array_views_without_wrapping_scalar_parameters(self) -> None:
+        marker = object()
+
+        class ArrayView:
+            def __ctype__(self):
+                return marker
+
+        class Command:
+            values = None
+
+            def set_params_from_ctypes(self, values):
+                self.values = values
+
+        command = Command()
+        set_launch_params(command, [ArrayView(), 4, 2.5])
+
+        self.assertEqual(command.values, [marker, 4, 2.5])
 
 
 class PackedStateContractTests(unittest.TestCase):

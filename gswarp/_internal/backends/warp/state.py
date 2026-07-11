@@ -3,9 +3,47 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import warp as wp
 
 from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class RenderBackwardInterop:
+    """Forward-created Warp views reused by the standard render backward."""
+
+    ranges: Any
+    point_list: Any
+    points_xy: Any
+    features: Any
+    depths: Any
+    conic_opacity: Any
+    background: Any
+    out_alpha: Any
+    n_contrib: Any
+
+
+@dataclass(slots=True)
+class PreprocessBackwardInterop:
+    """Forward-created Warp views reused by preprocess and SH backward."""
+
+    means3d: Any | None = None
+    scales: Any | None = None
+    rotations: Any | None = None
+    viewmatrix: Any | None = None
+    projmatrix: Any | None = None
+    radii: Any | None = None
+    cov3d: Any | None = None
+    campos: Any | None = None
+    clamped: Any | None = None
+
+
+@dataclass(slots=True)
+class StandardBackwardInterop:
+    """Owned non-autograd views retained by one standard forward graph."""
+
+    render: RenderBackwardInterop | None = None
+    preprocess: PreprocessBackwardInterop | None = None
+
 
 @dataclass(slots=True)
 class PreprocessOutputs:
@@ -21,6 +59,7 @@ class PreprocessOutputs:
     clamped: torch.Tensor
     conic_opacity: torch.Tensor
     cov3d_all: torch.Tensor
+    backward_interop: PreprocessBackwardInterop | None = None
 
 
 @dataclass(slots=True)
@@ -39,6 +78,7 @@ class ForwardState:
     preprocess: PreprocessOutputs
     binning: BinningState
     n_contrib: torch.Tensor
+    backward_interop: StandardBackwardInterop | None = None
 
 
 @dataclass(slots=True)
@@ -57,4 +97,12 @@ class ForwardResult:
     aux: tuple[torch.Tensor, ...] = ()
 
 
-__all__ = ["PreprocessOutputs", "BinningState", "ForwardState", "ForwardResult"]
+__all__ = [
+    "RenderBackwardInterop",
+    "PreprocessBackwardInterop",
+    "StandardBackwardInterop",
+    "PreprocessOutputs",
+    "BinningState",
+    "ForwardState",
+    "ForwardResult",
+]

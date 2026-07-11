@@ -216,6 +216,18 @@ def torch_launch_array(tensor: torch.Tensor, dtype=None):
     )
 
 
+def set_launch_params(command, values) -> None:
+    """Update a recorded launch without repeating Warp's type conversion."""
+
+    packed_values = []
+    for value in values:
+        to_ctype = getattr(value, "__ctype__", None)
+        # Regular Warp arrays own the Torch reference; this descriptor only
+        # carries the raw launch metadata retained by the cached command.
+        packed_values.append(to_ctype() if to_ctype is not None else value)
+    command.set_params_from_ctypes(packed_values)
+
+
 def clear_execution_stream_cache(
     device: torch.device | str | None = None,
 ) -> None:
@@ -241,5 +253,6 @@ __all__ = [
     "resolve_execution_context",
     "submission_guard",
     "torch_launch_array",
+    "set_launch_params",
     "clear_execution_stream_cache",
 ]
