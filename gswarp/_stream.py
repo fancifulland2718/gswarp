@@ -205,6 +205,17 @@ def ensure_aligned(device: torch.device | str | None = None) -> None:
             _BOUND_STREAM_HANDLES[resolved.device_index] = resolved.stream_handle
 
 
+def torch_launch_array(tensor: torch.Tensor, dtype=None):
+    """Wrap a tensor without attaching a second Warp autograd graph."""
+
+    return wp.from_torch(
+        tensor,
+        dtype=dtype,
+        requires_grad=False,
+        return_ctype=False,
+    )
+
+
 def clear_execution_stream_cache(
     device: torch.device | str | None = None,
 ) -> None:
@@ -229,5 +240,6 @@ __all__ = [
     "execution_context",
     "resolve_execution_context",
     "submission_guard",
+    "torch_launch_array",
     "clear_execution_stream_cache",
 ]

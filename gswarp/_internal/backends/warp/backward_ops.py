@@ -15,6 +15,7 @@ from ...._tuning import (
     FAMILY_COMPUTE,
     FAMILY_WARP_SPECIALIZED,
 )
+from ...._stream import torch_launch_array
 
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from . import runtime as _runtime
@@ -56,17 +57,17 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
     clamped_i32 = clamped.contiguous() if clamped.dtype == torch.int32 else clamped.to(torch.int32).contiguous()
     _dev = str(means3D.device)
 
-    _w_means = wp.from_torch(means3D.contiguous(), dtype=wp.vec3)
-    _w_campos = wp.from_torch(campos.contiguous().reshape(-1), dtype=wp.float32)
-    _w_grad_means = wp.from_torch(grad_means, dtype=wp.vec3)
+    _w_means = torch_launch_array(means3D.contiguous(), dtype=wp.vec3)
+    _w_campos = torch_launch_array(campos.contiguous().reshape(-1), dtype=wp.float32)
+    _w_grad_means = torch_launch_array(grad_means, dtype=wp.vec3)
 
     if degree <= 1:
         # degree 0-1: use monolithic kernel (scalar arrays, no deg 2-3 work)
         grad_sh = torch.zeros(shs.shape, dtype=shs.dtype, device=shs.device)
-        _w_shs = wp.from_torch(shs.contiguous().reshape(-1), dtype=wp.float32)
-        _w_clamped = wp.from_torch(clamped_i32.reshape(-1), dtype=wp.int32)
-        _w_grad_color = wp.from_torch(grad_color.contiguous().reshape(-1), dtype=wp.float32)
-        _w_grad_sh = wp.from_torch(grad_sh.reshape(-1), dtype=wp.float32)
+        _w_shs = torch_launch_array(shs.contiguous().reshape(-1), dtype=wp.float32)
+        _w_clamped = torch_launch_array(clamped_i32.reshape(-1), dtype=wp.int32)
+        _w_grad_color = torch_launch_array(grad_color.contiguous().reshape(-1), dtype=wp.float32)
+        _w_grad_sh = torch_launch_array(grad_sh.reshape(-1), dtype=wp.float32)
         _inp = [_w_means, _w_campos, _w_shs, int(degree), int(coeff_count), _w_clamped, _w_grad_color]
         _out = [_w_grad_means, _w_grad_sh]
         _key = (_dev, point_count)
@@ -82,12 +83,12 @@ def _backward_rgb_from_sh_warp(means3D, campos, shs, degree, clamped, grad_color
     else:
         # SoA layout for coalesced GPU access: (P, K, 3) 鈫?(K, P, 3)
         # Adjacent threads access adjacent vec3s 鈫?eliminates 86% excessive sectors
-        _w_shs_v3 = wp.from_torch(shs.permute(1, 0, 2).contiguous().reshape(-1, 3), dtype=wp.vec3)
+        _w_shs_v3 = torch_launch_array(shs.permute(1, 0, 2).contiguous().reshape(-1, 3), dtype=wp.vec3)
         grad_sh_soa = torch.zeros((coeff_count, point_count, 3), dtype=shs.dtype, device=means3D.device)
-        _w_grad_sh_v3 = wp.from_torch(grad_sh_soa.reshape(-1, 3), dtype=wp.vec3)
+        _w_grad_sh_v3 = torch_launch_array(grad_sh_soa.reshape(-1, 3), dtype=wp.vec3)
         # M2: pass grad_color + clamped directly to kernel (avoids _masked_grad allocation)
-        _w_grad_color_v3 = wp.from_torch(grad_color.contiguous().reshape(-1, 3), dtype=wp.vec3)
-        _w_clamped_i32 = wp.from_torch(clamped_i32.reshape(-1), dtype=wp.int32)
+        _w_grad_color_v3 = torch_launch_array(grad_color.contiguous().reshape(-1, 3), dtype=wp.vec3)
+        _w_clamped_i32 = torch_launch_array(clamped_i32.reshape(-1), dtype=wp.int32)
         _key = (_dev, point_count)
 
         _inp = [_w_means, _w_campos, _w_shs_v3, int(degree), int(coeff_count), int(point_count), _w_grad_color_v3, _w_clamped_i32]
@@ -114,17 +115,17 @@ def _backward_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations, 
     grad_scales = torch.empty(scales.shape, dtype=scales.dtype, device=scales.device)
     grad_rot = torch.empty(rotations.shape, dtype=rotations.dtype, device=rotations.device)
     N = scales.shape[0]
-    # C4: cache wp.from_torch wrappers + Launch object
+    # C4: cache launch objects; tensor wrappers do not attach Warp gradients.
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        wp.from_torch(scales.contiguous(), dtype=wp.vec3),
-        wp.from_torch(rotations.contiguous(), dtype=wp.vec4),
+        torch_launch_array(scales.contiguous(), dtype=wp.vec3),
+        torch_launch_array(rotations.contiguous(), dtype=wp.vec4),
         float(scale_modifier),
-        wp.from_torch(grad_cov3d.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_cov3d.contiguous().reshape(-1), dtype=wp.float32),
     ]
     _out = [
-        wp.from_torch(grad_scales, dtype=wp.vec3),
-        wp.from_torch(grad_rot, dtype=wp.vec4),
+        torch_launch_array(grad_scales, dtype=wp.vec3),
+        torch_launch_array(grad_rot, dtype=wp.vec4),
     ]
     _key = (str(scales.device), N)
     _cmd = _C4_LAUNCH_CACHE_COV3D.get(_key)
@@ -190,22 +191,22 @@ def _backward_render_tiles_warp(
     _num_tiles = _grid_x * _grid_y
     _num_rendered = int(binning_state.num_rendered)
 
-    _wp_ranges = wp.from_torch(ranges, dtype=wp.int32)
-    _wp_point_list = wp.from_torch(point_list, dtype=wp.int32)
-    _wp_points_xy = wp.from_torch(points_xy_image, dtype=wp.vec2)
-    _wp_features = wp.from_torch(feature_ptr.reshape(-1), dtype=wp.float32)
-    _wp_depths = wp.from_torch(depths, dtype=wp.float32)
-    _wp_conic_opacity = wp.from_torch(conic_opacity, dtype=wp.vec4)
-    _wp_bg = wp.from_torch(background.reshape(-1), dtype=wp.float32)
-    _wp_out_alpha = wp.from_torch(out_alpha, dtype=wp.float32)
-    _wp_n_contrib = wp.from_torch(n_contrib, dtype=wp.int32)
-    _wp_grad_color = wp.from_torch(grad_color, dtype=wp.float32)
-    _wp_grad_depth = wp.from_torch(grad_depth, dtype=wp.float32)
-    _wp_grad_alpha = wp.from_torch(grad_alpha, dtype=wp.float32)
-    _wp_grad_xy = wp.from_torch(grad_points_xy, dtype=wp.vec2)
-    _wp_grad_d = wp.from_torch(grad_depths, dtype=wp.float32)
-    _wp_grad_co = wp.from_torch(grad_conic_opacity, dtype=wp.vec4)
-    _wp_grad_f = wp.from_torch(grad_feature, dtype=wp.vec3)
+    _wp_ranges = torch_launch_array(ranges, dtype=wp.int32)
+    _wp_point_list = torch_launch_array(point_list, dtype=wp.int32)
+    _wp_points_xy = torch_launch_array(points_xy_image, dtype=wp.vec2)
+    _wp_features = torch_launch_array(feature_ptr.reshape(-1), dtype=wp.float32)
+    _wp_depths = torch_launch_array(depths, dtype=wp.float32)
+    _wp_conic_opacity = torch_launch_array(conic_opacity, dtype=wp.vec4)
+    _wp_bg = torch_launch_array(background.reshape(-1), dtype=wp.float32)
+    _wp_out_alpha = torch_launch_array(out_alpha, dtype=wp.float32)
+    _wp_n_contrib = torch_launch_array(n_contrib, dtype=wp.int32)
+    _wp_grad_color = torch_launch_array(grad_color, dtype=wp.float32)
+    _wp_grad_depth = torch_launch_array(grad_depth, dtype=wp.float32)
+    _wp_grad_alpha = torch_launch_array(grad_alpha, dtype=wp.float32)
+    _wp_grad_xy = torch_launch_array(grad_points_xy, dtype=wp.vec2)
+    _wp_grad_d = torch_launch_array(grad_depths, dtype=wp.float32)
+    _wp_grad_co = torch_launch_array(grad_conic_opacity, dtype=wp.vec4)
+    _wp_grad_f = torch_launch_array(grad_feature, dtype=wp.vec3)
     _compute_depth_flag = int(1 if _runtime.get_active_compute_depth() else 0)
 
     _dim = _num_tiles * (BLOCK_X * BLOCK_Y)
@@ -236,18 +237,18 @@ def _backward_projected_means_warp(means3D, radii, projmatrix, viewmatrix,      
 
     out = torch.empty(means3D.shape, dtype=means3D.dtype, device=means3D.device)
     N = means3D.shape[0]
-    # C4: cache wp.from_torch wrappers + Launch object
+    # C4: cache launch objects; tensor wrappers do not attach Warp gradients.
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
-        wp.from_torch(radii.contiguous(), dtype=wp.int32),
-        wp.from_torch(projmatrix.contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(viewmatrix.contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(grad_mean2d.contiguous(), dtype=wp.vec2),
-        wp.from_torch(grad_proj_2d.contiguous(), dtype=wp.vec2),
-        wp.from_torch(grad_depths.contiguous(), dtype=wp.float32),
+        torch_launch_array(means3D.contiguous(), dtype=wp.vec3),
+        torch_launch_array(radii.contiguous(), dtype=wp.int32),
+        torch_launch_array(projmatrix.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(viewmatrix.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_mean2d.contiguous(), dtype=wp.vec2),
+        torch_launch_array(grad_proj_2d.contiguous(), dtype=wp.vec2),
+        torch_launch_array(grad_depths.contiguous(), dtype=wp.float32),
     ]
-    _out = [wp.from_torch(out, dtype=wp.vec3)]
+    _out = [torch_launch_array(out, dtype=wp.vec3)]
     _key = (str(means3D.device), N)
     _cmd = _C4_LAUNCH_CACHE_PROJ_MEANS.get(_key)
     if _cmd is None:
@@ -281,24 +282,24 @@ def _backward_cov2d_warp(
 
     N = means3D.shape[0]
     viewmatrix = viewmatrix.contiguous()
-    # C4: cache wp.from_torch wrappers + Launch object
+    # C4: cache launch objects; tensor wrappers do not attach Warp gradients.
     _inp = [
         # C5: skip redundant .detach().contiguous()
-        wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
-        wp.from_torch(radii.contiguous(), dtype=wp.int32),
-        wp.from_torch(cov3D.contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(viewmatrix.reshape(-1), dtype=wp.float32),
+        torch_launch_array(means3D.contiguous(), dtype=wp.vec3),
+        torch_launch_array(radii.contiguous(), dtype=wp.int32),
+        torch_launch_array(cov3D.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(viewmatrix.reshape(-1), dtype=wp.float32),
         float(tanfovx),
         float(tanfovy),
         float(focal_x),
         float(focal_y),
-        wp.from_torch(grad_conic.contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(grad_conic_2d.contiguous().reshape(-1), dtype=wp.float32),
-        wp.from_torch(grad_conic_2d_inv.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_conic.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_conic_2d.contiguous().reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_conic_2d_inv.contiguous().reshape(-1), dtype=wp.float32),
     ]
     _out = [
-        wp.from_torch(grad_means, dtype=wp.vec3),
-        wp.from_torch(grad_cov.reshape(-1), dtype=wp.float32),
+        torch_launch_array(grad_means, dtype=wp.vec3),
+        torch_launch_array(grad_cov.reshape(-1), dtype=wp.float32),
     ]
     _key = (str(means3D.device), N)
     _cmd = _C4_LAUNCH_CACHE_COV2D.get(_key)
@@ -496,33 +497,33 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                 _grad_conic_2d_inv_flat = grad_conic_2d_inv_active.contiguous().reshape(-1)
                 _cov3d_flat = cov3d_all.contiguous().reshape(-1)
                 _e2_inp = [
-                    wp.from_torch(means3D.contiguous(), dtype=wp.vec3),
-                    wp.from_torch(preprocess_outputs.radii.contiguous(), dtype=wp.int32),
-                    wp.from_torch(_proj_flat, dtype=wp.float32),
-                    wp.from_torch(_view_flat, dtype=wp.float32),
-                    wp.from_torch(render_grad_points, dtype=wp.vec2),
-                    wp.from_torch(grad_proj_2d_active.contiguous(), dtype=wp.vec2),
-                    wp.from_torch(render_grad_depths, dtype=wp.float32),
-                    wp.from_torch(_cov3d_flat, dtype=wp.float32),
+                    torch_launch_array(means3D.contiguous(), dtype=wp.vec3),
+                    torch_launch_array(preprocess_outputs.radii.contiguous(), dtype=wp.int32),
+                    torch_launch_array(_proj_flat, dtype=wp.float32),
+                    torch_launch_array(_view_flat, dtype=wp.float32),
+                    torch_launch_array(render_grad_points, dtype=wp.vec2),
+                    torch_launch_array(grad_proj_2d_active.contiguous(), dtype=wp.vec2),
+                    torch_launch_array(render_grad_depths, dtype=wp.float32),
+                    torch_launch_array(_cov3d_flat, dtype=wp.float32),
                     float(_tan_fovx),
                     float(_tan_fovy),
                     float(focal_x),
                     float(focal_y),
-                    wp.from_torch(render_grad_conic_opacity, dtype=wp.vec4),
-                    wp.from_torch(_grad_conic_2d_flat, dtype=wp.float32),
-                    wp.from_torch(_grad_conic_2d_inv_flat, dtype=wp.float32),
-                    wp.from_torch(_scales.contiguous(), dtype=wp.vec3),
-                    wp.from_torch(_rotations.contiguous(), dtype=wp.vec4),
+                    torch_launch_array(render_grad_conic_opacity, dtype=wp.vec4),
+                    torch_launch_array(_grad_conic_2d_flat, dtype=wp.float32),
+                    torch_launch_array(_grad_conic_2d_inv_flat, dtype=wp.float32),
+                    torch_launch_array(_scales.contiguous(), dtype=wp.vec3),
+                    torch_launch_array(_rotations.contiguous(), dtype=wp.vec4),
                     float(_scale_modifier),
-                    wp.from_torch(_sh_grad, dtype=wp.vec3),
+                    torch_launch_array(_sh_grad, dtype=wp.vec3),
                     int(_has_sh),
-                    wp.from_torch(render_grad_points, dtype=wp.vec2),
+                    torch_launch_array(render_grad_points, dtype=wp.vec2),
                 ]
                 _e2_out = [
-                    wp.from_torch(grad_means3D, dtype=wp.vec3),
-                    wp.from_torch(grad_means2D, dtype=wp.vec3),
-                    wp.from_torch(grad_scales, dtype=wp.vec3),
-                    wp.from_torch(grad_rotations, dtype=wp.vec4),
+                    torch_launch_array(grad_means3D, dtype=wp.vec3),
+                    torch_launch_array(grad_means2D, dtype=wp.vec3),
+                    torch_launch_array(grad_scales, dtype=wp.vec3),
+                    torch_launch_array(grad_rotations, dtype=wp.vec4),
                 ]
                 _e2_key = (str(device), point_count, int(_has_sh))
                 _e2_cmd = _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS.get(_e2_key)
@@ -563,17 +564,17 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                 grad_means3D = torch.empty(means3D.shape, dtype=means3D.dtype, device=device)
                 grad_means2D = torch.empty((point_count, 3), dtype=torch.float32, device=device)
                 _sh_grad_input = _grad_mean_sh if _has_sh else _grad_projected
-                # C4: cache wp.from_torch + Launch object
+                # C4: cache launch objects; tensor wrappers remain call-scoped.
                 _acc_inp = [
-                    wp.from_torch(_grad_projected, dtype=wp.vec3),
-                    wp.from_torch(_grad_means_cov, dtype=wp.vec3),
-                    wp.from_torch(_sh_grad_input, dtype=wp.vec3),
+                    torch_launch_array(_grad_projected, dtype=wp.vec3),
+                    torch_launch_array(_grad_means_cov, dtype=wp.vec3),
+                    torch_launch_array(_sh_grad_input, dtype=wp.vec3),
                     int(_has_sh),
-                    wp.from_torch(render_grad_points, dtype=wp.vec2),
+                    torch_launch_array(render_grad_points, dtype=wp.vec2),
                 ]
                 _acc_out = [
-                    wp.from_torch(grad_means3D, dtype=wp.vec3),
-                    wp.from_torch(grad_means2D, dtype=wp.vec3),
+                    torch_launch_array(grad_means3D, dtype=wp.vec3),
+                    torch_launch_array(grad_means2D, dtype=wp.vec3),
                 ]
                 _acc_key = (str(device), point_count, int(_has_sh))
                 _acc_cmd = _C4_LAUNCH_CACHE_ACCUM.get(_acc_key)

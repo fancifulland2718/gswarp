@@ -19,7 +19,12 @@ import weakref
 import torch
 import warp as wp
 
-from ._stream import current_execution_context, execution_context, submission_guard
+from ._stream import (
+    current_execution_context,
+    execution_context,
+    submission_guard,
+    torch_launch_array,
+)
 from ._tuning import register_kernel_class, get_tuned_block_dim, FAMILY_MEMORY
 
 wp.init()
@@ -149,12 +154,12 @@ class _SSIMPlan:
         # starts, so the H-pass values are never live when bwd_h overwrites them.
         # Saving: 3*N float32 elements vs. two separate allocations.
         shared_buf = torch.empty(4 * N, dtype=torch.float32, device=device)
-        w_h = [wp.from_torch(shared_buf[i * N:(i + 1) * N]) for i in range(4)]
-        w_t = [wp.from_torch(shared_buf[i * N:(i + 1) * N]) for i in range(3)]
+        w_h = [torch_launch_array(shared_buf[i * N:(i + 1) * N]) for i in range(4)]
+        w_t = [torch_launch_array(shared_buf[i * N:(i + 1) * N]) for i in range(3)]
 
         # dm workspace (3 x N) - written by fwd_v, read by bwd_h
         dm_buf = torch.empty(3 * N, dtype=torch.float32, device=device)
-        w_dm = [wp.from_torch(dm_buf[i * N:(i + 1) * N]) for i in range(3)]
+        w_dm = [torch_launch_array(dm_buf[i * N:(i + 1) * N]) for i in range(3)]
         self.t_dm = [dm_buf[i * N:(i + 1) * N].view(B, CH, H, W) for i in range(3)]
 
         # SSIM output
@@ -166,10 +171,10 @@ class _SSIMPlan:
             Nv = N
             Hv = Wv = 0
             self.t_ssim = torch.empty(N, dtype=torch.float32, device=device)
-        w_ssim = wp.from_torch(self.t_ssim)
+        w_ssim = torch_launch_array(self.t_ssim)
 
         # Placeholder for upstream grad
-        ph_up = wp.from_torch(torch.ones(1, dtype=torch.float32, device=device))
+        ph_up = torch_launch_array(torch.ones(1, dtype=torch.float32, device=device))
 
         # --- Record all 4 launch commands ---
         # Use a workspace array as placeholder for img1/img2 (same dtype/size)
@@ -234,8 +239,8 @@ class _SSIMPlan:
 
     def forward(self, img1, img2):
         """Run forward. Returns (loss_scalar, w_img1, w_img2)."""
-        w_img1 = wp.from_torch(img1.view(-1))
-        w_img2 = wp.from_torch(img2.view(-1))
+        w_img1 = torch_launch_array(img1.view(-1))
+        w_img2 = torch_launch_array(img2.view(-1))
 
         self._cmd_fwd_h.set_param_at_index(0, w_img1)
         self._cmd_fwd_h.set_param_at_index(1, w_img2)
@@ -247,11 +252,11 @@ class _SSIMPlan:
 
     def backward(self, w_img1, w_img2, opt_grad):
         """Run backward. Returns dL/dimg1 tensor."""
-        w_up = wp.from_torch(opt_grad.reshape(1))
+        w_up = torch_launch_array(opt_grad.reshape(1))
         t_dL = torch.empty(
             self._output_shape, dtype=torch.float32, device=self._device
         )
-        w_dL = wp.from_torch(t_dL.view(-1))
+        w_dL = torch_launch_array(t_dL.view(-1))
 
         self._cmd_bwd_h.set_param_at_index(self._bwd_h_up_idx, w_up)
         self._cmd_bwd_h.launch()
@@ -937,11 +942,11 @@ class FusedSSIMMap(torch.autograd.Function):
             return loss
 
         # --- Inference path (rare) ---
-        w_img1 = wp.from_torch(img1.view(-1))
-        w_img2 = wp.from_torch(img2.view(-1))
+        w_img1 = torch_launch_array(img1.view(-1))
+        w_img2 = torch_launch_array(img2.view(-1))
 
         h_buf = torch.empty(4 * N, dtype=torch.float32, device=device)
-        w_h = [wp.from_torch(h_buf[i * N:(i + 1) * N]) for i in range(4)]
+        w_h = [torch_launch_array(h_buf[i * N:(i + 1) * N]) for i in range(4)]
 
         _launch_cached(_C4_FWD_H_INF, _fwd_h, N,
                        [w_img1, w_img2,
@@ -952,7 +957,7 @@ class FusedSSIMMap(torch.autograd.Function):
             Hv, Wv = H - 10, W - 10
             Nv = B * CH * Hv * Wv
             ssim_flat = torch.empty(Nv, dtype=torch.float32, device=device)
-            w_ssim = wp.from_torch(ssim_flat)
+            w_ssim = torch_launch_array(ssim_flat)
             _launch_cached(_C4_FWD_VIV, _fwd_v_infer_valid, Nv,
                            [w_h[0], w_h[1], w_h[2], w_h[3],
                             w_ssim, H, W, Hv, Wv,
@@ -961,7 +966,7 @@ class FusedSSIMMap(torch.autograd.Function):
             return ssim_flat.mean()
         else:
             ssim_map = torch.empty_like(img1)
-            w_ssim = wp.from_torch(ssim_map.view(-1))
+            w_ssim = torch_launch_array(ssim_map.view(-1))
             _launch_cached(_C4_FWD_VI, _fwd_v_infer, N,
                            [w_h[0], w_h[1], w_h[2], w_h[3],
                             w_ssim, H, W, float(C1), float(C2)], dev,

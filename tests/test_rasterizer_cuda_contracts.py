@@ -5,9 +5,11 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import gswarp._stream as stream_interop
 from gswarp.rasterizer import (
     GaussianRasterizer as StandardRasterizer,
     GaussianRasterizationSettings as StandardSettings,
@@ -204,6 +206,36 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         pending_color.sum().backward()
 
         torch.testing.assert_close(pending_scales.grad, reference_grad)
+
+    def test_standard_backward_does_not_attach_warp_autograd(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        scales = torch.full(
+            (1, 3),
+            0.5,
+            dtype=torch.float32,
+            device=DEVICE,
+            requires_grad=True,
+        )
+        color, _, _ = rasterize_standard(
+            **_inputs(
+                torch.tensor(
+                    [[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE
+                ),
+                scales=scales,
+            ),
+            raster_settings=_settings(background),
+        )
+        original = stream_interop.wp.from_torch
+
+        with patch.object(
+            stream_interop.wp, "from_torch", wraps=original
+        ) as wrapped:
+            color.sum().backward()
+
+        self.assertGreater(len(wrapped.call_args_list), 0)
+        for call in wrapped.call_args_list:
+            self.assertIs(call.kwargs["requires_grad"], False)
+            self.assertIs(call.kwargs["return_ctype"], False)
 
     def test_two_stream_forward_backward_matches_isolated_references(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import gc
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import gswarp._stream as stream_interop
 from gswarp.fused_ssim import (
     _get_fused_ssim_cache_report,
     clear_fused_ssim_caches,
@@ -53,6 +55,26 @@ class FusedSSIMCUDAContractTests(unittest.TestCase):
 
         torch.testing.assert_close(actual1.grad, expected1, rtol=1.0e-4, atol=1.0e-5)
         torch.testing.assert_close(actual2.grad, expected2, rtol=1.0e-4, atol=1.0e-5)
+
+    def test_manual_kernels_do_not_attach_warp_autograd(self) -> None:
+        generator = torch.Generator(device=DEVICE).manual_seed(9)
+        image = torch.rand(
+            (1, 3, 16, 16), generator=generator, device=DEVICE
+        ).requires_grad_(True)
+        target = torch.rand(
+            (1, 3, 16, 16), generator=generator, device=DEVICE
+        )
+        original = stream_interop.wp.from_torch
+
+        with patch.object(
+            stream_interop.wp, "from_torch", wraps=original
+        ) as wrapped:
+            fused_ssim(image, target, train=True).backward()
+
+        self.assertGreater(len(wrapped.call_args_list), 0)
+        for call in wrapped.call_args_list:
+            self.assertIs(call.kwargs["requires_grad"], False)
+            self.assertIs(call.kwargs["return_ctype"], False)
 
     def test_non_default_pytorch_stream_is_supported(self) -> None:
         generator = torch.Generator(device=DEVICE).manual_seed(11)
