@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -94,6 +95,20 @@ class RuntimeOptionsTests(unittest.TestCase):
         report = memory.get_warp_cache_report()
         self.assertEqual(report["by_cache"]["_SEQUENCE_BUFFER_CACHE"]["entries"], 0)
         self.assertEqual(report["by_cache"]["_C4_LAUNCH_CACHE_SH"]["entries"], 0)
+
+    def test_warp_allocation_device_does_not_refresh_tuning_report(self) -> None:
+        with (
+            patch.object(runtime, "_WARP_INITIALIZED", True),
+            patch.object(
+                runtime,
+                "get_runtime_tuning_report",
+                side_effect=AssertionError("allocation device lookup must not refresh runtime memory"),
+            ),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "current_device", return_value=2),
+        ):
+            self.assertEqual(memory._get_runtime_warp_device("cuda"), "cuda:2")
+            self.assertEqual(memory._get_runtime_warp_device("cuda:1"), "cuda:1")
 
 
 if __name__ == "__main__":

@@ -144,10 +144,9 @@ def _can_use_warp_scalar_alloc(device: torch.device | str) -> bool:
 
 def _get_runtime_warp_device(device: torch.device | str) -> str:
     runtime_device = _normalize_runtime_device(device)
-    auto_tune, _ = _runtime.get_active_auto_tuning_config()
-    if not auto_tune or not _runtime._WARP_INITIALIZED:
-        return str(runtime_device)
-    return str(_runtime.get_runtime_tuning_report(runtime_device)["device"])
+    if runtime_device.type == "cuda" and runtime_device.index is None and torch.cuda.is_available():
+        runtime_device = torch.device("cuda", torch.cuda.current_device())
+    return str(runtime_device)
 
 
 def _get_warp_dtype(torch_dtype: torch.dtype):
