@@ -12,10 +12,14 @@ GPU kernels use NVIDIA Warp.  torch is used only for:
 No C++/CUDA compilation required.
 """
 
+from collections import OrderedDict
+from threading import RLock
+import weakref
+
 import torch
 import warp as wp
 
-from ._stream import execution_context, submission_guard
+from ._stream import current_execution_context, execution_context, submission_guard
 from ._tuning import register_kernel_class, get_tuned_block_dim, FAMILY_MEMORY
 
 wp.init()
@@ -84,6 +88,13 @@ def _gw(i: wp.int32) -> wp.float32:
 _C4_FWD_H_INF: dict = {}
 _C4_FWD_VI: dict = {}
 _C4_FWD_VIV: dict = {}
+_TRAIN_PLAN_POOL: OrderedDict[tuple, list] = OrderedDict()
+_TRAIN_PLAN_POOL_LOCK = RLock()
+_MAX_FREE_TRAIN_PLANS_PER_KEY = 2
+_MAX_FREE_TRAIN_PLANS_PER_DEVICE = 4
+_TRAIN_PLAN_CREATIONS = 0
+_TRAIN_PLAN_REUSES = 0
+_TRAIN_PLAN_ACTIVE_LEASES = 0
 
 
 def _launch_cached(cache, kernel, dim, inputs, device, block_dim=256):
@@ -106,10 +117,24 @@ class _SSIMPlan:
     call, preventing another forward from replacing its saved intermediates.
     """
 
-    def __init__(self, B, CH, H, W, C1, C2, padding, device):
+    def __init__(
+        self,
+        B,
+        CH,
+        H,
+        W,
+        C1,
+        C2,
+        padding,
+        device,
+        *,
+        block_dims,
+        warp_stream,
+    ):
         dev = str(device)
         N = B * CH * H * W
         valid = (padding == "valid")
+        self.warp_stream = warp_stream
 
         # --- Pre-allocate ALL workspace buffers ---
         # Shared buffer for H-pass forward and H-pass backward workspaces.
@@ -143,10 +168,6 @@ class _SSIMPlan:
             self.t_ssim = torch.empty(N, dtype=torch.float32, device=device)
         w_ssim = wp.from_torch(self.t_ssim)
 
-        # Backward output (dL/dimg1)
-        self.t_dL = torch.empty(B, CH, H, W, dtype=torch.float32, device=device)
-        w_dL = wp.from_torch(self.t_dL.view(-1))
-
         # Placeholder for upstream grad
         ph_up = wp.from_torch(torch.ones(1, dtype=torch.float32, device=device))
 
@@ -154,10 +175,7 @@ class _SSIMPlan:
         # Use a workspace array as placeholder for img1/img2 (same dtype/size)
         ph = w_h[0]
 
-        bd_fwd_h = get_tuned_block_dim("ssim_fwd_h", device)
-        bd_fwd_v = get_tuned_block_dim("ssim_fwd_v", device)
-        bd_bwd_h = get_tuned_block_dim("ssim_bwd_h", device)
-        bd_bwd_v = get_tuned_block_dim("ssim_bwd_v", device)
+        bd_fwd_h, bd_fwd_v, bd_bwd_h, bd_bwd_v = block_dims
 
         # FWD_H: params [0]=img1, [1]=img2 change each call
         self._cmd_fwd_h = wp.launch(
@@ -205,12 +223,14 @@ class _SSIMPlan:
         # BWD_V: params [0]=img1, [1]=img2 change each call
         self._cmd_bwd_v = wp.launch(
             kernel=_bwd_v, dim=N,
-            inputs=[ph, ph, w_t[0], w_t[1], w_t[2], w_dL, H, W],
+            inputs=[ph, ph, w_t[0], w_t[1], w_t[2], w_h[3], H, W],
             device=dev, record_cmd=True, block_dim=bd_bwd_v)
 
         # Keep references to prevent GC of backing torch buffers
         # (Warp arrays hold raw CUDA pointers, not Python refs)
         self._refs = (shared_buf, dm_buf, ph_up)
+        self._output_shape = (B, CH, H, W)
+        self._device = device
 
     def forward(self, img1, img2):
         """Run forward. Returns (loss_scalar, w_img1, w_img2)."""
@@ -228,15 +248,176 @@ class _SSIMPlan:
     def backward(self, w_img1, w_img2, opt_grad):
         """Run backward. Returns dL/dimg1 tensor."""
         w_up = wp.from_torch(opt_grad.reshape(1))
+        t_dL = torch.empty(
+            self._output_shape, dtype=torch.float32, device=self._device
+        )
+        w_dL = wp.from_torch(t_dL.view(-1))
 
         self._cmd_bwd_h.set_param_at_index(self._bwd_h_up_idx, w_up)
         self._cmd_bwd_h.launch()
 
         self._cmd_bwd_v.set_param_at_index(0, w_img1)
         self._cmd_bwd_v.set_param_at_index(1, w_img2)
+        self._cmd_bwd_v.set_param_at_index(5, w_dL)
         self._cmd_bwd_v.launch()
 
-        return self.t_dL
+        return t_dL
+
+
+class _SSIMPlanLease:
+    """Keep one internal plan private for the lifetime of an autograd graph."""
+
+    __slots__ = ("plan", "_finalizer", "__weakref__")
+
+    def __init__(self, key, plan):
+        self.plan = plan
+        self._finalizer = weakref.finalize(
+            self, _release_training_plan, key, plan
+        )
+        self._finalizer.atexit = False
+
+
+def _training_plan_key(B, CH, H, W, C1, C2, padding, device):
+    context = current_execution_context(device)
+    if context is None:
+        raise RuntimeError(
+            "SSIM training plans require an active CUDA execution context"
+        )
+    block_dims = (
+        get_tuned_block_dim("ssim_fwd_h", device),
+        get_tuned_block_dim("ssim_fwd_v", device),
+        get_tuned_block_dim("ssim_bwd_h", device),
+        get_tuned_block_dim("ssim_bwd_v", device),
+    )
+    key = (
+        str(context.device),
+        context.stream_handle,
+        B,
+        CH,
+        H,
+        W,
+        float(C1),
+        float(C2),
+        padding,
+        *block_dims,
+    )
+    return key, block_dims, context.warp_stream
+
+
+def _acquire_training_plan(B, CH, H, W, C1, C2, padding, device):
+    global _TRAIN_PLAN_ACTIVE_LEASES
+    global _TRAIN_PLAN_CREATIONS
+    global _TRAIN_PLAN_REUSES
+
+    key, block_dims, warp_stream = _training_plan_key(
+        B, CH, H, W, C1, C2, padding, device
+    )
+    with _TRAIN_PLAN_POOL_LOCK:
+        bucket = _TRAIN_PLAN_POOL.get(key)
+        if bucket:
+            plan = bucket.pop()
+            if not bucket:
+                del _TRAIN_PLAN_POOL[key]
+            _TRAIN_PLAN_REUSES += 1
+        else:
+            plan = None
+        _TRAIN_PLAN_ACTIVE_LEASES += 1
+
+    if plan is None:
+        try:
+            plan = _SSIMPlan(
+                B,
+                CH,
+                H,
+                W,
+                C1,
+                C2,
+                padding,
+                device,
+                block_dims=block_dims,
+                warp_stream=warp_stream,
+            )
+        except Exception:
+            with _TRAIN_PLAN_POOL_LOCK:
+                _TRAIN_PLAN_ACTIVE_LEASES = max(
+                    0, _TRAIN_PLAN_ACTIVE_LEASES - 1
+                )
+            raise
+        with _TRAIN_PLAN_POOL_LOCK:
+            _TRAIN_PLAN_CREATIONS += 1
+    return _SSIMPlanLease(key, plan)
+
+
+def _release_training_plan(key, plan):
+    global _TRAIN_PLAN_ACTIVE_LEASES
+
+    evicted = []
+    with _TRAIN_PLAN_POOL_LOCK:
+        _TRAIN_PLAN_ACTIVE_LEASES = max(0, _TRAIN_PLAN_ACTIVE_LEASES - 1)
+        bucket = _TRAIN_PLAN_POOL.setdefault(key, [])
+        if len(bucket) < _MAX_FREE_TRAIN_PLANS_PER_KEY:
+            bucket.append(plan)
+            _TRAIN_PLAN_POOL.move_to_end(key)
+        else:
+            evicted.append(plan)
+
+        device_key = key[0]
+        while sum(
+            len(plans)
+            for pool_key, plans in _TRAIN_PLAN_POOL.items()
+            if pool_key[0] == device_key
+        ) > _MAX_FREE_TRAIN_PLANS_PER_DEVICE:
+            for pool_key in tuple(_TRAIN_PLAN_POOL):
+                if pool_key[0] != device_key:
+                    continue
+                plans = _TRAIN_PLAN_POOL[pool_key]
+                evicted.append(plans.pop(0))
+                if not plans:
+                    del _TRAIN_PLAN_POOL[pool_key]
+                break
+
+    if evicted:
+        with submission_guard(key[0]):
+            for retired in evicted:
+                if retired.warp_stream is not None:
+                    wp.synchronize_stream(retired.warp_stream)
+
+
+def _clear_training_plan_pool(device_key=None):
+    retired = []
+    with _TRAIN_PLAN_POOL_LOCK:
+        for key in tuple(_TRAIN_PLAN_POOL):
+            if device_key is None or key[0] == device_key:
+                retired.extend(_TRAIN_PLAN_POOL.pop(key))
+    synchronized = set()
+    for plan in retired:
+        stream = plan.warp_stream
+        if stream is not None and id(stream) not in synchronized:
+            wp.synchronize_stream(stream)
+            synchronized.add(id(stream))
+
+
+def _get_fused_ssim_cache_report():
+    with _TRAIN_PLAN_POOL_LOCK:
+        free_by_stream = {
+            f"{key[0]}@{key[1]}": sum(
+                len(plans)
+                for pool_key, plans in _TRAIN_PLAN_POOL.items()
+                if pool_key[:2] == key[:2]
+            )
+            for key in _TRAIN_PLAN_POOL
+        }
+        return {
+            "active_training_leases": _TRAIN_PLAN_ACTIVE_LEASES,
+            "free_training_plans": sum(
+                len(plans) for plans in _TRAIN_PLAN_POOL.values()
+            ),
+            "training_plan_creations": _TRAIN_PLAN_CREATIONS,
+            "training_plan_reuses": _TRAIN_PLAN_REUSES,
+            "free_training_plans_by_stream": free_by_stream,
+            "free_plan_limit_per_key": _MAX_FREE_TRAIN_PLANS_PER_KEY,
+            "free_plan_limit_per_device": _MAX_FREE_TRAIN_PLANS_PER_DEVICE,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -743,11 +924,13 @@ class FusedSSIMMap(torch.autograd.Function):
         ctx.train = train
 
         if train:
-            # The workspace is intentionally private to this autograd node.
-            plan = _SSIMPlan(B, CH, H, W, C1, C2, padding, device)
+            lease = _acquire_training_plan(
+                B, CH, H, W, C1, C2, padding, device
+            )
+            plan = lease.plan
             loss, w_img1, w_img2 = plan.forward(img1, img2)
 
-            ctx.plan = plan
+            ctx.plan_lease = lease
             ctx.w_img1 = w_img1
             ctx.w_img2 = w_img2
             ctx.save_for_backward(img1.detach(), img2)  # prevent data GC
@@ -795,7 +978,7 @@ class FusedSSIMMap(torch.autograd.Function):
     def _backward_impl(ctx, opt_grad):
         if not ctx.train:
             return None, None, None, None, None, None
-        plan = ctx.plan
+        plan = ctx.plan_lease.plan
         dL_dimg1 = plan.backward(ctx.w_img1, ctx.w_img2, opt_grad)
         return None, None, dL_dimg1, None, None, None
 
@@ -852,7 +1035,7 @@ def fused_ssim(img1, img2, padding="same", train=True):
 
 
 def clear_fused_ssim_caches(device=None) -> None:
-    """Clear inference launch caches for one device or all known devices."""
+    """Clear reusable SSIM plans and inference launches."""
 
     caches = (_C4_FWD_H_INF, _C4_FWD_VI, _C4_FWD_VIV)
     resolved_device = None if device is None else torch.device(device)
@@ -870,9 +1053,12 @@ def clear_fused_ssim_caches(device=None) -> None:
         for key in cache
         if isinstance(key, tuple) and isinstance(key[0], str)
     }
+    with _TRAIN_PLAN_POOL_LOCK:
+        known_devices.update(key[0] for key in _TRAIN_PLAN_POOL)
     targets = known_devices if device_key is None else {device_key}
     for target in sorted(targets):
         with submission_guard(target):
+            _clear_training_plan_pool(target)
             for cache in caches:
                 for key in tuple(cache):
                     if key[0] == target:
