@@ -26,13 +26,75 @@ from .memory import (
     get_warp_cache_report,
 )
 from .packing import _pack_forward_aux_buffers
-from .preprocess_ops import _make_empty_forward_outputs, preprocess_gaussians, mark_visible
+from .preprocess_ops import (
+    _make_empty_forward_outputs,
+    feature_3dgs_stage,
+    mark_visible,
+    preprocess_3dgs_stage,
+    preprocess_gaussians,
+)
 from .binning_ops import _build_binning_state
 from .render_ops import _render_tiles_warp
 from .backward_ops import rasterize_gaussians_backward, rasterize_gaussians_backward_typed
-from .state import ForwardResult, ForwardState, StandardBackwardInterop
+from .state import ForwardResult, ForwardState, RenderStageResult, StandardBackwardInterop
 
 BACKEND_CAPABILITIES = frozenset({"stable_warp", "typed_forward", "typed_backward", "mark_visible"})
+
+
+def empty_forward_stage(inputs) -> ForwardResult:
+    outputs = _make_empty_forward_outputs(
+        inputs.means3d, inputs.background, inputs.image_height, inputs.image_width
+    )
+    return ForwardResult(
+        num_rendered=0,
+        color=outputs[1],
+        depth=outputs[2],
+        alpha=outputs[3],
+        radii=outputs[4],
+        proj_2d=outputs[8],
+        conic_2d=outputs[9],
+        conic_2d_inv=outputs[10],
+        state=None,
+    )
+
+
+def preprocess_stage(inputs):
+    return preprocess_3dgs_stage(inputs, capture_backward_interop=True)
+
+
+def feature_stage(inputs, preprocess_outputs):
+    return feature_3dgs_stage(inputs, preprocess_outputs)
+
+
+def render_stage(inputs, preprocess_outputs, binning_state, features) -> RenderStageResult:
+    color, depth, alpha, n_contrib, backward_interop = _render_tiles_warp(
+        preprocess_outputs,
+        binning_state,
+        features,
+        inputs.background.to(dtype=torch.float32),
+        inputs.image_height,
+        inputs.image_width,
+        capture_backward_interop=True,
+    )
+    return RenderStageResult(
+        color=color,
+        depth=depth,
+        alpha=alpha,
+        n_contrib=n_contrib,
+        backward_interop=backward_interop,
+    )
+
+
+def build_state_stage(preprocess_outputs, binning_state, render_result):
+    return ForwardState(
+        preprocess_outputs,
+        binning_state,
+        render_result.n_contrib,
+        StandardBackwardInterop(
+            render=render_result.backward_interop,
+            preprocess=preprocess_outputs.backward_interop,
+        ),
+    )
 
 
 def clear_warp_caches() -> None:
@@ -197,6 +259,11 @@ __all__ = [
     "get_runtime_tuning_report",
     "initialize_runtime_tuning",
     "preprocess_gaussians",
+    "empty_forward_stage",
+    "preprocess_stage",
+    "feature_stage",
+    "render_stage",
+    "build_state_stage",
     "rasterize_gaussians",
     "rasterize_gaussians_typed",
     "mark_visible",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from gswarp._stream import execution_context
 from gswarp._internal.backends.select import resolve_backend
 from gswarp._internal.api.runtime_context import resolve_execution_options, run_with_runtime_overrides
+from gswarp._internal.methods.pipeline import execute_typed_forward
 
 
 def plan_for(method):
@@ -21,7 +22,7 @@ def run_typed_forward(plan, raster_settings, args):
     result = run_with_runtime_overrides(
         plan.backend,
         raster_settings,
-        lambda: plan.stages.forward(*args),
+        lambda: execute_typed_forward(plan, args),
         flow=plan.flow,
         options=options,
     )

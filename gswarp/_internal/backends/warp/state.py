@@ -82,6 +82,18 @@ class ForwardState:
 
 
 @dataclass(slots=True)
+class RenderStageResult:
+    """Normalized render output consumed by the shared method pipeline."""
+
+    color: torch.Tensor
+    depth: torch.Tensor
+    alpha: torch.Tensor
+    n_contrib: torch.Tensor
+    backward_interop: RenderBackwardInterop | None = None
+    aux: tuple[torch.Tensor, ...] = ()
+
+
+@dataclass(slots=True)
 class ForwardResult:
     """Normal frontend result that avoids raw compatibility-buffer packing."""
 
@@ -104,5 +116,6 @@ __all__ = [
     "PreprocessOutputs",
     "BinningState",
     "ForwardState",
+    "RenderStageResult",
     "ForwardResult",
 ]

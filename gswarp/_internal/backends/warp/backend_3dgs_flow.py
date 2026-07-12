@@ -22,7 +22,12 @@ from .runtime import (
 )
 from .memory import clear_common_warp_caches, clear_flow_warp_caches, get_warp_cache_report
 from .packing import _pack_forward_aux_buffers
-from .preprocess_ops import preprocess_gaussians, mark_visible
+from .preprocess_ops import (
+    feature_3dgs_stage,
+    mark_visible,
+    preprocess_3dgs_stage,
+    preprocess_gaussians,
+)
 from .binning_ops import _build_binning_state
 from .flow_ops import (
     _make_empty_forward_outputs as flow_make_empty_forward_outputs,
@@ -34,11 +39,63 @@ from .flow_ops import (
     set_flow_topk,
     rasterize_gaussians_flow_backward_typed,
 )
-from .state import ForwardResult, ForwardState
+from .state import ForwardResult, ForwardState, RenderStageResult
 
 BACKEND_CAPABILITIES = frozenset(
     {"stable_warp", "typed_forward", "typed_backward", "mark_visible", "flow_aux"}
 )
+
+
+def empty_forward_stage(inputs) -> ForwardResult:
+    outputs = flow_make_empty_forward_outputs(
+        inputs.means3d, inputs.background, inputs.image_height, inputs.image_width
+    )
+    return ForwardResult(
+        num_rendered=0,
+        color=outputs[1],
+        depth=outputs[2],
+        alpha=outputs[3],
+        radii=outputs[4],
+        proj_2d=outputs[8],
+        conic_2d=outputs[9],
+        conic_2d_inv=outputs[10],
+        state=None,
+        aux=outputs[11:],
+    )
+
+
+def preprocess_stage(inputs):
+    return preprocess_3dgs_stage(inputs, capture_backward_interop=False)
+
+
+def feature_stage(inputs, preprocess_outputs):
+    return feature_3dgs_stage(inputs, preprocess_outputs)
+
+
+def render_stage(inputs, preprocess_outputs, binning_state, features) -> RenderStageResult:
+    color, depth, alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib = (
+        render_gaussians_flow(
+            preprocess_outputs,
+            binning_state,
+            features,
+            inputs.background.to(dtype=torch.float32),
+            inputs.image_height,
+            inputs.image_width,
+        )
+    )
+    return RenderStageResult(
+        color=color,
+        depth=depth,
+        alpha=alpha,
+        n_contrib=n_contrib,
+        aux=(gs_per_pixel, weight_per_gs_pixel, x_mu),
+    )
+
+
+def build_state_stage(preprocess_outputs, binning_state, render_result):
+    return ForwardState(
+        preprocess_outputs, binning_state, render_result.n_contrib
+    )
 
 
 def clear_warp_caches() -> None:
@@ -182,6 +239,11 @@ __all__ = [
     "get_runtime_tuning_report",
     "initialize_runtime_tuning",
     "preprocess_gaussians",
+    "empty_forward_stage",
+    "preprocess_stage",
+    "feature_stage",
+    "render_stage",
+    "build_state_stage",
     "rasterize_gaussians",
     "rasterize_gaussians_typed",
     "mark_visible",

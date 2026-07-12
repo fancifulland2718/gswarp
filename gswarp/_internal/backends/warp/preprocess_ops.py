@@ -67,6 +67,55 @@ def _make_empty_forward_outputs(means3D, background, image_height, image_width):
     )
 
 
+def preprocess_3dgs_stage(inputs, *, capture_backward_interop: bool):
+    common = dict(
+        shs=inputs.sh.reshape(inputs.means3d.shape[0], -1, NUM_CHANNELS)
+        if inputs.sh.numel() != 0
+        else None,
+        degree=inputs.degree,
+        campos=inputs.campos,
+        colors_precomp=inputs.colors if inputs.colors.numel() != 0 else None,
+        opacities=inputs.opacities,
+        prefiltered=inputs.prefiltered,
+        capture_backward_interop=capture_backward_interop,
+    )
+    if inputs.cov3d_precomp.numel() != 0:
+        return preprocess_gaussians(
+            inputs.means3d,
+            inputs.viewmatrix,
+            inputs.projmatrix,
+            inputs.image_height,
+            inputs.image_width,
+            inputs.tan_fovx,
+            inputs.tan_fovy,
+            cov3D_precomp=inputs.cov3d_precomp,
+            **common,
+        )
+    if inputs.scales.numel() != 0 and inputs.rotations.numel() != 0:
+        return preprocess_gaussians(
+            inputs.means3d,
+            inputs.viewmatrix,
+            inputs.projmatrix,
+            inputs.image_height,
+            inputs.image_width,
+            inputs.tan_fovx,
+            inputs.tan_fovy,
+            scales=inputs.scales,
+            rotations=inputs.rotations,
+            scale_modifier=inputs.scale_modifier,
+            **common,
+        )
+    raise ValueError("either cov3Ds_precomp or scales/rotations must be provided")
+
+
+def feature_3dgs_stage(inputs, preprocess_outputs):
+    if inputs.colors.numel() != 0:
+        return inputs.colors.reshape(inputs.means3d.shape[0], NUM_CHANNELS).to(
+            dtype=torch.float32
+        )
+    return preprocess_outputs.rgb
+
+
 def _compute_cov3d_from_scale_rotation_warp(scales, scale_modifier, rotations):
     if scales.numel() == 0:
         return torch.zeros((0, 6), dtype=torch.float32, device=scales.device)
@@ -538,4 +587,13 @@ def mark_visible(*args: Any):
     return visible.to(torch.bool)
 
 
-__all__ = ["preprocess_gaussians", "mark_visible", "_make_empty_forward_outputs", "_compute_cov3d_from_scale_rotation_warp", "_project_visible_points_warp", "_compute_rgb_from_sh_warp"]
+__all__ = [
+    "preprocess_gaussians",
+    "preprocess_3dgs_stage",
+    "feature_3dgs_stage",
+    "mark_visible",
+    "_make_empty_forward_outputs",
+    "_compute_cov3d_from_scale_rotation_warp",
+    "_project_visible_points_warp",
+    "_compute_rgb_from_sh_warp",
+]

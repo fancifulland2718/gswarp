@@ -24,10 +24,12 @@ class MethodSpec:
 class MethodStages:
     """Immutable function bindings for one rasterization method."""
 
+    empty_forward: Callable[..., Any]
     preprocess: Callable[..., Any]
+    features: Callable[..., Any]
     binning: Callable[..., Any]
     render: Callable[..., Any]
-    forward: Callable[..., Any]
+    build_state: Callable[..., Any]
     backward: Callable[..., Any]
     mark_visible: Callable[..., Any]
 

@@ -28,7 +28,11 @@ _STAGE_PROFILES = {
         "appearance": "sh_or_rgb",
         "pre_adapter": None,
         "flow": False,
-        "render_name": "_render_tiles_warp",
+        "empty_forward_name": "empty_forward_stage",
+        "preprocess_name": "preprocess_stage",
+        "features_name": "feature_stage",
+        "render_name": "render_stage",
+        "build_state_name": "build_state_stage",
         "backward_name": "rasterize_gaussians_backward_typed",
     },
     "warp_3dgs_flow": {
@@ -39,7 +43,11 @@ _STAGE_PROFILES = {
         "appearance": "sh_or_rgb",
         "pre_adapter": None,
         "flow": True,
-        "render_name": "render_gaussians_flow",
+        "empty_forward_name": "empty_forward_stage",
+        "preprocess_name": "preprocess_stage",
+        "features_name": "feature_stage",
+        "render_name": "render_stage",
+        "build_state_name": "build_state_stage",
         "backward_name": "rasterize_gaussians_flow_backward_typed",
     },
 }
@@ -110,10 +118,12 @@ def build_method_plan(
         )
 
     defaults = {
-        "preprocess": getattr(backend, "preprocess_gaussians"),
+        "empty_forward": getattr(backend, profile["empty_forward_name"]),
+        "preprocess": getattr(backend, profile["preprocess_name"]),
+        "features": getattr(backend, profile["features_name"]),
         "binning": getattr(backend, "_build_binning_state"),
         "render": getattr(backend, profile["render_name"]),
-        "forward": getattr(backend, "rasterize_gaussians_typed"),
+        "build_state": getattr(backend, profile["build_state_name"]),
         "backward": getattr(backend, profile["backward_name"]),
         "mark_visible": getattr(backend, "mark_visible"),
     }
@@ -141,17 +151,21 @@ def _resolve_registered_plan(method_name: str, mode: str) -> MethodPlan:
     if mode == "stable":
         return build_method_plan(method, stable)
 
-    from gswarp._internal.backends.warp.advanced import try_resolve_advanced_backend
+    from gswarp._internal.backends.warp.advanced import resolve_advanced_backend
 
-    advanced = try_resolve_advanced_backend(method)
+    advanced, unavailable_reason = resolve_advanced_backend(method)
     if advanced is not None:
         try:
             return build_method_plan(method, advanced)
-        except RuntimeError:
+        except RuntimeError as exc:
+            unavailable_reason = str(exc)
             if mode == "advanced":
                 raise
     if mode == "advanced":
-        raise RuntimeError(f"Advanced Warp backend unavailable for method {method.name!r}")
+        raise RuntimeError(
+            f"Advanced Warp backend unavailable for method {method.name!r}: "
+            f"{unavailable_reason or 'unknown reason'}"
+        )
     return build_method_plan(method, stable)
 
 
