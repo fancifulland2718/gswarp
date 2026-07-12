@@ -2,7 +2,7 @@
 
 Optimizations (following gswarp/_warp_backend.py patterns):
   C0 - wp.constant Gaussian weights: eliminate per-pixel array reads
-  C4 - Launch object caching: record_cmd + set_param_at_index bypass Python overhead
+  C4 - Launch object caching with batched parameter updates
   M1 - Flat 1D arrays with manual offsets: remove 4D stride arithmetic
   O3 - torch.empty for always-overwritten outputs: skip GPU memset
 
@@ -23,6 +23,7 @@ from ._stream import (
     TransientLaunchArrayScope,
     current_execution_context,
     execution_context,
+    set_launch_params,
     submission_guard,
     torch_launch_array,
 )
@@ -111,8 +112,7 @@ def _launch_cached(cache, kernel, dim, inputs, device, block_dim=256):
                         device=device, record_cmd=True, block_dim=block_dim)
         cache[key] = cmd
     else:
-        for i, v in enumerate(inputs):
-            cmd.set_param_at_index(i, v)
+        set_launch_params(cmd, inputs)
     cmd.launch()
 
 

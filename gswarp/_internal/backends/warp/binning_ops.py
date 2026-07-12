@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import warp as wp
 
+from ...._stream import set_launch_params
 from ...coverage import tile_coverage_mode_id
 from .constants import (
     BINNING_SORT_MODES,
@@ -299,8 +300,7 @@ def _build_binning_state(
                     device=_dev, record_cmd=True)
                 _C4_LAUNCH_CACHE_BINNING_DUPLICATE[_g1_key] = _g1_cmd
             else:
-                for _i, _v in enumerate(_g1_inp + _g1_out):
-                    _g1_cmd.set_param_at_index(_i, _v)
+                set_launch_params(_g1_cmd, _g1_inp + _g1_out)
             _g1_cmd.launch()
             tile_ids = tile_id_buffer[:num_rendered]
             point_list = point_list_buffer[:num_rendered]

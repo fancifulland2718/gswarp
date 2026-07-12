@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from ...._stream import set_launch_params
 from ...._tuning import (
     normalize_device as _normalize_runtime_device,
     query_device_info as _query_runtime_device_info,
@@ -187,8 +188,7 @@ def _render_tiles_warp(preprocess_outputs, binning_state, feature_ptr, backgroun
                          block_dim=256)
         _C4_LAUNCH_CACHE_FWD_RENDER_TILED256[_key] = _cmd
     else:
-        for _i, _v in enumerate(_inp + _out):
-            _cmd.set_param_at_index(_i, _v)
+        set_launch_params(_cmd, _inp + _out)
     _cmd.launch()
     return out_color, out_depth, out_alpha, gs_per_pixel, weight_per_gs_pixel, x_mu, n_contrib
 
@@ -355,8 +355,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                                             inputs=_fg_inp, outputs=_fg_out, device=str(device), record_cmd=True)
                         _C4_LAUNCH_CACHE_FLOW_GRAD[_fg_key] = _fg_cmd
                     else:
-                        for _i, _v in enumerate(_fg_inp + _fg_out):
-                            _fg_cmd.set_param_at_index(_i, _v)
+                        set_launch_params(_fg_cmd, _fg_inp + _fg_out)
                     _fg_cmd.launch()
                     grad_conic_2d_inv_active = grad_conic_2D_inv
         else:
@@ -441,8 +440,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                                         block_dim=get_tuned_block_dim("backward_preprocess", device))
                     _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS[_e2_key] = _e2_cmd
                 else:
-                    for _i, _v in enumerate(_e2_inp + _e2_out):
-                        _e2_cmd.set_param_at_index(_i, _v)
+                    set_launch_params(_e2_cmd, _e2_inp + _e2_out)
                 _e2_cmd.launch()
         else:
                 _grad_projected = _backward_projected_means_warp(
@@ -491,8 +489,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                                          inputs=_acc_inp, outputs=_acc_out, device=str(device), record_cmd=True)
                     _C4_LAUNCH_CACHE_ACCUM[_acc_key] = _acc_cmd
                 else:
-                    for _i, _v in enumerate(_acc_inp + _acc_out):
-                        _acc_cmd.set_param_at_index(_i, _v)
+                    set_launch_params(_acc_cmd, _acc_inp + _acc_out)
                 _acc_cmd.launch()
 
                 # L1: allocate grad_scales/grad_rotations per-branch

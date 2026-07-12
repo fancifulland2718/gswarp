@@ -15,7 +15,7 @@ from ...._tuning import (
     FAMILY_COMPUTE,
     FAMILY_WARP_SPECIALIZED,
 )
-from ...._stream import torch_launch_array
+from ...._stream import set_launch_params, torch_launch_array
 from ...coverage import tile_coverage_mode_id
 
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
@@ -271,8 +271,7 @@ def _compute_rgb_from_sh_warp(
                          inputs=_inp, outputs=_out, device=_dev, record_cmd=True)
         _C4_LAUNCH_CACHE_FWD_SH[_key] = _cmd
     else:
-        for _i, _v in enumerate(_inp + _out):
-            _cmd.set_param_at_index(_i, _v)
+        set_launch_params(_cmd, _inp + _out)
     _cmd.launch()
     backward_interop = None
     if capture_backward_interop:
@@ -407,8 +406,7 @@ def preprocess_gaussians(
                   )
                   _C4_LAUNCH_CACHE_FWD_PREPROCESS[_e1_key] = _e1_cmd
               else:
-                  for _i, _v in enumerate(_e1_inp + _e1_out):
-                      _e1_cmd.set_param_at_index(_i, _v)
+                  set_launch_params(_e1_cmd, _e1_inp + _e1_out)
               _e1_cmd.launch()
               if backward_interop is not None:
                   backward_interop.means3d = _e1_inp[0]

@@ -324,6 +324,49 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(scales.grad).all())
         self.assertGreater(scales.grad.abs().sum().item(), 0.0)
 
+    def test_flow_cached_launches_refresh_forward_and_backward_parameters(self) -> None:
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        points = torch.tensor(
+            [[-0.15, 0.05, 2.0], [0.2, -0.1, 2.4]],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+
+        warm_scales = torch.full(
+            (2, 3), 0.45, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        warm = rasterize_flow(
+            **_inputs(points, scales=warm_scales),
+            raster_settings=_settings(background, flow=True),
+        )
+        warm[6].sum().backward()
+
+        cached_scales = torch.full(
+            (2, 3), 0.65, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        cached = rasterize_flow(
+            **_inputs(points, scales=cached_scales),
+            raster_settings=_settings(background, flow=True),
+        )
+        cached[6].sum().backward()
+        cached_grad = cached_scales.grad.detach().clone()
+
+        clear_flow_caches()
+        reference_scales = torch.full(
+            (2, 3), 0.65, dtype=torch.float32, device=DEVICE, requires_grad=True
+        )
+        reference = rasterize_flow(
+            **_inputs(points, scales=reference_scales),
+            raster_settings=_settings(background, flow=True),
+        )
+        reference[6].sum().backward()
+
+        torch.testing.assert_close(cached[0], reference[0])
+        torch.testing.assert_close(cached[6], reference[6])
+        torch.testing.assert_close(cached_grad, reference_scales.grad)
+
     def test_pending_forward_owns_its_binning_state(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
         first_points = torch.tensor(

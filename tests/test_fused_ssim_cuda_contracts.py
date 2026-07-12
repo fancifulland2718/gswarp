@@ -56,6 +56,25 @@ class FusedSSIMCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(actual1.grad, expected1, rtol=1.0e-4, atol=1.0e-5)
         torch.testing.assert_close(actual2.grad, expected2, rtol=1.0e-4, atol=1.0e-5)
 
+    def test_inference_cache_refreshes_input_parameters(self) -> None:
+        generator = torch.Generator(device=DEVICE).manual_seed(8)
+        warm_image = torch.rand(
+            (1, 3, 16, 16), generator=generator, device=DEVICE
+        )
+        warm_target = torch.rand(
+            (1, 3, 16, 16), generator=generator, device=DEVICE
+        )
+        image = torch.rand((1, 3, 16, 16), generator=generator, device=DEVICE)
+        target = torch.rand((1, 3, 16, 16), generator=generator, device=DEVICE)
+
+        fused_ssim(warm_image, warm_target, train=False)
+        cached = fused_ssim(image, target, train=False)
+
+        clear_fused_ssim_caches(DEVICE)
+        reference = fused_ssim(image, target, train=False)
+
+        torch.testing.assert_close(cached, reference)
+
     def test_manual_kernels_use_non_autograd_interop(self) -> None:
         generator = torch.Generator(device=DEVICE).manual_seed(9)
         image = torch.rand(
