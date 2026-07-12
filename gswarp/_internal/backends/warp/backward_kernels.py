@@ -580,9 +580,20 @@ if wp is not None:
         end = ranges_flat[block_id * 2 + 1]
         n_gs = end - start
 
+        last_contributor = int(0)
+        if inside != 0 and n_gs > 0:
+            last_contributor = n_contrib[pixel_id]
+
+        # Resolve the warp loop bound before loading gradients and recurrence
+        # state so groups with no contributors exit after one reduction.
+        t_lc = wp.tile(last_contributor)
+        t_max_lc = wp.tile_reduce(wp.max, t_lc)
+        warp_max_lc = wp.tile_extract(t_max_lc, 0)
+        if warp_max_lc == 0:
+            return
+
         T_final = float(0.0)
         T = float(0.0)
-        last_contributor = int(0)
         ddelx_dx = 0.5 * float(image_width)
         ddely_dy = 0.5 * float(image_height)
         pixf_x = float(pix_x)
@@ -595,7 +606,6 @@ if wp is not None:
         if inside != 0 and n_gs > 0:
             T_final = 1.0 - out_alpha_flat[pixel_id]
             T = T_final
-            last_contributor = n_contrib[pixel_id]
             dL_dpixel = wp.vec3(
                 grad_color_flat[pixel_id],
                 grad_color_flat[total_pixels + pixel_id],
@@ -614,11 +624,6 @@ if wp is not None:
         last_color = wp.vec3(0.0, 0.0, 0.0)
         last_depth = float(0.0)
 
-        # W1: Warp-level max contributor 鈥?each 32-pixel sub-tile determines its own loop bound.
-        t_lc = wp.tile(last_contributor)
-        t_max_lc = wp.tile_reduce(wp.max, t_lc)
-        warp_max_lc = wp.tile_extract(t_max_lc, 0)
-
         for step in range(warp_max_lc):
             pos = warp_max_lc - step - 1
             coll_id = point_list[start + pos]
@@ -627,6 +632,7 @@ if wp is not None:
             my_grad_depth = float(0.0)
             my_grad_xy = wp.vec2(0.0, 0.0)
             my_grad_co = wp.vec4(0.0, 0.0, 0.0, 0.0)
+            has_contribution = int(0)
 
             if inside != 0 and pos < last_contributor:
                 xy = points_xy_image[coll_id]
@@ -639,6 +645,7 @@ if wp is not None:
                     G = wp.exp(power)
                     alpha = _compute_alpha(con_o, power)
                     if alpha >= (1.0 / 255.0):
+                        has_contribution = 1
                         one_minus_alpha = wp.max(1.0 - alpha, ONE_MINUS_ALPHA_MIN)
                         T = T / one_minus_alpha
                         dchannel_dcolor = alpha * T
@@ -676,23 +683,27 @@ if wp is not None:
                         my_grad_xy = wp.vec2(dL_dG * dG_ddelx * ddelx_dx, dL_dG * dG_ddely * ddely_dy)
                         my_grad_co = wp.vec4(-0.5 * gdx * d_x * dL_dG, -0.5 * gdx * d_y * dL_dG, -0.5 * gdy * d_y * dL_dG, G * dL_dopa)
 
-            # W1: Warp-level reduction 鈥?ALL 32 threads participate (UNIFORM path)
-            t_feat = wp.tile(my_grad_feat, preserve_type=True)
-            s_feat = wp.tile_reduce(wp.add, t_feat)
-            wp.tile_atomic_add(grad_feature, s_feat, offset=coll_id)
+            t_has_contribution = wp.tile(has_contribution)
+            s_has_contribution = wp.tile_sum(t_has_contribution)
+            if wp.tile_extract(s_has_contribution, 0) > 0:
+                # The vote is warp-uniform. Contributor steps with no valid
+                # footprint skip three vector reductions and zero atomics.
+                t_feat = wp.tile(my_grad_feat, preserve_type=True)
+                s_feat = wp.tile_reduce(wp.add, t_feat)
+                wp.tile_atomic_add(grad_feature, s_feat, offset=coll_id)
 
-            if compute_depth != 0:
-                t_depth = wp.tile(my_grad_depth)
-                s_depth = wp.tile_sum(t_depth)
-                wp.tile_atomic_add(grad_depths, s_depth, offset=coll_id)
+                if compute_depth != 0:
+                    t_depth = wp.tile(my_grad_depth)
+                    s_depth = wp.tile_sum(t_depth)
+                    wp.tile_atomic_add(grad_depths, s_depth, offset=coll_id)
 
-            t_xy = wp.tile(my_grad_xy, preserve_type=True)
-            s_xy = wp.tile_reduce(wp.add, t_xy)
-            wp.tile_atomic_add(grad_points_xy, s_xy, offset=coll_id)
+                t_xy = wp.tile(my_grad_xy, preserve_type=True)
+                s_xy = wp.tile_reduce(wp.add, t_xy)
+                wp.tile_atomic_add(grad_points_xy, s_xy, offset=coll_id)
 
-            t_co = wp.tile(my_grad_co, preserve_type=True)
-            s_co = wp.tile_reduce(wp.add, t_co)
-            wp.tile_atomic_add(grad_conic_opacity, s_co, offset=coll_id)
+                t_co = wp.tile(my_grad_co, preserve_type=True)
+                s_co = wp.tile_reduce(wp.add, t_co)
+                wp.tile_atomic_add(grad_conic_opacity, s_co, offset=coll_id)
 
     @wp.kernel
     def _backward_cov2d_warp_kernel(
