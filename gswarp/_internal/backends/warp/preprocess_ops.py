@@ -16,6 +16,7 @@ from ...._tuning import (
     FAMILY_WARP_SPECIALIZED,
 )
 from ...._stream import torch_launch_array
+from ...coverage import tile_coverage_mode_id
 
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from .state import PreprocessBackwardInterop, PreprocessOutputs
@@ -304,6 +305,7 @@ def preprocess_gaussians(
     capture_backward_interop=False,
 ):
         _runtime._require_warp()
+        coverage_mode = tile_coverage_mode_id(_runtime.get_active_tile_coverage_mode())
         if means3D.ndim != 2 or means3D.shape[1] != 3:
             raise ValueError("means3D must have dimensions (num_points, 3)")
         if prefiltered:
@@ -377,6 +379,7 @@ def preprocess_gaussians(
                   int(image_height),
                   int(grid_x),
                   int(grid_y),
+                  int(coverage_mode),
               ]
               _e1_out = [
                   torch_launch_array(cov3d_all.reshape(-1), dtype=wp.float32),
@@ -488,6 +491,7 @@ def preprocess_gaussians(
                     int(image_height),
                     int(grid_x),
                     int(grid_y),
+                    int(coverage_mode),
                 ],
                 outputs=[
                     wp.from_torch(depths, dtype=wp.float32),
@@ -523,6 +527,7 @@ def preprocess_gaussians(
                     int(image_height),
                     int(grid_x),
                     int(grid_y),
+                    int(coverage_mode),
                 ],
                 outputs=[
                     wp.from_torch(depths, dtype=wp.float32),

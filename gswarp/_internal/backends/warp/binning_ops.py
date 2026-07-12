@@ -3,7 +3,15 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-from .constants import BINNING_SORT_MODES, BLOCK_X, BLOCK_Y, TORCH_SINGLE_SORT_THRESHOLD
+from ...coverage import tile_coverage_mode_id
+from .constants import (
+    BINNING_SORT_MODES,
+    BLOCK_X,
+    BLOCK_Y,
+    TILE_COVERAGE_AUTO,
+    TILE_COVERAGE_CONIC_RECT,
+    TORCH_SINGLE_SORT_THRESHOLD,
+)
 from .state import BinningState
 from . import runtime as _runtime
 from .memory import (
@@ -27,6 +35,7 @@ from .binning_kernels import (
     _duplicate_with_packed_keys_warp_kernel,
     _identify_tile_ranges_from_packed_keys_warp_kernel,
     _identify_tile_ranges_warp_kernel,
+    _recount_covered_tiles_warp_kernel,
 )
 
 def _build_binning_state(
@@ -47,9 +56,54 @@ def _build_binning_state(
 
         if sort_mode is None:
             sort_mode = _runtime.get_active_binning_sort_mode()
+        coverage_mode = tile_coverage_mode_id(_runtime.get_active_tile_coverage_mode())
 
         if sort_mode not in BINNING_SORT_MODES:
             raise ValueError("sort_mode must be one of 'torch', 'warp_radix', or 'warp_depth_stable_tile'")
+
+        if point_count > 0 and coverage_mode in (
+            TILE_COVERAGE_CONIC_RECT,
+            TILE_COVERAGE_AUTO,
+        ):
+            coverage_masks = torch.empty(
+                (point_count,), dtype=torch.int64, device=device
+            )
+            wp.launch(
+                kernel=_recount_covered_tiles_warp_kernel,
+                dim=point_count,
+                inputs=[
+                    wp.from_torch(
+                        _as_detached_contiguous_dtype(points_xy_image, torch.float32),
+                        dtype=wp.vec2,
+                    ),
+                    wp.from_torch(
+                        _as_detached_contiguous_dtype(radii, torch.int32),
+                        dtype=wp.int32,
+                    ),
+                    wp.from_torch(
+                        _as_detached_contiguous_dtype(
+                            preprocess_outputs.conic_opacity, torch.float32
+                        ),
+                        dtype=wp.vec4,
+                    ),
+                    wp.from_torch(
+                        _as_detached_contiguous_dtype(
+                            preprocess_outputs.conic_2d_inv, torch.float32
+                        ),
+                        dtype=wp.vec3,
+                    ),
+                    int(grid_x),
+                    int(grid_y),
+                    int(coverage_mode),
+                ],
+                outputs=[
+                    wp.from_torch(tiles_touched, dtype=wp.int32),
+                    wp.from_torch(coverage_masks, dtype=wp.int64),
+                ],
+                device=str(device),
+            )
+        else:
+            coverage_masks = torch.zeros((1,), dtype=torch.int64, device=device)
 
         sorted_point_ids: torch.Tensor | None = None
         if point_count > 0 and sort_mode == "warp_depth_stable_tile":
@@ -122,6 +176,8 @@ def _build_binning_state(
                     wp.from_torch(depths_f32, dtype=wp.float32),
                     int(grid_x),
                     int(grid_y),
+                    int(coverage_mode),
+                    wp.from_torch(coverage_masks, dtype=wp.int64),
                 ],
                 outputs=[
                     wp.from_torch(point_list_keys, dtype=wp.int64),
@@ -152,6 +208,8 @@ def _build_binning_state(
                 wp.from_torch(point_offsets_i32, dtype=wp.int32),
                 int(grid_x),
                 int(grid_y),
+                int(coverage_mode),
+                wp.from_torch(coverage_masks, dtype=wp.int64),
             ]
             _g1_out = [
                 tile_id_buffer_wp
@@ -203,6 +261,8 @@ def _build_binning_state(
                     cov2d_inv_wp,
                     int(grid_x),
                     int(grid_y),
+                    int(coverage_mode),
+                    wp.from_torch(coverage_masks, dtype=wp.int64),
                 ],
                 outputs=[
                     tile_ids_warp if tile_ids_warp is not None else wp.from_torch(tile_ids, dtype=wp.int32),

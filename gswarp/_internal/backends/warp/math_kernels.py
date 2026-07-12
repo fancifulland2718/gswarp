@@ -8,9 +8,16 @@ import warp as wp
 from .constants import (
     BLOCK_X,
     BLOCK_Y,
+    COVERAGE_Q_EPSILON,
+    DET_EPSILON,
     PREPROCESS_CULL_FOV_SCALE,
     PREPROCESS_CULL_SIGMA,
     SNUGBOX_PIXEL_PADDING,
+    TILE_COVERAGE_ACCUTILE_SWEEP,
+    TILE_COVERAGE_AUTO,
+    TILE_COVERAGE_AUTO_CONIC_RECT_MAX_TILES,
+    TILE_COVERAGE_CONIC_RECT,
+    TILE_COVERAGE_SNUGBOX,
 )
 
 
@@ -187,6 +194,214 @@ if wp is not None:
             wp.min(cuda_rect[2], rect_max_x),
             wp.min(cuda_rect[3], rect_max_y),
         )
+
+    @wp.func
+    def _resolve_tile_coverage_mode_wp(
+        requested_mode: wp.int32,
+        rect: wp.vec4i,
+    ):
+        if requested_mode != TILE_COVERAGE_AUTO:
+            return requested_mode
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        if area <= TILE_COVERAGE_AUTO_CONIC_RECT_MAX_TILES:
+            return wp.int32(TILE_COVERAGE_CONIC_RECT)
+        return wp.int32(TILE_COVERAGE_ACCUTILE_SWEEP)
+
+    @wp.func
+    def _conic_q_wp(
+        x: wp.float32,
+        y: wp.float32,
+        conic_a: wp.float32,
+        conic_b: wp.float32,
+        conic_c: wp.float32,
+    ):
+        return conic_a * x * x + 2.0 * conic_b * x * y + conic_c * y * y
+
+    @wp.func
+    def _conic_rect_intersects_tile_wp(
+        point_x: wp.float32,
+        point_y: wp.float32,
+        conic_a: wp.float32,
+        conic_b: wp.float32,
+        conic_c: wp.float32,
+        threshold: wp.float32,
+        tile_x: wp.int32,
+        tile_y: wp.int32,
+    ):
+        det = conic_a * conic_c - conic_b * conic_b
+        if conic_a <= 0.0 or conic_c <= 0.0 or det <= DET_EPSILON:
+            return True
+
+        x0 = float(tile_x * BLOCK_X) - point_x
+        x1 = float(tile_x * BLOCK_X + BLOCK_X - 1) - point_x
+        y0 = float(tile_y * BLOCK_Y) - point_y
+        y1 = float(tile_y * BLOCK_Y + BLOCK_Y - 1) - point_y
+        if x0 <= 0.0 and x1 >= 0.0 and y0 <= 0.0 and y1 >= 0.0:
+            return True
+
+        q_min = wp.float32(3.402823466e38)
+
+        y = wp.clamp(-conic_b * x0 / conic_c, y0, y1)
+        q_min = wp.min(q_min, _conic_q_wp(x0, y, conic_a, conic_b, conic_c))
+        y = wp.clamp(-conic_b * x1 / conic_c, y0, y1)
+        q_min = wp.min(q_min, _conic_q_wp(x1, y, conic_a, conic_b, conic_c))
+
+        x = wp.clamp(-conic_b * y0 / conic_a, x0, x1)
+        q_min = wp.min(q_min, _conic_q_wp(x, y0, conic_a, conic_b, conic_c))
+        x = wp.clamp(-conic_b * y1 / conic_a, x0, x1)
+        q_min = wp.min(q_min, _conic_q_wp(x, y1, conic_a, conic_b, conic_c))
+
+        return q_min <= threshold + COVERAGE_Q_EPSILON
+
+    @wp.func
+    def _accutile_band_interval_wp(
+        point_u: wp.float32,
+        point_v: wp.float32,
+        conic_uu: wp.float32,
+        conic_uv: wp.float32,
+        conic_vv: wp.float32,
+        threshold: wp.float32,
+        tile_v: wp.int32,
+        block_u: wp.int32,
+        block_v: wp.int32,
+        rect_u_min: wp.int32,
+        rect_u_max: wp.int32,
+    ):
+        det = conic_uu * conic_vv - conic_uv * conic_uv
+        if conic_uu <= 0.0 or conic_vv <= 0.0 or det <= DET_EPSILON:
+            return wp.vec2i(rect_u_min, rect_u_max)
+
+        threshold_safe = threshold + COVERAGE_Q_EPSILON
+        v0 = float(tile_v * block_v) - point_v
+        v1 = float(tile_v * block_v + block_v - 1) - point_v
+        u_min = wp.float32(3.402823466e38)
+        u_max = wp.float32(-3.402823466e38)
+        found = False
+
+        disc = conic_uu * threshold_safe - det * v0 * v0
+        if disc >= -COVERAGE_Q_EPSILON:
+            half = wp.sqrt(wp.max(disc, 0.0)) / conic_uu
+            center = -conic_uv * v0 / conic_uu
+            u_min = wp.min(u_min, center - half)
+            u_max = wp.max(u_max, center + half)
+            found = True
+
+        disc = conic_uu * threshold_safe - det * v1 * v1
+        if disc >= -COVERAGE_Q_EPSILON:
+            half = wp.sqrt(wp.max(disc, 0.0)) / conic_uu
+            center = -conic_uv * v1 / conic_uu
+            u_min = wp.min(u_min, center - half)
+            u_max = wp.max(u_max, center + half)
+            found = True
+
+        extent_u = wp.sqrt(wp.max(threshold_safe * conic_vv / det, 0.0))
+        v_at_min_u = conic_uv * extent_u / conic_vv
+        if v_at_min_u >= v0 - COVERAGE_Q_EPSILON and v_at_min_u <= v1 + COVERAGE_Q_EPSILON:
+            u_min = wp.min(u_min, -extent_u)
+            u_max = wp.max(u_max, -extent_u)
+            found = True
+        v_at_max_u = -conic_uv * extent_u / conic_vv
+        if v_at_max_u >= v0 - COVERAGE_Q_EPSILON and v_at_max_u <= v1 + COVERAGE_Q_EPSILON:
+            u_min = wp.min(u_min, extent_u)
+            u_max = wp.max(u_max, extent_u)
+            found = True
+
+        if not found:
+            return wp.vec2i(rect_u_min, rect_u_min)
+
+        tile_u_min = wp.int32(wp.floor((point_u + u_min) / float(block_u)))
+        tile_u_max = wp.int32(wp.floor((point_u + u_max) / float(block_u))) + 1
+        return wp.vec2i(
+            wp.max(rect_u_min, wp.min(rect_u_max, tile_u_min)),
+            wp.max(rect_u_min, wp.min(rect_u_max, tile_u_max)),
+        )
+
+    @wp.func
+    def _count_covered_tiles_wp(
+        point_x: wp.float32,
+        point_y: wp.float32,
+        cov2d_aa: wp.float32,
+        cov2d_cc: wp.float32,
+        conic_a: wp.float32,
+        conic_b: wp.float32,
+        conic_c: wp.float32,
+        opacity: wp.float32,
+        cuda_radius: wp.int32,
+        grid_x: wp.int32,
+        grid_y: wp.int32,
+        requested_mode: wp.int32,
+    ):
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point_x,
+            point_y,
+            cov2d_aa,
+            cov2d_cc,
+            opacity,
+            cuda_radius,
+            grid_x,
+            grid_y,
+        )
+        span_x = rect[2] - rect[0]
+        span_y = rect[3] - rect[1]
+        area = span_x * span_y
+        if area <= 1:
+            return area
+
+        mode = _resolve_tile_coverage_mode_wp(requested_mode, rect)
+        if mode == TILE_COVERAGE_SNUGBOX:
+            return area
+
+        threshold = 2.0 * wp.log(wp.max(255.0 * opacity, 1.0))
+        count = wp.int32(0)
+        if mode == TILE_COVERAGE_CONIC_RECT:
+            for tile_y in range(rect[1], rect[3]):
+                for tile_x in range(rect[0], rect[2]):
+                    if _conic_rect_intersects_tile_wp(
+                        point_x,
+                        point_y,
+                        conic_a,
+                        conic_b,
+                        conic_c,
+                        threshold,
+                        tile_x,
+                        tile_y,
+                    ):
+                        count = count + 1
+            return count
+
+        if span_y <= span_x:
+            for tile_y in range(rect[1], rect[3]):
+                interval = _accutile_band_interval_wp(
+                    point_x,
+                    point_y,
+                    conic_a,
+                    conic_b,
+                    conic_c,
+                    threshold,
+                    tile_y,
+                    BLOCK_X,
+                    BLOCK_Y,
+                    rect[0],
+                    rect[2],
+                )
+                count = count + wp.max(0, interval[1] - interval[0])
+        else:
+            for tile_x in range(rect[0], rect[2]):
+                interval = _accutile_band_interval_wp(
+                    point_y,
+                    point_x,
+                    conic_c,
+                    conic_b,
+                    conic_a,
+                    threshold,
+                    tile_x,
+                    BLOCK_Y,
+                    BLOCK_X,
+                    rect[1],
+                    rect[3],
+                )
+                count = count + wp.max(0, interval[1] - interval[0])
+        return count
 
     @wp.func
     def _preprocess_rect_visible_wp(

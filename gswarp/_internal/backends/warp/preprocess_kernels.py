@@ -24,7 +24,7 @@ from .constants import (
     sh_c3_6,
 )
 from .math_kernels import (
-    _compute_tile_rect_compat_snugbox_cov2d_wp,
+    _count_covered_tiles_wp,
     _compute_tile_rect_wp,
     _conservative_cull_radius_from_cov3d_wp,
     _cov2d_from_scale_rotation_gram_wp,
@@ -96,6 +96,7 @@ if wp is not None:
         image_height: wp.int32,
         grid_x: wp.int32,
         grid_y: wp.int32,
+        coverage_mode: wp.int32,
         # outputs
         out_cov3d_flat: wp.array(dtype=wp.float32),
         visible_mask_out: wp.array(dtype=wp.int32),
@@ -242,18 +243,6 @@ if wp is not None:
         if cuda_rect_area == 0:
             return
 
-        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
-            point_x,
-            point_y,
-            cov_a,
-            cov_c,
-            opacities[idx],
-            radius,
-            grid_x,
-            grid_y,
-        )
-        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z
         radii[idx] = radius
@@ -261,8 +250,23 @@ if wp is not None:
         conic_2d[idx] = conic
         conic_2d_inv[idx] = wp.vec3(cov_a, cov_b, cov_c)
         points_xy_image[idx] = point_image
-        tiles_touched[idx] = rect_area
         conic_opacity[idx] = wp.vec4(conic[0], conic[1], conic[2], opacities[idx])
+        stored_cov = conic_2d_inv[idx]
+        stored_conic_opacity = conic_opacity[idx]
+        tiles_touched[idx] = _count_covered_tiles_wp(
+            point_x,
+            point_y,
+            stored_cov[0],
+            stored_cov[2],
+            stored_conic_opacity[0],
+            stored_conic_opacity[1],
+            stored_conic_opacity[2],
+            stored_conic_opacity[3],
+            radius,
+            grid_x,
+            grid_y,
+            coverage_mode,
+        )
 
     @wp.kernel
     def _forward_rgb_from_sh_v3_warp_kernel(
@@ -354,6 +358,7 @@ if wp is not None:
         image_height: wp.int32,
         grid_x: wp.int32,
         grid_y: wp.int32,
+        coverage_mode: wp.int32,
         depths: wp.array(dtype=wp.float32),
         radii: wp.array(dtype=wp.int32),
         proj_2d: wp.array(dtype=wp.vec2),
@@ -446,18 +451,6 @@ if wp is not None:
         if cuda_rect_area == 0:
             return
 
-        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
-            point_x,
-            point_y,
-            cov_value[0],
-            cov_value[2],
-            opacities[idx],
-            radius,
-            grid_x,
-            grid_y,
-        )
-        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z[idx]
         radii[idx] = radius
@@ -465,8 +458,23 @@ if wp is not None:
         conic_2d[idx] = conic
         conic_2d_inv[idx] = cov_value
         points_xy_image[idx] = point_image
-        tiles_touched[idx] = rect_area
         conic_opacity[idx] = wp.vec4(conic[0], conic[1], conic[2], opacities[idx])
+        stored_cov = conic_2d_inv[idx]
+        stored_conic_opacity = conic_opacity[idx]
+        tiles_touched[idx] = _count_covered_tiles_wp(
+            point_x,
+            point_y,
+            stored_cov[0],
+            stored_cov[2],
+            stored_conic_opacity[0],
+            stored_conic_opacity[1],
+            stored_conic_opacity[2],
+            stored_conic_opacity[3],
+            radius,
+            grid_x,
+            grid_y,
+            coverage_mode,
+        )
 
     @wp.kernel
     def _cov2d_preprocess_masked_pack_scale_rotation_warp_kernel(
@@ -487,6 +495,7 @@ if wp is not None:
         image_height: wp.int32,
         grid_x: wp.int32,
         grid_y: wp.int32,
+        coverage_mode: wp.int32,
         depths: wp.array(dtype=wp.float32),
         radii: wp.array(dtype=wp.int32),
         proj_2d: wp.array(dtype=wp.vec2),
@@ -566,18 +575,6 @@ if wp is not None:
         if cuda_rect_area == 0:
             return
 
-        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
-            point_x,
-            point_y,
-            cov_value[0],
-            cov_value[2],
-            opacities[idx],
-            radius,
-            grid_x,
-            grid_y,
-        )
-        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z[idx]
         radii[idx] = radius
@@ -585,8 +582,23 @@ if wp is not None:
         conic_2d[idx] = conic
         conic_2d_inv[idx] = cov_value
         points_xy_image[idx] = point_image
-        tiles_touched[idx] = rect_area
         conic_opacity[idx] = wp.vec4(conic[0], conic[1], conic[2], opacities[idx])
+        stored_cov = conic_2d_inv[idx]
+        stored_conic_opacity = conic_opacity[idx]
+        tiles_touched[idx] = _count_covered_tiles_wp(
+            point_x,
+            point_y,
+            stored_cov[0],
+            stored_cov[2],
+            stored_conic_opacity[0],
+            stored_conic_opacity[1],
+            stored_conic_opacity[2],
+            stored_conic_opacity[3],
+            radius,
+            grid_x,
+            grid_y,
+            coverage_mode,
+        )
 
     @wp.kernel
     def _project_visible_points_warp_kernel(

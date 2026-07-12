@@ -19,7 +19,9 @@ from gswarp.rasterizer import (
     GaussianRasterizationSettings as StandardSettings,
     clear_warp_caches as clear_standard_caches,
     get_warp_cache_report as get_standard_cache_report,
+    get_tile_coverage_mode,
     rasterize_gaussians as rasterize_standard,
+    set_tile_coverage_mode,
 )
 from gswarp.rasterizer_flow import (
     GaussianRasterizationSettings as FlowSettings,
@@ -188,6 +190,45 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(
             rendered, expected, atol=2.0e-5, rtol=2.0e-4
         )
+
+    def test_tile_coverage_modes_match_snugbox_for_large_rotated_conic(self) -> None:
+        image_size = 128
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        covariances = torch.tensor(
+            [[0.20, 0.18, 0.0, 0.20, 0.0, 0.02]],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        inputs = _inputs(
+            torch.tensor([[-0.15, 0.1, 2.0]], dtype=torch.float32, device=DEVICE),
+            scales=_empty(),
+            covariances=covariances,
+        )
+        inputs["opacities"] = torch.full(
+            (1, 1), 0.35, dtype=torch.float32, device=DEVICE
+        )
+
+        original_mode = get_tile_coverage_mode()
+        outputs = {}
+        try:
+            for mode in ("snugbox", "accutile_sweep", "conic_rect", "auto"):
+                set_tile_coverage_mode(mode)
+                outputs[mode] = rasterize_standard(
+                    **inputs,
+                    raster_settings=_settings(background, image_size=image_size),
+                )
+                torch.cuda.synchronize(DEVICE)
+        finally:
+            set_tile_coverage_mode(original_mode)
+
+        reference = outputs["snugbox"]
+        for mode in ("accutile_sweep", "conic_rect", "auto"):
+            torch.testing.assert_close(outputs[mode][0], reference[0], atol=2.0e-5, rtol=2.0e-4)
+            torch.testing.assert_close(outputs[mode][1], reference[1])
+            for actual, expected in zip(outputs[mode][2], reference[2]):
+                torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-4)
 
     def test_mark_visible_returns_owned_bool_tensor(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
