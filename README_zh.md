@@ -11,6 +11,7 @@ gswarp 是一个基于 **NVIDIA Warp** 的 3D Gaussian Splatting 加速后端，
 ## 目录
 
 - [三个替换模块](#三个替换模块)
+- [当前架构](#当前架构)
 - [系统要求](#系统要求)
 - [安装](#安装)
 - [在 3DGS 框架中替换 CUDA 后端](#在-3dgs-框架中替换-cuda-后端)
@@ -29,9 +30,27 @@ gswarp 是一个基于 **NVIDIA Warp** 的 3D Gaussian Splatting 加速后端，
 
 | 模块 | 替换目标 | 导入路径 | 说明 |
 |------|----------|----------|------|
-| **光栅化器** | `diff_gaussian_rasterization` | `gswarp` | 完整的可微高斯光栅化 + 自动调优 |
-| **SSIM** | `fused_ssim` | `gswarp.fused_ssim` | 可分离高斯卷积，带 launch 缓存 |
-| **KNN** | `simple_knn` | `gswarp.knn` | Morton 排序 + 包围盒剪枝的 3-NN |
+| **光栅化器** | `diff_gaussian_rasterization` | `gswarp` | 类型化分阶段光栅化、手写反向与 stream-safe 缓存 |
+| **SSIM** | `fused_ssim` | `gswarp.fused_ssim` | 可分离高斯卷积，使用随 autograd graph 持有的可复用计划 |
+| **KNN** | `simple_knn` | `gswarp.knn` | 在当前 PyTorch stream 上执行 Morton 排序和包围盒剪枝 3-NN |
+
+---
+
+## 当前架构
+
+公开模块保持为轻量兼容层。光栅化器内部解析并缓存不可变的方法计划，再执行明确的阶段：
+
+```text
+公开 API -> 输入校验/autograd -> 方法计划
+        -> preprocess -> features -> binning -> render -> typed forward state
+        -> manual backward
+```
+
+标准 3DGS 与可选 flow 后端共用预处理、分箱、调用级运行时选项、stream 互操作、workspace 管理和大部分反向实现。方法专属后端只适配阶段输入输出、辅助数据和需要保留的反向状态。
+
+每次调用都会冻结自己的运行时选项，并将 Warp 绑定到当前 PyTorch CUDA 设备和 stream。可复用 workspace 与 recorded launch 按设备和 stream 有界缓存；forward 所有的张量随 autograd graph 保留，直到 backward 释放。`clear_warp_caches()` 和 `get_warp_cache_report()` 用于显式管理缓存生命周期。
+
+stable 后端面向声明的最低 Warp 版本。可选 advanced 后端只有在最低版本与所需 Warp 能力同时满足时才会启用；当前发布尚未启用任何 advanced 后端。
 
 ---
 
@@ -94,7 +113,7 @@ from gswarp import (
 )
 ```
 
-`GaussianRasterizationSettings` 是 `NamedTuple`，字段与原版完全一致（额外的 Warp 专有字段均有默认值）。`GaussianRasterizer.forward()` **返回三值元组 `(color, radii, meta)`**，其中 `meta` 是 `RasterizerMeta` NamedTuple，携带五个附加输出：
+`GaussianRasterizationSettings` 是 `NamedTuple`，包含 CUDA 兼容字段以及带默认值的 Warp 专属字段。`GaussianRasterizer.forward()` **返回三值元组 `(color, radii, meta)`**，其中 `meta` 是 `RasterizerMeta` NamedTuple，携带五个附加输出：
 
 | `meta` 字段 | 含义 |
 |-------------|------|
@@ -121,6 +140,8 @@ conic_2D_inv = meta.conic_2D_inv  # (N, 3)
 # 仅需 color 与 radii 时可忽略 meta：
 color, radii, _ = rasterizer(means3D=..., means2D=..., ...)
 ```
+
+迁移现有代码时应使用关键字参数。`shs`、`colors_precomp`、`scales`、`rotations` 与 `cov3D_precomp` 遵守 CUDA 光栅化器的互斥输入规则；`dc` 可作为 `shs` 的兼容别名。当前 stable 后端尚不支持 `prefiltered=True`，也不会执行 CUDA 的 antialiasing 路径。
 
 ### 光流后端（可选）
 
@@ -172,11 +193,11 @@ set_compute_flow_aux(False)  # 临时禁用辅助输出以节省显存
 ```python
 from gswarp import initialize_runtime_tuning, set_binning_sort_mode
 
-# 检测 GPU 并自动选择最优 block_dim（推荐）
+# 初始化 Warp 并记录当前设备的 launch/tuning 报告
 initialize_runtime_tuning(device="cuda:0", verbose=True)
 
-# 手动选择排序模式（默认 warp_depth_stable_tile 通常最优）
-set_binning_sort_mode("warp_depth_stable_tile")  # 推荐（大场景优势明显）
+# stable 默认使用 32 位深度排序，再进行稳定的 tile 排序
+set_binning_sort_mode("warp_depth_stable_tile")
 # set_binning_sort_mode("warp_radix")            # 备选
 # set_binning_sort_mode("torch")                 # 回退
 ```
@@ -241,6 +262,8 @@ except ImportError:
 
 ## 整体性能
 
+> **历史结果，等待复测。** 下列表格来自较早代码快照和上一张显卡，仅用于保留测试来源，不代表当前发布版本的性能声明。更新这些数字前，将在新显卡上同时重跑 CUDA 与 Warp。
+
 以下数据来自 12 个标准 3DGS 数据集的完整 30K 步训练，测试环境为 RTX 5090D V2（sm_120，24 GiB），Python 3.14，PyTorch 2.11.0+cu130，Warp 1.12.0。**三个模块均使用 Warp 后端**，含 Python 层开销优化。
 
 | 数据集 | CUDA (it/s) | Warp (it/s) | 速度比 |
@@ -263,6 +286,8 @@ except ImportError:
 ---
 
 ## 质量指标
+
+> **历史结果，等待复测。** 下列数值来自同一轮旧 benchmark。当前仓库已有公开契约和确定性小场景门禁，但发布新的端到端一致性结论前，仍需在新硬件上重新生成 CUDA/Warp 训练与评估结果。
 
 训练 30K 步后在测试集上的评估结果：
 
@@ -290,7 +315,7 @@ except ImportError:
 | SSIM | 0.9062 | 0.9063 | +0.0001 |
 | LPIPS | 0.2390 | 0.2388 | −0.0002 |
 
-各场景 PSNR 差异均在 ±0.25 dB 以内，SSIM 差异 < 0.001。Warp 后端在所有场景中的训练质量与 CUDA 基线等价。
+历史测试曾记录各场景 PSNR 差异在 ±0.25 dB 以内、SSIM 差异 < 0.001；这些归档数值不得视为当前版本与 CUDA 等价的结论。
 
 ---
 

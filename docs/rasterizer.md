@@ -1,6 +1,6 @@
 # Rasterizer Backend
 
-**中文** · [English](rasterizer.md)
+[中文](rasterizer_zh.md) · **English**
 
 This document covers technical details, implementation differences, performance data, and correctness verification for the `gswarp` rasterizer backend. For everyday usage, see the [main README](../README.md).
 
@@ -23,16 +23,17 @@ This document covers technical details, implementation differences, performance 
 ## Overview
 
 The `gswarp` rasterizer backend implements a differentiable Gaussian rasterization
-pipeline equivalent to [diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization)
+pipeline compatible with [diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization)
 in pure Python + NVIDIA Warp, comprising the following stages:
 
 1. **Preprocessing**: Project 3D Gaussians to 2D, compute covariances, evaluate SH colors, compute AABB tile rects
-2. **Binning**: Gaussian-to-tile mapping, depth sort, tile range identification
-3. **Forward render**: block_dim=256 cooperative tile loading, front-to-back alpha compositing
-4. **Backward render**: block_dim=32 (single warp), warp shuffle gradient reduction, 32× fewer atomics
-5. **Backward preprocess**: Gradients for means3D / scales / rotations / SH
+2. **Feature selection**: Select precomputed RGB or the SH-evaluated colors
+3. **Binning**: Gaussian-to-tile mapping, depth sort, tile range identification
+4. **Forward render**: block_dim=256 cooperative tile loading, front-to-back alpha compositing
+5. **State assembly**: Retain typed preprocess/binning/render state needed by backward
+6. **Manual backward**: Render, projection, covariance, scale/rotation, and SH gradients
 
-The entire pipeline runs on the same PyTorch CUDA stream (aligned via `_stream.py` `ensure_aligned()`), cooperating correctly with PyTorch autograd.
+Each public call snapshots its runtime options and enters a call-scoped execution context. Warp is bound to the current PyTorch CUDA device and stream for the complete submission, including non-default streams.
 
 ---
 
@@ -51,12 +52,13 @@ Input Gaussians (means3D, SH, scales, rotations, opacities)
 │  - Frustum + near-plane culling │
 │  - SH → RGB color evaluation    │
 │  - Tight AABB tile rectangle    │
-│  - Forward-state packing        │
+│  - Typed preprocess outputs     │
 └─────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────┐
-│  2. BINNING                     │
+│  2. FEATURES + BINNING          │
+│  - Select precomputed/SH RGB    │
 │  - Tile-overlap counting (scan) │
 │  - Gaussian→tile duplication    │
 │  - Depth sort + tile sort       │
@@ -65,18 +67,19 @@ Input Gaussians (means3D, SH, scales, rotations, opacities)
     │
     ▼
 ┌──────────────────────────────────────────┐
-│  3. FORWARD RENDER                       │
+│  3. FORWARD RENDER + STATE               │
 │  - block_dim=256 cooperative tile load   │
 │    (wp.tile + wp.tile_extract)           │
 │  - Per-pixel alpha blending              │
 │  - Front-to-back compositing             │
 │  - Transmittance threshold termination   │
 │  - Color, depth, alpha outputs           │
+│  - Typed state for manual backward       │
 └──────────────────────────────────────────┘
     │
     ▼
 ┌──────────────────────────────────────────┐
-│  4. BACKWARD RENDER                      │
+│  4. MANUAL BACKWARD                      │
 │  - block_dim=32 warp-level grad reduce   │
 │    (wp.tile_reduce → warp shuffle)       │
 │  - Gradients w.r.t. conic,              │
@@ -94,16 +97,24 @@ Input Gaussians (means3D, SH, scales, rotations, opacities)
 └─────────────────────────────────────┘
 ```
 
-### Single-File Design
+### Module Boundaries
 
-The entire Warp backend is contained in a single Python file (about 4100 lines), including:
+The public modules are compatibility layers; implementation code is split by functional ownership:
 
-- all Warp kernel definitions (`@wp.kernel`)
-- all Warp helper functions (`@wp.func`)
-- runtime auto-tuning
-- public API functions
+| Layer | Responsibility |
+|-------|----------------|
+| `gswarp/rasterizer*.py` | Public settings, return schema, and CUDA-style module wrappers |
+| `_internal/frontend/` | PyTorch autograd adapters and output adaptation |
+| `_internal/methods/` | Immutable method specifications, stage plans, and the shared typed executor |
+| `_internal/backends/select.py` | Stable/advanced backend resolution and capability validation |
+| `_internal/backends/warp/backend_3dgs*.py` | Thin standard/flow stage adapters and raw compatibility entry points |
+| `*_ops.py` | Torch/Warp orchestration for one algorithm domain |
+| `*_kernels.py` | Warp kernels and device functions for that domain |
+| `state.py`, `memory.py`, `runtime.py` | Typed retained state, bounded workspaces, and call-scoped runtime policy |
 
-This is intentional — Warp's JIT compilation model requires all kernel code and dependencies to remain within the same `wp.Module` scope. Splitting the code across multiple files would break Warp's ability to resolve `@wp.func` cross-references during JIT.
+Kernel modules remain grouped with the device functions they call, while Python orchestration and public compatibility code are kept outside those modules. This preserves Warp JIT symbol resolution without rebuilding a monolithic backend.
+
+The standard and flow backends use the same stage protocol. Their adapters reuse common preprocessing, binning, rendering, stream, cache, and backward components; flow-specific auxiliary outputs remain confined to the flow path.
 
 ### Key Constants
 
@@ -112,7 +123,6 @@ This is intentional — Warp's JIT compilation model requires all kernel code an
 | `BLOCK_X` | 16 | Tile width in pixels |
 | `BLOCK_Y` | 16 | Tile height in pixels |
 | `NUM_CHANNELS` | 3 | RGB output channels |
-| `RENDER_TILE_BATCH` | 32 | Number of Gaussians cooperatively loaded into shared memory per round in the forward kernel |
 | `PREPROCESS_CULL_SIGMA` | 3.0 | Frustum-culling sigma multiplier |
 | `PREPROCESS_CULL_FOV_SCALE` | 1.3 | FoV-boundary scale used for culling |
 | `VISIBILITY_NEAR_PLANE` | 0.2 | Near-plane distance used for culling |
@@ -238,33 +248,23 @@ The backward render kernel uses block_dim=32 (single warp), where each warp cove
 
 Warp's Python layer (type checking, kernel parameter packing, torch→wp.array conversion)
 introduces measurable Python function-call overhead on the per-iteration hot path.
-The following optimizations have been applied to `_rasterizer.py`:
+The current implementation reduces this cost through:
 
-**Key measures:**
-- `GaussianRasterizationSettings` uses `dataclasses.dataclass` instead of a plain class,
-  reducing field access from dict lookup to attribute lookup
-- The `device` object is cached on first call, avoiding repeated `tensor.device` queries
-- Parameter validation and format conversion are moved from the call hot-path into `_prep()`,
-  reducing conditional branches
+- cached immutable method plans rather than resolving stages per Gaussian or per kernel
+- call-scoped immutable execution options rather than mutating and restoring global settings
+- recorded Warp launches with bounded caches
+- forward-created, non-autograd Warp views reused by the standard backward path
+- ownerless dynamic launch descriptors whose tensor owners remain in the call or graph state
+- typed forward state instead of packing normal frontend state into opaque byte buffers
+- stream-owned workspace slots with bounded eviction and explicit cache reporting
 
-**Measured effect (RTX 5090D V2):**
-
-| Scale | Before optimization | After optimization | Reduction |
-|-------|--------------------|--------------------|-----------|
-| 256K | 0.786 ms | 0.760 ms | -3.2% |
-| 512K | 0.906 ms | 0.868 ms | -4.2% |
-| 1024K | 1.090 ms | 1.061 ms | -2.7% |
-| 2048K | 1.622 ms | 1.580 ms | -2.6% |
-
-*Public API end-to-end (forward + backward) steady-state latency; bit-exact output unchanged.*
-
-Real-world 30K training effect varies by scene: small scenes (lego, ~300K Gaussians) see ~2.5%
-improvement; large scenes (truck, drjohnson, 2M+ Gaussians) see <0.1% — GPU compute dominates
-and Python overhead is negligible.
+These mechanisms do not change the public return schema or the stable sorting policy. Their current-device performance effect is intentionally not stated here; the numeric sections below are historical until CUDA and Warp are rerun on the new GPU.
 
 ---
 
 ## Correctness
+
+> **Historical numeric snapshot pending refresh.** The values in this section were collected on the previous GPU and earlier code revisions. The current repository has contract tests for empty/all-culled scenes, gradients, retained graphs, stream ownership, and cache lifecycle, but CUDA and Warp numeric comparisons will be regenerated together on the new hardware.
 
 ### Random Particle Correctness (256K–2048K)
 
@@ -353,6 +353,8 @@ In most scenes the PSNR gap between Warp and CUDA is within **-0.07 to -0.40 dB*
 
 ## Performance Characteristics (Early Benchmark)
 
+> **Historical benchmark.** This section is retained for provenance and must not be treated as a current performance claim.
+
 
 > **Benchmark conditions**: Data in this section was collected in an earlier benchmark run: only the rasterizer used the Warp backend; SSIM used cuda-fused (not Warp SSIM); KNN used CUDA simple-knn (not Warp KNN); Python-layer overhead optimizations had not yet been applied. For all-three-module Warp results, see [Updated Benchmark](#updated-benchmark-bench30k_plots-all-warp-stack) below.
 
@@ -423,7 +425,7 @@ The following data was tested on **NVIDIA RTX 5090D V2** (24 GiB, sm_120), **PyT
 
 The following figure shows the iteration speed (FPS), total loss (log), peak GPU memory, and Gaussian count over 30K training iterations for all 12 datasets across CUDA (blue), Stable Tile (red), Radix (green), and Torch Sort (purple):
 
-![Sort Backend Training Overview](../figures/sort_backend_overview.png)
+![Sort Backend Training Overview](../figures/warp%20rasterizer/sort_backend_overview.png)
 
 ### Micro-Benchmarks (Random Particles)
 
@@ -548,6 +550,8 @@ CPU overhead breakdown (from nsys CUDA API Summary):
 
 ## Updated Benchmark (bench30k\_plots, All-Warp Stack)
 
+> **Historical benchmark pending replacement.** CUDA and Warp must both be rerun on the new GPU before this section is considered current.
+
 > **Benchmark conditions**: Rasterizer, SSIM, and KNN all use Warp backends; Python-layer
 > overhead optimizations applied; 12 datasets × 30K iterations. See [SSIM docs](ssim.md#end-to-end-training-impact)
 > and [KNN docs](knn.md#end-to-end-training-impact) for per-module contributions.Attention, the result differs a lot from all-warp version as different test scripts were used.
@@ -594,71 +598,40 @@ with Warp SSIM at some resolutions — see [SSIM docs](ssim.md) for details.
 
 ## Known Limitations
 
-### 1. Warp Tile API Flexibility Limitations
+### 1. CUDA Compatibility Boundaries
 
-NVIDIA Warp provides shared memory and warp-level operations indirectly through the Tile API (`wp.tile()`, `wp.tile_extract()`, `wp.tile_reduce()`), but compared to directly operating CUDA `__shared__` memory, there are the following limitations:
-- **`wp.tile()` always creates block-level tiles** — it is not possible to create warp-level or other granularity sub-block tiles.
-- **Each `wp.tile()` call implicitly triggers `__syncthreads`** — creating tiles multiple times in an inner loop causes a barrier storm (verified experimentally: the tiled-256 backward kernel triggers 12 `__syncthreads` per Gaussian, resulting in a 2–3× performance regression).
-- **No control over shared memory layout** — alignment, padding, and bank conflict avoidance cannot be manually optimized.
-- **`tile_reduce` uses shared memory + `__syncthreads` when block_dim > 32** — only when block_dim=32 (single warp) does it take the pure warp shuffle fast path.
+The common keyword-based 3DGS integration path is supported, but the public contract is not byte-for-byte identical to every revision of `diff-gaussian-rasterization`:
 
-Current solution: forward uses block_dim=256 + `wp.tile()`/`wp.tile_extract()` for cooperative loading; backward uses block_dim=32 to ensure `tile_reduce` takes the warp shuffle fast path.
+- standard gswarp returns `(color, radii, RasterizerMeta)` rather than a bare depth tensor
+- `dc` is an additional compatibility alias before `shs`, so positional migration is discouraged
+- `prefiltered=True` is not implemented
+- the `antialiasing` setting is accepted for construction compatibility but is not applied by the stable backend
+- `debug=True` enables public-input finite-value checks; it does not reproduce the CUDA extension's snapshot dump
 
-### 2. `tile_atomic_add` Only Supports Scalars
+### 2. Manual Backward and Atomic Ordering
 
-`wp.tile_atomic_add` only supports a few scalar operands such as `float32`. Vector- and matrix-level atomic reductions must be decomposed into separate scalar atomic operations. This has been verified experimentally — the tiled-256 + `tile_reduce` + `tile_atomic_add` backward kernel is **2–3× slower** than the warp32 version, requiring 10 scalar atomic operations plus 12 `__syncthreads` barriers per Gaussian.
+Only `backward_mode="manual"` is supported. Gradient accumulation uses atomic operations, so repeated runs can differ slightly in floating-point order, as can the CUDA baseline. The typed forward state and explicit backward implementation are integrated into PyTorch through a custom autograd function.
 
-### 3. Compile-Time Tile Shape
+### 3. Fixed Tile Shape and First-Run JIT
 
-`BLOCK_X` and `BLOCK_Y` are defined as `wp.constant()` values (16×16). Changing the tile shape requires modifying the source code and triggering Warp module recompilation. The CUDA baseline also uses fixed tile sizes, but Warp's JIT model makes this limitation more obvious because the constants are baked into the kernel at compile time.
+`BLOCK_X=16` and `BLOCK_Y=16` are compile-time constants. Changing them requires recompiling the Warp kernels. The first invocation on a new device/kernel configuration triggers Warp JIT compilation; later processes can reuse Warp's on-disk cache.
 
-### 4. First-Run JIT Compilation Overhead
+### 4. Python Orchestration and Synchronization
 
-The first call to any Warp kernel triggers JIT compilation of the whole module. On a typical system, this takes several seconds (depending on the number of kernels and the GPU). Subsequent calls use the Warp kernel cache and complete almost instantly.
+The CUDA baseline performs most orchestration in C++. gswarp still submits several Warp kernels and PyTorch operations from Python. Binning also reads the exact rendered-reference count back to the host before allocating and launching dependent work. Recorded launches and ownerless descriptors reduce this cost but do not eliminate it.
 
-### 5. Backward Non-Determinism
+### 5. Cache High-Water Marks
 
-The backward render kernel uses `wp.atomic_add` to accumulate gradients. When multiple threads write to the same address, this is inherently non-deterministic. This means:
-- two runs with identical inputs may produce slightly different gradient values
-- the difference is usually within FP32 precision (most gradients < 1e-4)
-- this is consistent with the CUDA baseline (`atomicAdd` is also non-deterministic)
+Reusable workspaces are bounded by device and stream count, and launch caches have entry limits. Individual workspace buffers retain the largest capacity requested by their slot until eviction or an explicit `clear_warp_caches()`. Use `get_warp_cache_report()` to inspect retained bytes and stream distribution.
 
-### 6. Python-Level Orchestration Overhead
+### 6. Advanced Warp Backends
 
-Unlike the CUDA baseline, where the full pipeline is orchestrated in C++ with very little Python interaction, the Warp backend uses Python to:
-
-- allocate intermediate tensors (through PyTorch)
-- launch Warp kernels sequentially
-- pass data between stages through Python variables
-
-This introduces measurable fixed overhead. It is significant at small scales and negligible at large scales. **This may cause large fluctuations in Warp training throughput.**
-
-### 7. Single Backward Mode
-
-Only `backward_mode="manual"` is supported. The CUDA baseline's `autograd`-level differentiation is not applicable because Warp kernels are not natively integrated into PyTorch's autograd graph — the backward pass is explicitly encoded with manually derived gradients.
+The resolver can gate optional implementations by Warp version and required public capabilities. The current advanced modules are placeholders and are not executable; automatic selection therefore uses the stable backend.
 
 ---
 
 ## Future Optimization Directions
 
-The following are the most impactful potential improvements, roughly ordered by expected benefit:
+Optimization priorities will be rewritten only after paired CUDA/Warp profiling on the new GPU. The next benchmark must separate full-training and full-inference lifecycle time from individual kernel duration, and must report fixed host overhead, synchronization, allocation, and retained-cache behavior.
 
-### 1. More Efficient Backward Tile Reduction
-
-The current backward kernel uses block_dim=32 (single warp) to ensure `tile_reduce` takes the pure warp shuffle fast path. This approach is already 3–4× faster than the block_dim=256 `tile_reduce + tile_atomic_add` approach, but each pixel still requires multiple atomic writes. If Warp adds support in a future release for:
-- **Sub-block / warp-level tile creation** (allowing creation of 32-thread warp tiles within a 256-thread block)
-- **Direct exposure of `__shfl_down_sync` and other warp-level intrinsics**
-
-then the block_dim=256 backward kernel could implement intra-warp reduction followed by cross-warp reduction, combining the benefits of cooperative loading and efficient reduction.
-
-### 2. Runtime Tile-Shape Adaptation
-
-Currently `BLOCK_X=16, BLOCK_Y=16` is fixed at compile time. Allowing runtime selection of tile shapes (for example, 8×8 for small images and 32×16 for wide images) could improve occupancy and reduce tile-boundary overhead. This would require Warp to support dynamic kernel parameterization or template-like mechanisms.
-
-### 3. `.item()` Sync Point Elimination
-
-The binning stage synchronizes via `.item()` to obtain `num_rendered` (GPU→CPU), which breaks the GPU pipeline. If speculative launch or GPU-side branch resolution based on this value could be implemented, pipeline efficiency could be further improved. The effect is limited at low Gaussian counts, but becomes meaningful in multi-view / batch training.
-
-### 4. Smart Buffer Pool Recycling
-
-Currently, radix sort, index gather, scan, and other buffers use a grow-only cache — once allocated, they only grow and never shrink. After densification/pruning, old buffers may be far larger than actually needed. Introducing aging or shrink strategies could reduce memory fragmentation.
+Support for additional Gaussian methods and any executable advanced-Warp backend will be designed in separate plans. The current baseline keeps the stage executor and capability gate ready without adding an external plugin API or unvalidated backend placeholders.

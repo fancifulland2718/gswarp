@@ -1,6 +1,6 @@
 # SSIM Module
 
-**中文** · [English](ssim.md)
+[中文](ssim_zh.md) · **English**
 
 This document covers the implementation details, kernel performance, and correctness of the `gswarp.fused_ssim` module.
 
@@ -61,33 +61,33 @@ The 11 Gaussian weights (σ=1.5) are unrolled as compile-time constants. Warp em
 
 ### C4: `_SSIMPlan` Launch Cache (Most Impactful)
 
-Each Warp kernel invocation requires ~37 `set_param_at_index` calls, ~10 `wp.from_torch` calls, and several `torch.empty` allocations in Python.
+Training uses a bounded pool of `_SSIMPlan` objects keyed by device, current PyTorch stream, shape, padding, constants, and tuned block dimensions. A plan owns its intermediate buffers and four recorded commands.
 
-`_SSIMPlan` caches all intermediate buffers and kernel parameter references on the first forward pass. Subsequent iterations update only the few pointer slots that actually change (~5 `set_param_at_index` calls), bypassing the reconstruction overhead.
+Each forward acquires a private lease that remains attached to its autograd context until the graph is released. This prevents a later forward from overwriting saved workspace and supports multiple live graphs, `retain_graph=True`, and non-default streams. Returned gradients are newly allocated and never stored in the reusable pool.
 
-Effect (chair 30K training, RTX 5090D V2): −7.1 s total loss-phase time, approximately **−2.8%** in overall training time.
+Dynamic image, upstream-gradient, and output pointers are passed through call-scoped ownerless descriptors. Recorded commands never retain the input autograd graph.
 
 ### M1: Flat Array Layout
 
 Intermediate buffers (row means, column means, etc.) use 1D flat layout (`[C, H, W]`) rather than structured tensors, enabling direct pointer-offset access in kernels and reducing index computation overhead.
 
-### O3: Dead-Buffer Reuse
+### O3: Lifetime-Based Workspace Aliasing
 
-The `bwd_h` output buffer can reuse an expired intermediate tensor from `fwd_h`, eliminating one `torch.empty` allocation per backward call.
+The horizontal backward workspace aliases three channels of the horizontal forward buffer. The forward values are dead before backward writes begin on the same stream, so the plan reduces retained storage without overlapping live values.
 
 ---
 
 ## Python Overhead and Launch Caching
 
-The fixed Python overhead per SSIM call (Python→Warp parameter marshaling, kernel launch, result collection) is approximately **0.05 ms/call**, resolution-independent.
+Forward and backward enter the same call-scoped PyTorch/Warp execution context used by the rasterizer. Recorded commands keep static workspace parameters, while only dynamic pointers are updated for each invocation. The free-plan pool is bounded per key and per device; retirement and explicit cache clearing synchronize only the affected Warp streams.
 
-On drjohnson (1332×876), total e2e per SSIM call is ~0.30 ms: 0.25 ms kernel execution + 0.05 ms Python overhead (17%).
-
-The C4 launch cache reduces Python overhead from ~0.08 ms/call to ~0.05 ms/call — the dominant contributor to the 2.8% training speedup.
+Current-device timing is intentionally omitted from this description. The numeric sections below are historical until CUDA fused-ssim and Warp SSIM are rerun on the new GPU.
 
 ---
 
 ## Kernel Performance Analysis
+
+> **Historical benchmark pending refresh.** The following values were collected on the previous GPU and an earlier implementation snapshot.
 
 **Platform**: NVIDIA RTX 5090D V2 (sm_120), PyTorch 2.11.0+cu130, Warp 1.12.0.
 
@@ -116,6 +116,8 @@ At drjohnson resolution, Warp kernel execution time (0.25 ms) is already faster 
 ---
 
 ## End-to-End Training Impact
+
+> **Historical benchmark pending refresh.** CUDA and Warp loss backends must be rerun under the same new-hardware training configuration before these values are used as current claims.
 
 > **Benchmark conditions**: The ablation data below was collected with the rasterizer fixed to the Warp backend and SSIM/KNN each taking two values. Python-layer overhead optimizations had not yet been applied. The numbers reflect SSIM's isolated contribution to training speed, not the final all-Warp stack performance.
 
@@ -149,6 +151,8 @@ Ablation runs on drjohnson and playroom with rasterizer fixed to Warp (to isolat
 
 ## Correctness
 
+> **Historical numeric snapshot pending refresh.** Current tests cover multiple live forwards, `retain_graph`, non-default/two-stream execution, plan-pool bounds, cache clearing, and returned-gradient ownership. CUDA/PyTorch numerical tables will be regenerated on the new GPU.
+
 **Forward (loss value accuracy)**:
 
 Using PyTorch reference implementation (`F.conv2d` with same Gaussian kernel) as ground truth:
@@ -176,6 +180,8 @@ Gradient errors are within numerical analysis machine precision and have no impa
 
 ## Known Limitations
 
-**Bandwidth bottleneck**: Separable convolution intermediate buffers exceed L2 cache at large resolutions (V-pass buffer ~220 MB at 1080p). CUDA fused-ssim keeps more computation on-chip via `__shared__` memory; Warp lacks explicit shared memory management and must rely on L2/DRAM. This is the root cause of the 14% e2e slowdown at 1080p.
-
-**Theoretical ceiling**: Without shared memory, the achievable bandwidth efficiency is at most ~1/1.2× of CUDA fused-ssim — meaning Warp SSIM's theoretical performance ceiling at large resolutions is approximate parity with fused-ssim. The observed 1.14× ratio is close to this limit.
+- The stable implementation keeps the four-pass separable algorithm and therefore materializes intermediate image-sized buffers.
+- Training plans are bounded, but each live autograd graph requires a private lease until that graph is released.
+- `padding="valid"` requires both spatial dimensions to be at least 11.
+- Inputs must be same-shape, same-device CUDA `float32` tensors.
+- Performance and memory behavior depend on image shape, concurrent live graphs, stream count, and the current Warp/PyTorch versions; old single-device ratios are not portable claims.

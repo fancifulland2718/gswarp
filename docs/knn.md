@@ -1,6 +1,6 @@
 # KNN Module
 
-**中文** · [English](knn.md)
+[中文](knn_zh.md) · **English**
 
 This document covers the algorithm, implementation, performance, and correctness of the `gswarp.knn` module.
 
@@ -27,7 +27,7 @@ from gswarp.knn import distCUDA2 as warp_distCUDA2
 dist2 = warp_distCUDA2(means3D.cuda())  # drop-in replacement
 ```
 
-KNN is only invoked during Gaussian densification (approximately every ~100 iterations). Its cumulative contribution to total 30K training time is ~1–2%, making it a minor factor in overall performance.
+In the reference 3DGS pipeline, `distCUDA2()` is used when Gaussian scales are initialized from the input point cloud. It is not part of the per-iteration rasterizer path; integrations that reinitialize scales may call it at additional lifecycle points.
 
 ---
 
@@ -36,7 +36,7 @@ KNN is only invoked during Gaussian densification (approximately every ~100 iter
 The algorithm matches the CUDA implementation in simple-knn:
 
 1. **Morton encoding**: Compute the AABB of all Gaussian centers, normalize each point to [0, 1)³, and map to a 30-bit Morton code (3D Z-curve)
-2. **Radix sort**: Sort Gaussians by Morton code, placing spatially adjacent Gaussians adjacent in index order
+2. **Warp radix sort**: Sort Gaussians by Morton code, placing spatially adjacent Gaussians adjacent in index order
 3. **SoA gather**: Reorder coordinates by sort result into Structure-of-Arrays layout (x[], y[], z[] separate arrays)
 4. **Box AABB**: For groups of BOX_SIZE=1024 Gaussians, compute AABB (min/max xyz) of each box
 5. **3-NN box-pruning search**: For each Gaussian, dynamically prune distant boxes based on the current k-NN distance bound, then compute exact Euclidean distances to remaining candidates
@@ -48,22 +48,25 @@ This exactly matches the simple-knn CUDA algorithm without additional approximat
 
 ## Implementation Details
 
-The code lives in `gswarp/knn.py`, comprising 4 Warp kernels:
+The code lives in `gswarp/knn.py` and uses four Warp kernels plus Warp's radix-sort utility:
 
-| Kernel | Kernel Family | Registers | Description |
-|--------|--------------|-----------|-------------|
-| `knn_morton` | FAMILY_COMPUTE | 32 | Compute scene AABB + Morton codes |
-| `knn_gather` | FAMILY_MEMORY | 32 | Reorder points into SoA by sort order |
-| `knn_box_minmax` | FAMILY_ATOMIC | 32 | Compute per-box AABB (atomic min/max) |
-| `knn_box_dist` | FAMILY_COMPUTE | 64 | Box-pruning 3-NN search |
+| Implementation | Responsibility |
+|----------------|----------------|
+| `_coord2morton_kernel` | Convert normalized coordinates to Morton codes |
+| `wp.utils.radix_sort_pairs` | Sort Morton codes and original point indices |
+| `_gather_sorted_soa_kernel` | Gather sorted coordinates into SoA arrays |
+| `_box_min_max_kernel` | Compute one AABB per fixed-size point box |
+| `_box_mean_dist_kernel` | Perform exact 3-NN search with box pruning |
 
-Morton code sorting and the inverse permutation index are handled by `torch.sort()` (simplifies kernel logic, avoids implementing radix sort in Warp). Global AABB reduction also uses torch reduce.
+The global scene AABB is reduced with PyTorch, then copied to host scalars for Morton normalization. The complete operation enters a call-scoped execution context, so PyTorch reductions, Warp sorting, and kernels are submitted in order on the active CUDA stream.
 
-`knn_box_dist` uses 64 registers (generous) to maintain multiple running minimums in the box-pruning inner loop without spilling to local memory.
+The public contract is explicit for small and invalid inputs: zero points return an empty tensor, one point returns zero, two or three points raise because three neighbours do not exist, and non-finite coordinates are rejected before Morton conversion.
 
 ---
 
 ## End-to-End Training Impact
+
+> **Historical benchmark pending refresh.** The following ablation used the previous GPU and an earlier code snapshot. CUDA simple-knn and Warp KNN will be rerun together on the new hardware.
 
 > **Benchmark conditions**: The ablation data below was collected with the rasterizer fixed to the Warp backend and SSIM/KNN each taking two values. Python-layer overhead optimizations had not yet been applied. The numbers reflect KNN's isolated contribution to training speed, not the final all-Warp stack performance.
 
@@ -92,6 +95,8 @@ PSNR differences (~±0.1 dB) are within training noise; not attributable to KNN 
 ---
 
 ## Correctness
+
+> **Historical numeric snapshot pending refresh.** Current contract tests cover empty/singleton behavior and rejection of two- or three-point inputs. CUDA/Warp random-cloud and degenerate-distribution comparisons will be regenerated on the new GPU.
 
 Warp KNN and simple-knn CUDA use the same algorithm (same Morton codes, same BOX_SIZE, same box-pruning logic). Outputs agree within floating-point precision on the same point cloud.
 

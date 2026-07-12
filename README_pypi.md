@@ -16,6 +16,8 @@ gswarp reimplements the three core CUDA modules used in 3DGS training — the ra
 | **SSIM** | `fused_ssim` | `gswarp.fused_ssim` |
 | **KNN** | `simple_knn` | `gswarp.knn` |
 
+The rasterizer is internally organized as an immutable staged method plan (`preprocess -> features -> binning -> render -> typed state -> backward`). Standard and flow entry points share the stream-safe runtime, bounded workspaces, preprocessing, binning, and backward building blocks while preserving their existing public return formats.
+
 ---
 
 ## Requirements
@@ -73,8 +75,10 @@ color, radii, _ = rasterizer(means3D=..., means2D=..., ...)
 from gswarp import initialize_runtime_tuning, set_binning_sort_mode
 
 initialize_runtime_tuning(device="cuda:0", verbose=True)
-set_binning_sort_mode("warp_depth_stable_tile")  # recommended for large scenes
+set_binning_sort_mode("warp_depth_stable_tile")
 ```
+
+Use keyword arguments for CUDA-rasterizer migration. The current stable backend does not implement `prefiltered=True`, and accepts but does not apply the CUDA antialiasing path.
 
 ### Flow Backend (optical-flow pipelines)
 
@@ -117,6 +121,8 @@ dist2 = distCUDA2(points)  # points: (N, 3) float32 CUDA tensor
 
 ## Performance
 
+> **Historical snapshot pending refresh.** The following tables were collected on the previous GPU and an earlier code revision. CUDA and Warp will both be rerun on the new hardware before these values become current release claims.
+
 Full 30K-step training, RTX 5090D V2 (sm_120), PyTorch 2.11.0+cu130, Warp 1.12.0. All three modules use the Warp backend.
 
 **NeRF Synthetic (8 scenes):** average **×1.08** speedup over CUDA baseline.  
@@ -137,6 +143,8 @@ Sample results:
 
 ## Quality
 
+> **Historical snapshot pending refresh.** End-to-end CUDA/Warp quality metrics will be regenerated together with the performance benchmark.
+
 NeRF Synthetic 8-scene average after 30K steps:
 
 | Metric | CUDA | Warp | Δ |
@@ -145,7 +153,7 @@ NeRF Synthetic 8-scene average after 30K steps:
 | SSIM | 0.9692 | 0.9693 | +0.0001 |
 | LPIPS | 0.0303 | 0.0302 | −0.0001 |
 
-Per-scene PSNR differences are within ±0.25 dB. Training quality is equivalent to the CUDA baseline across all tested scenes.
+The historical campaign reported per-scene PSNR differences within ±0.25 dB. These archived values must not be treated as a current CUDA-equivalence claim.
 
 ---
 

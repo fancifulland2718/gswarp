@@ -11,6 +11,7 @@ gswarp is a pure-Python **NVIDIA Warp** backend for 3D Gaussian Splatting, reimp
 ## Table of Contents
 
 - [Three Replacement Modules](#three-replacement-modules)
+- [Current Architecture](#current-architecture)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Replacing CUDA Backends in a 3DGS Project](#replacing-cuda-backends-in-a-3dgs-project)
@@ -29,9 +30,27 @@ gswarp is a pure-Python **NVIDIA Warp** backend for 3D Gaussian Splatting, reimp
 
 | Module | Replaces | Import Path | Notes |
 |--------|----------|-------------|-------|
-| **Rasterizer** | `diff_gaussian_rasterization` | `gswarp` | Full differentiable Gaussian rasterization + auto-tuning |
-| **SSIM** | `fused_ssim` | `gswarp.fused_ssim` | Separable Gaussian convolution with launch caching |
-| **KNN** | `simple_knn` | `gswarp.knn` | Morton-sort + bounding-box pruning 3-NN |
+| **Rasterizer** | `diff_gaussian_rasterization` | `gswarp` | Typed staged rasterization with manual backward and stream-safe caches |
+| **SSIM** | `fused_ssim` | `gswarp.fused_ssim` | Separable Gaussian convolution with graph-owned reusable plans |
+| **KNN** | `simple_knn` | `gswarp.knn` | Morton-sort + bounding-box pruning 3-NN on the active PyTorch stream |
+
+---
+
+## Current Architecture
+
+The public modules remain small compatibility layers. Internally, the rasterizer resolves a cached immutable method plan and executes explicit stages:
+
+```text
+public API -> validation/autograd -> method plan
+           -> preprocess -> features -> binning -> render -> typed forward state
+           -> manual backward
+```
+
+Standard 3DGS and the optional flow backend share preprocessing, binning, runtime options, stream interop, workspace management, and most backward operations. Method-specific backend modules only adapt stage inputs, outputs, auxiliary data, and retained backward state.
+
+Every call snapshots its runtime options and binds Warp to the current PyTorch CUDA device and stream. Reusable workspaces and recorded launches are bounded by device/stream keys; forward-owned tensors remain attached to their autograd graph until backward releases them. `clear_warp_caches()` and `get_warp_cache_report()` provide explicit cache lifecycle control.
+
+The stable backend targets the declared minimum Warp version. Optional advanced backends are selected only when both their minimum version and required Warp capabilities are available; no advanced backend is enabled in the current release.
 
 ---
 
@@ -94,7 +113,7 @@ from gswarp import (
 )
 ```
 
-`GaussianRasterizationSettings` is a `NamedTuple` with the same fields as the original (Warp-specific fields have defaults). `GaussianRasterizer.forward()` **returns a three-element tuple `(color, radii, meta)`**, where `meta` is a `RasterizerMeta` NamedTuple carrying five auxiliary outputs:
+`GaussianRasterizationSettings` is a `NamedTuple` containing the CUDA-compatible fields plus Warp-specific fields with defaults. `GaussianRasterizer.forward()` **returns a three-element tuple `(color, radii, meta)`**, where `meta` is a `RasterizerMeta` NamedTuple carrying five auxiliary outputs:
 
 | `meta` field | Meaning |
 |--------------|---------|
@@ -121,6 +140,8 @@ conic_2D_inv = meta.conic_2D_inv   # (N, 3)
 # If you only need color and radii, discard meta:
 color, radii, _ = rasterizer(means3D=..., means2D=..., ...)
 ```
+
+Use keyword arguments when migrating existing code. `shs`, `colors_precomp`, `scales`, `rotations`, and `cov3D_precomp` follow the CUDA rasterizer's mutually exclusive input rules; `dc` is accepted as a compatibility alias for `shs`. The current stable backend does not implement `prefiltered=True`, and accepts but does not apply the CUDA antialiasing path.
 
 ### Flow Backend (optional)
 
@@ -172,11 +193,11 @@ set_compute_flow_aux(False)  # temporarily disable aux outputs to save VRAM
 ```python
 from gswarp import initialize_runtime_tuning, set_binning_sort_mode
 
-# Detect GPU and select optimal block_dim automatically (recommended)
+# Initialize Warp and record the per-device launch/tuning report
 initialize_runtime_tuning(device="cuda:0", verbose=True)
 
-# Choose a sort mode (default warp_depth_stable_tile is usually best)
-set_binning_sort_mode("warp_depth_stable_tile")  # recommended for large scenes
+# The stable default is a 32-bit depth sort followed by a stable tile sort
+set_binning_sort_mode("warp_depth_stable_tile")
 # set_binning_sort_mode("warp_radix")            # alternative
 # set_binning_sort_mode("torch")                 # fallback
 ```
@@ -241,6 +262,8 @@ Then switch backends at each usage site using the `GSWARP_AVAILABLE` flag. A ref
 
 ## Performance
 
+> **Historical results pending refresh.** The tables below describe an earlier code snapshot and the previous GPU. They are retained for provenance, not as a performance claim for the current release. CUDA and Warp will be rerun on the new GPU before these figures are replaced.
+
 Results from full 30K-step training on 12 standard 3DGS datasets. Hardware: RTX 5090D V2 (sm_120, 24 GiB), Python 3.14, PyTorch 2.11.0+cu130, Warp 1.12.0. **All three modules use the Warp backend**, with Python-layer overhead optimizations applied.
 
 | Dataset | CUDA (it/s) | Warp (it/s) | Speedup |
@@ -263,6 +286,8 @@ Results from full 30K-step training on 12 standard 3DGS datasets. Hardware: RTX 
 ---
 
 ## Quality Metrics
+
+> **Historical results pending refresh.** These values were produced by the same earlier benchmark campaign. Current correctness gates cover public contracts and deterministic micro-scenes, but end-to-end CUDA/Warp quality must be regenerated on the new hardware before release claims are updated.
 
 Test-set evaluation after 30K training steps:
 
@@ -290,7 +315,7 @@ Test-set evaluation after 30K training steps:
 | SSIM | 0.9062 | 0.9063 | +0.0001 |
 | LPIPS | 0.2390 | 0.2388 | −0.0002 |
 
-Per-scene PSNR differences are within ±0.25 dB; SSIM differences are < 0.001. The Warp backend produces training quality equivalent to the CUDA baseline across all tested scenes.
+The historical campaign reported per-scene PSNR differences within ±0.25 dB and SSIM differences below 0.001. These archived values must not be treated as a current CUDA-equivalence claim.
 
 ---
 
