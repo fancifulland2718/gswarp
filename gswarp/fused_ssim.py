@@ -20,6 +20,7 @@ import torch
 import warp as wp
 
 from ._stream import (
+    TransientLaunchArrayScope,
     current_execution_context,
     execution_context,
     submission_guard,
@@ -239,11 +240,12 @@ class _SSIMPlan:
 
     def forward(self, img1, img2):
         """Run forward. Returns (loss_scalar, w_img1, w_img2)."""
-        w_img1 = torch_launch_array(img1.view(-1))
-        w_img2 = torch_launch_array(img2.view(-1))
+        dynamic_arrays = TransientLaunchArrayScope()
+        w_img1 = dynamic_arrays.array(img1.view(-1))
+        w_img2 = dynamic_arrays.array(img2.view(-1))
 
-        self._cmd_fwd_h.set_param_at_index(0, w_img1)
-        self._cmd_fwd_h.set_param_at_index(1, w_img2)
+        self._cmd_fwd_h.set_param_at_index_from_ctype(0, w_img1)
+        self._cmd_fwd_h.set_param_at_index_from_ctype(1, w_img2)
         self._cmd_fwd_h.launch()
 
         self._cmd_fwd_v.launch()
@@ -252,18 +254,21 @@ class _SSIMPlan:
 
     def backward(self, w_img1, w_img2, opt_grad):
         """Run backward. Returns dL/dimg1 tensor."""
-        w_up = torch_launch_array(opt_grad.reshape(1))
+        dynamic_arrays = TransientLaunchArrayScope()
+        w_up = dynamic_arrays.array(opt_grad.reshape(1))
         t_dL = torch.empty(
             self._output_shape, dtype=torch.float32, device=self._device
         )
-        w_dL = torch_launch_array(t_dL.view(-1))
+        w_dL = dynamic_arrays.array(t_dL.view(-1))
 
-        self._cmd_bwd_h.set_param_at_index(self._bwd_h_up_idx, w_up)
+        self._cmd_bwd_h.set_param_at_index_from_ctype(
+            self._bwd_h_up_idx, w_up
+        )
         self._cmd_bwd_h.launch()
 
-        self._cmd_bwd_v.set_param_at_index(0, w_img1)
-        self._cmd_bwd_v.set_param_at_index(1, w_img2)
-        self._cmd_bwd_v.set_param_at_index(5, w_dL)
+        self._cmd_bwd_v.set_param_at_index_from_ctype(0, w_img1)
+        self._cmd_bwd_v.set_param_at_index_from_ctype(1, w_img2)
+        self._cmd_bwd_v.set_param_at_index_from_ctype(5, w_dL)
         self._cmd_bwd_v.launch()
 
         return t_dL

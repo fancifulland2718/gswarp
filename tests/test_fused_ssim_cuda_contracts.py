@@ -56,7 +56,7 @@ class FusedSSIMCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(actual1.grad, expected1, rtol=1.0e-4, atol=1.0e-5)
         torch.testing.assert_close(actual2.grad, expected2, rtol=1.0e-4, atol=1.0e-5)
 
-    def test_manual_kernels_do_not_attach_warp_autograd(self) -> None:
+    def test_manual_kernels_use_non_autograd_interop(self) -> None:
         generator = torch.Generator(device=DEVICE).manual_seed(9)
         image = torch.rand(
             (1, 3, 16, 16), generator=generator, device=DEVICE
@@ -74,7 +74,10 @@ class FusedSSIMCUDAContractTests(unittest.TestCase):
         self.assertGreater(len(wrapped.call_args_list), 0)
         for call in wrapped.call_args_list:
             self.assertIs(call.kwargs["requires_grad"], False)
-            self.assertIs(call.kwargs["return_ctype"], False)
+        self.assertEqual(
+            sum(call.kwargs["return_ctype"] for call in wrapped.call_args_list),
+            4,
+        )
 
     def test_non_default_pytorch_stream_is_supported(self) -> None:
         generator = torch.Generator(device=DEVICE).manual_seed(11)
