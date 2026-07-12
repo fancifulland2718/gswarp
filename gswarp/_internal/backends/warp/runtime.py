@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import warp as wp
 
+from ...coverage import normalize_tile_coverage_mode
 from ...._tuning import (
     normalize_device as _normalize_runtime_device,
     query_device_info as _query_runtime_device_info,
@@ -32,6 +33,8 @@ DEFAULT_BACKWARD_MODE = "manual"
 _BACKWARD_MODE = DEFAULT_BACKWARD_MODE
 DEFAULT_BINNING_SORT_MODE = "warp_depth_stable_tile"
 _BINNING_SORT_MODE = DEFAULT_BINNING_SORT_MODE
+DEFAULT_TILE_COVERAGE_MODE = "auto"
+_TILE_COVERAGE_MODE = DEFAULT_TILE_COVERAGE_MODE
 _COMPUTE_DEPTH = os.environ.get("GSWARP_COMPUTE_DEPTH", "1") != "0"
 _RUNTIME_TUNING_CACHE: dict[str, dict[str, Any]] = {}
 _RUNTIME_TUNING_LOGGED_DEVICES: set[str] = set()
@@ -47,6 +50,7 @@ class ExecutionOptions:
 
     backward_mode: str
     binning_sort_mode: str
+    tile_coverage_mode: str
     compute_depth: bool
     auto_tune: bool
     auto_tune_verbose: bool
@@ -75,6 +79,11 @@ def get_active_compute_depth() -> bool:
 def get_active_binning_sort_mode() -> str:
     options = _ACTIVE_EXECUTION_OPTIONS.get()
     return _BINNING_SORT_MODE if options is None else options.binning_sort_mode
+
+
+def get_active_tile_coverage_mode() -> str:
+    options = _ACTIVE_EXECUTION_OPTIONS.get()
+    return _TILE_COVERAGE_MODE if options is None else options.tile_coverage_mode
 
 
 def get_active_auto_tuning_config() -> tuple[bool, bool]:
@@ -453,6 +462,15 @@ def set_binning_sort_mode(mode: str) -> None:
     _BINNING_SORT_MODE = mode
 
 
+def get_tile_coverage_mode() -> str:
+    return _TILE_COVERAGE_MODE
+
+
+def set_tile_coverage_mode(mode: str) -> None:
+    global _TILE_COVERAGE_MODE
+    _TILE_COVERAGE_MODE = normalize_tile_coverage_mode(mode)
+
+
 def _require_warp() -> None:
     """Ensure Warp is imported AND runtime tuning has been executed.
 
@@ -486,10 +504,13 @@ __all__ = [
     "set_backward_mode",
     "get_binning_sort_mode",
     "set_binning_sort_mode",
+    "get_tile_coverage_mode",
+    "set_tile_coverage_mode",
     "ExecutionOptions",
     "execution_options",
     "get_active_compute_depth",
     "get_active_binning_sort_mode",
+    "get_active_tile_coverage_mode",
     "get_active_auto_tuning_config",
     "get_active_compute_flow_aux",
 ]

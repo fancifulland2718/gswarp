@@ -18,7 +18,12 @@ def backend_for(method):
 
 
 def run_typed_forward(plan, raster_settings, args):
-    options = resolve_execution_options(plan.backend, raster_settings, flow=plan.flow)
+    options = resolve_execution_options(
+        plan.backend,
+        raster_settings,
+        flow=plan.flow,
+        footprint_capability=plan.spec.footprint_capability,
+    )
     result = run_with_runtime_overrides(
         plan.backend,
         raster_settings,

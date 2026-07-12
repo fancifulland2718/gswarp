@@ -10,6 +10,7 @@ import torch
 
 from gswarp._internal.api.runtime_context import resolve_execution_options, runtime_overrides
 from gswarp._internal.backends.warp import memory, runtime
+from gswarp._internal.coverage import FOOTPRINT_CUSTOM
 
 
 class _BackendDefaults:
@@ -18,6 +19,9 @@ class _BackendDefaults:
 
     def get_binning_sort_mode(self):
         return "warp_depth_stable_tile"
+
+    def get_tile_coverage_mode(self):
+        return "auto"
 
     def get_compute_depth(self):
         return True
@@ -48,6 +52,7 @@ class RuntimeOptionsTests(unittest.TestCase):
 
         self.assertEqual(options.backward_mode, "manual")
         self.assertEqual(options.binning_sort_mode, "torch")
+        self.assertEqual(options.tile_coverage_mode, "accutile_sweep")
         self.assertTrue(options.compute_depth)
         self.assertFalse(options.auto_tune)
         self.assertFalse(options.auto_tune_verbose)
@@ -60,6 +65,7 @@ class RuntimeOptionsTests(unittest.TestCase):
 
         with runtime_overrides(backend, outer_settings):
             self.assertEqual(runtime.get_active_binning_sort_mode(), "torch")
+            self.assertEqual(runtime.get_active_tile_coverage_mode(), "accutile_sweep")
             self.assertEqual(runtime.get_active_auto_tuning_config(), (False, True))
             with runtime_overrides(backend, inner_settings):
                 self.assertEqual(runtime.get_active_binning_sort_mode(), "warp_radix")
@@ -69,6 +75,20 @@ class RuntimeOptionsTests(unittest.TestCase):
 
         self.assertEqual(runtime.get_active_binning_sort_mode(), backend.get_binning_sort_mode())
 
+    def test_coverage_mode_is_method_safe_and_call_scoped(self) -> None:
+        backend = _BackendDefaults()
+        settings = _settings()
+
+        options = resolve_execution_options(
+            backend,
+            settings,
+            footprint_capability=FOOTPRINT_CUSTOM,
+        )
+        self.assertEqual(options.tile_coverage_mode, "snugbox")
+        with runtime_overrides(backend, settings, options=options):
+            self.assertEqual(runtime.get_active_tile_coverage_mode(), "snugbox")
+        self.assertEqual(runtime.get_active_tile_coverage_mode(), runtime.get_tile_coverage_mode())
+
     def test_flow_option_is_scoped_with_the_same_snapshot(self) -> None:
         backend = _BackendDefaults()
         settings = _settings(compute_flow_aux=False)
@@ -76,6 +96,16 @@ class RuntimeOptionsTests(unittest.TestCase):
         with runtime_overrides(backend, settings, flow=True):
             self.assertFalse(runtime.get_active_compute_flow_aux(True))
         self.assertTrue(runtime.get_active_compute_flow_aux(True))
+
+    def test_tile_coverage_default_setter_validates_and_restores(self) -> None:
+        original = runtime.get_tile_coverage_mode()
+        try:
+            runtime.set_tile_coverage_mode("conic_rect")
+            self.assertEqual(runtime.get_tile_coverage_mode(), "conic_rect")
+            with self.assertRaisesRegex(ValueError, "accutile_sweep"):
+                runtime.set_tile_coverage_mode("not-a-mode")
+        finally:
+            runtime.set_tile_coverage_mode(original)
 
     def test_cache_report_and_bounds_are_cpu_safe(self) -> None:
         cache = memory._C4_LAUNCH_CACHE_SH

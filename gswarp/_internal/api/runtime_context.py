@@ -6,16 +6,27 @@ from contextlib import contextmanager
 
 from gswarp._stream import execution_context
 from gswarp._internal.backends.warp.runtime import ExecutionOptions, execution_options
+from gswarp._internal.coverage import FOOTPRINT_EXACT_SCREEN_CONIC, resolve_tile_coverage_mode
 
 
-def resolve_execution_options(backend, raster_settings, *, flow: bool = False) -> ExecutionOptions:
+def resolve_execution_options(
+    backend,
+    raster_settings,
+    *,
+    flow: bool = False,
+    footprint_capability: str = FOOTPRINT_EXACT_SCREEN_CONIC,
+) -> ExecutionOptions:
     """Merge public defaults and per-call settings into an immutable snapshot."""
     backward_mode = getattr(raster_settings, "backward_mode", None)
     binning_sort_mode = getattr(raster_settings, "binning_sort_mode", None)
+    tile_coverage_mode = resolve_tile_coverage_mode(
+        backend.get_tile_coverage_mode(), footprint_capability
+    )
     compute_flow_aux = getattr(raster_settings, "compute_flow_aux", None) if flow else None
     return ExecutionOptions(
         backward_mode=backend.get_backward_mode() if backward_mode is None else backward_mode,
         binning_sort_mode=backend.get_binning_sort_mode() if binning_sort_mode is None else binning_sort_mode,
+        tile_coverage_mode=tile_coverage_mode,
         compute_depth=backend.get_compute_depth(),
         auto_tune=bool(getattr(raster_settings, "auto_tune", True)),
         auto_tune_verbose=bool(getattr(raster_settings, "auto_tune_verbose", True)),

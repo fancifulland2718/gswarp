@@ -21,6 +21,8 @@ from .rasterizer import (  # noqa: F401
     set_compute_depth,
     get_binning_sort_mode,
     set_binning_sort_mode,
+    get_tile_coverage_mode,
+    set_tile_coverage_mode,
 )
 
 from ._tuning import (  # noqa: F401

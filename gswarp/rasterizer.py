@@ -80,6 +80,14 @@ def set_binning_sort_mode(mode):
     _backend().set_binning_sort_mode(mode)
 
 
+def get_tile_coverage_mode():
+    return _backend().get_tile_coverage_mode()
+
+
+def set_tile_coverage_mode(mode):
+    _backend().set_tile_coverage_mode(mode)
+
+
 def get_default_parameter_info():
     return _backend().get_default_parameter_info()
 
@@ -191,4 +199,6 @@ __all__ = [
     "set_compute_depth",
     "get_binning_sort_mode",
     "set_binning_sort_mode",
+    "get_tile_coverage_mode",
+    "set_tile_coverage_mode",
 ]

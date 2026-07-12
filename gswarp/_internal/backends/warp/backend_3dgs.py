@@ -19,6 +19,8 @@ from .runtime import (
     set_backward_mode,
     get_binning_sort_mode,
     set_binning_sort_mode,
+    get_tile_coverage_mode,
+    set_tile_coverage_mode,
 )
 from .memory import (
     clear_common_warp_caches,
@@ -255,6 +257,8 @@ __all__ = [
     "set_backward_mode",
     "get_binning_sort_mode",
     "set_binning_sort_mode",
+    "get_tile_coverage_mode",
+    "set_tile_coverage_mode",
     "get_runtime_auto_tuning_config",
     "get_runtime_tuning_report",
     "initialize_runtime_tuning",
