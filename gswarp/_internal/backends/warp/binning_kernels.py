@@ -5,8 +5,7 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import BLOCK_X, BLOCK_Y
-from .math_kernels import _accutile_row_x_range_wp, _compute_tile_rect_snugbox_cov2d_wp
+from .math_kernels import _compute_tile_rect_compat_snugbox_cov2d_wp
 
 
 if wp is not None:
@@ -43,40 +42,24 @@ if wp is not None:
 
         point = points_xy_image[idx]
         co = conic_opacity[idx]
-        con_a = co[0]
-        con_b = co[1]
-        con_c = co[2]
         opac = co[3]
-
         cov = cov2d_inv[idx]
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
-        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
-        det_c = con_a * con_c - con_b * con_b
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point[0],
+            point[1],
+            cov[0],
+            cov[2],
+            opac,
+            radius,
+            grid_x,
+            grid_y,
+        )
 
         for tile_y in range(rect[1], rect[3]):
-            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
-            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
-            row_x_min = wp.max(row_range[0], rect[0])
-            row_x_max = wp.min(row_range[1], rect[2])
-            for tile_x in range(row_x_min, row_x_max):
-                dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
-                if power > 0.0:
-                    power = 0.0
-                alpha = wp.min(0.99, opac * wp.exp(power))
-                if alpha >= (1.0 / 255.0):
-                    tile_ids_out[off] = tile_y * grid_x + tile_x
-                    point_list_out[off] = idx
-                    off = off + 1
-
-        # Sentinel-fill remaining slots (AccuTile row range + alpha filter
-        # may write fewer entries than preprocess SnugBox AABB allocated)
-        end_off = point_offsets[idx]
-        sentinel_tile = grid_x * grid_y
-        while off < end_off:
-            tile_ids_out[off] = sentinel_tile
-            point_list_out[off] = 0
-            off = off + 1
+            for tile_x in range(rect[0], rect[2]):
+                tile_ids_out[off] = tile_y * grid_x + tile_x
+                point_list_out[off] = idx
+                off = off + 1
 
     @wp.kernel
     def _duplicate_with_packed_keys_warp_kernel(
@@ -102,40 +85,29 @@ if wp is not None:
 
         point = points_xy_image[idx]
         co = conic_opacity[idx]
-        con_a = co[0]
-        con_b = co[1]
-        con_c = co[2]
         opac = co[3]
         cov = cov2d_inv[idx]
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point[0],
+            point[1],
+            cov[0],
+            cov[2],
+            opac,
+            radius,
+            grid_x,
+            grid_y,
+        )
         depth_bits = wp.cast(depths[idx], wp.int32)
         depth_key = wp.int64(depth_bits) & wp.int64(4294967295)
-        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
-        det_c = con_a * con_c - con_b * con_b
 
         for tile_y in range(rect[1], rect[3]):
-            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
-            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
-            row_x_min = wp.max(row_range[0], rect[0])
-            row_x_max = wp.min(row_range[1], rect[2])
-            for tile_x in range(row_x_min, row_x_max):
-                dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
-                if power > 0.0:
-                    power = 0.0
-                alpha = wp.min(0.99, opac * wp.exp(power))
-                if alpha >= (1.0 / 255.0):
-                    tile_id = tile_y * grid_x + tile_x
-                    packed_keys_out[off] = (wp.int64(tile_id) << wp.int64(32)) | depth_key
-                    point_list_out[off] = idx
-                    off = off + 1
-        # Sentinel-fill remaining slots
-        end_off = point_offsets[idx]
-        sentinel_key = wp.int64(grid_x * grid_y) << wp.int64(32)
-        while off < end_off:
-            packed_keys_out[off] = sentinel_key
-            point_list_out[off] = 0
-            off = off + 1
+            for tile_x in range(rect[0], rect[2]):
+                tile_id = tile_y * grid_x + tile_x
+                packed_keys_out[off] = (
+                    (wp.int64(tile_id) << wp.int64(32)) | depth_key
+                )
+                point_list_out[off] = idx
+                off = off + 1
 
     @wp.kernel
     def _duplicate_with_keys_from_order_warp_kernel(
@@ -162,36 +134,24 @@ if wp is not None:
 
         point = points_xy_image[point_id]
         co = conic_opacity[point_id]
-        con_a = co[0]
-        con_b = co[1]
-        con_c = co[2]
         opac = co[3]
         cov = cov2d_inv[point_id]
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point[0], point[1], cov[0], cov[2], opac, grid_x, grid_y)
-        t_val = 2.0 * wp.log(wp.max(255.0 * opac, 1.0))
-        det_c = con_a * con_c - con_b * con_b
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point[0],
+            point[1],
+            cov[0],
+            cov[2],
+            opac,
+            radius,
+            grid_x,
+            grid_y,
+        )
 
         for tile_y in range(rect[1], rect[3]):
-            dy = wp.clamp(point[1], float(tile_y * BLOCK_Y), float(tile_y * BLOCK_Y + BLOCK_Y - 1)) - point[1]
-            row_range = _accutile_row_x_range_wp(point[0], con_a, con_b, det_c, t_val, dy, grid_x)
-            row_x_min = wp.max(row_range[0], rect[0])
-            row_x_max = wp.min(row_range[1], rect[2])
-            for tile_x in range(row_x_min, row_x_max):
-                dx = wp.clamp(point[0], float(tile_x * BLOCK_X), float(tile_x * BLOCK_X + BLOCK_X - 1)) - point[0]
-                power = -0.5 * (con_a * dx * dx + con_c * dy * dy) - con_b * dx * dy
-                if power > 0.0:
-                    power = 0.0
-                alpha = wp.min(0.99, opac * wp.exp(power))
-                if alpha >= (1.0 / 255.0):
-                    tile_ids_out[off] = tile_y * grid_x + tile_x
-                    point_list_out[off] = point_id
-                    off = off + 1
-        end_off = point_offsets[idx]
-        sentinel_tile = grid_x * grid_y
-        while off < end_off:
-            tile_ids_out[off] = sentinel_tile
-            point_list_out[off] = 0
-            off = off + 1
+            for tile_x in range(rect[0], rect[2]):
+                tile_ids_out[off] = tile_y * grid_x + tile_x
+                point_list_out[off] = point_id
+                off = off + 1
 
     @wp.kernel
     def _pack_binning_keys_warp_kernel(

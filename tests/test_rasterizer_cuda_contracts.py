@@ -41,10 +41,12 @@ def _empty() -> torch.Tensor:
     return torch.empty((0,), dtype=torch.float32, device=DEVICE)
 
 
-def _settings(background: torch.Tensor, *, flow: bool = False):
+def _settings(
+    background: torch.Tensor, *, flow: bool = False, image_size: int = 16
+):
     common = dict(
-        image_height=16,
-        image_width=16,
+        image_height=image_size,
+        image_width=image_size,
         tanfovx=1.0,
         tanfovy=1.0,
         bg=background,
@@ -111,6 +113,81 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(flow_outputs[0], expected)
         torch.testing.assert_close(radii, torch.zeros_like(radii))
         torch.testing.assert_close(flow_outputs[1], torch.zeros_like(flow_outputs[1]))
+
+    def test_subthreshold_opacity_preserves_cuda_geometric_visibility(self) -> None:
+        background = torch.tensor(
+            [0.2, 0.6, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        inputs = _inputs(
+            torch.tensor([[0.0, 0.0, 2.0]], dtype=torch.float32, device=DEVICE)
+        )
+        inputs["opacities"] = torch.full(
+            (1, 1), 1.0e-4, dtype=torch.float32, device=DEVICE
+        )
+
+        color, radii, _ = rasterize_standard(
+            **inputs, raster_settings=_settings(background)
+        )
+
+        expected = background[:, None, None].expand(3, 16, 16)
+        torch.testing.assert_close(color, expected)
+        self.assertGreater(radii.item(), 0)
+
+    def test_rotated_conic_matches_per_pixel_compositing_oracle(self) -> None:
+        image_size = 64
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        opacity = 0.2
+        color_value = torch.tensor(
+            [[0.7, 0.4, 0.2]], dtype=torch.float32, device=DEVICE
+        )
+        covariances = torch.tensor(
+            [[0.04, 0.038, 0.0, 0.04, 0.0, 0.02]],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        inputs = _inputs(
+            torch.tensor(
+                [[-0.5, -0.5, 2.0]], dtype=torch.float32, device=DEVICE
+            ),
+            scales=_empty(),
+            covariances=covariances,
+        )
+        inputs["colors_precomp"] = color_value
+        inputs["opacities"] = torch.full(
+            (1, 1), opacity, dtype=torch.float32, device=DEVICE
+        )
+
+        rendered, _, meta = rasterize_standard(
+            **inputs,
+            raster_settings=_settings(background, image_size=image_size),
+        )
+
+        point = meta.proj_2D[0]
+        conic = meta.conic_2D[0]
+        pixels = torch.arange(
+            image_size, dtype=torch.float32, device=DEVICE
+        )
+        pixel_y, pixel_x = torch.meshgrid(pixels, pixels, indexing="ij")
+        dx = point[0] - pixel_x
+        dy = point[1] - pixel_y
+        power = (
+            -0.5 * (conic[0] * dx.square() + conic[2] * dy.square())
+            - conic[1] * dx * dy
+        )
+        alpha = torch.minimum(
+            torch.tensor(0.99, device=DEVICE), opacity * torch.exp(power)
+        )
+        alpha = torch.where(alpha >= (1.0 / 255.0), alpha, 0.0)
+        expected = (
+            color_value[0, :, None, None] * alpha[None]
+            + background[:, None, None] * (1.0 - alpha[None])
+        )
+
+        torch.testing.assert_close(
+            rendered, expected, atol=2.0e-5, rtol=2.0e-4
+        )
 
     def test_mark_visible_returns_owned_bool_tensor(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)

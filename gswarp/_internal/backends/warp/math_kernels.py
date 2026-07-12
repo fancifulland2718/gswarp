@@ -5,7 +5,13 @@ from typing import Any
 import torch
 import warp as wp
 
-from .constants import BLOCK_X, BLOCK_Y, PREPROCESS_CULL_FOV_SCALE, PREPROCESS_CULL_SIGMA
+from .constants import (
+    BLOCK_X,
+    BLOCK_Y,
+    PREPROCESS_CULL_FOV_SCALE,
+    PREPROCESS_CULL_SIGMA,
+    SNUGBOX_PIXEL_PADDING,
+)
 
 
 if wp is not None:
@@ -137,54 +143,50 @@ if wp is not None:
         return wp.vec4i(rect_min_x, rect_min_y, rect_max_x, rect_max_y)
 
     @wp.func
-    def _compute_tile_rect_snugbox_cov2d_wp(
+    def _compute_tile_rect_compat_snugbox_cov2d_wp(
         point_x: wp.float32,
         point_y: wp.float32,
         cov2d_aa: wp.float32,
         cov2d_cc: wp.float32,
         opacity: wp.float32,
+        cuda_radius: wp.int32,
         grid_x: wp.int32,
         grid_y: wp.int32,
     ):
-        """Opacity-aware SnugBox directly from cov2d diagonal (b-insensitive).
+        """Padded Speedy-Splat SnugBox clipped to CUDA's geometric rect.
 
-        Mathematically equivalent to the conic version:
-          r_x = ceil(sqrt(t * con_c / det_conic)) = ceil(sqrt(t * cov2d_aa))
-        but avoids the det_conic = con_a*con_c - con_b^2 denominator that
-        amplifies floating-point differences in the off-diagonal term b.
+        This keeps Speedy-Splat's 1/255 alpha cutoff and adds one pixel before
+        tile conversion to cover boundary discretization. Clipping to CUDA's
+        3-sigma rect avoids contributions the reference rasterizer never bins.
         """
+        cuda_rect = _compute_tile_rect_wp(
+            point_x, point_y, cuda_radius, grid_x, grid_y
+        )
         t = 2.0 * wp.log(wp.max(255.0 * opacity, 1.0))
         if t <= 0.0:
             return wp.vec4i(0, 0, 0, 0)
-        radius_x = wp.int32(wp.ceil(wp.sqrt(wp.max(t * cov2d_aa, 0.0))))
-        radius_y = wp.int32(wp.ceil(wp.sqrt(wp.max(t * cov2d_cc, 0.0))))
+        radius_x = wp.int32(
+            wp.ceil(
+                wp.sqrt(wp.max(t * cov2d_aa, 0.0))
+                + SNUGBOX_PIXEL_PADDING
+            )
+        )
+        radius_y = wp.int32(
+            wp.ceil(
+                wp.sqrt(wp.max(t * cov2d_cc, 0.0))
+                + SNUGBOX_PIXEL_PADDING
+            )
+        )
         rect_min_x = wp.min(grid_x, wp.max(0, wp.int32((point_x - float(radius_x)) / float(BLOCK_X))))
         rect_min_y = wp.min(grid_y, wp.max(0, wp.int32((point_y - float(radius_y)) / float(BLOCK_Y))))
         rect_max_x = wp.min(grid_x, wp.max(0, wp.int32((point_x + float(radius_x) + float(BLOCK_X - 1)) / float(BLOCK_X))))
         rect_max_y = wp.min(grid_y, wp.max(0, wp.int32((point_y + float(radius_y) + float(BLOCK_Y - 1)) / float(BLOCK_Y))))
-        return wp.vec4i(rect_min_x, rect_min_y, rect_max_x, rect_max_y)
-
-    @wp.func
-    def _accutile_row_x_range_wp(
-        point_x: wp.float32,
-        con_a: wp.float32,
-        con_b: wp.float32,
-        det_conic: wp.float32,
-        t: wp.float32,
-        dy: wp.float32,
-        grid_x: wp.int32,
-    ):
-        inner = con_a * t - det_conic * dy * dy
-        if inner <= 0.0:
-            return wp.vec2i(0, 0)
-        sqrt_inner = wp.sqrt(inner)
-        dx_center = -con_b * dy / con_a
-        dx_half = sqrt_inner / con_a
-        x_min = point_x + dx_center - dx_half
-        x_max = point_x + dx_center + dx_half
-        tile_x_min = wp.min(grid_x, wp.max(0, wp.int32(x_min / float(BLOCK_X))))
-        tile_x_max = wp.min(grid_x, wp.max(0, wp.int32((x_max + float(BLOCK_X - 1)) / float(BLOCK_X))))
-        return wp.vec2i(tile_x_min, tile_x_max)
+        return wp.vec4i(
+            wp.max(cuda_rect[0], rect_min_x),
+            wp.max(cuda_rect[1], rect_min_y),
+            wp.min(cuda_rect[2], rect_max_x),
+            wp.min(cuda_rect[3], rect_max_y),
+        )
 
     @wp.func
     def _preprocess_rect_visible_wp(

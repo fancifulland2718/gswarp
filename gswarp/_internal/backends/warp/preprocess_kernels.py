@@ -24,7 +24,8 @@ from .constants import (
     sh_c3_6,
 )
 from .math_kernels import (
-    _compute_tile_rect_snugbox_cov2d_wp,
+    _compute_tile_rect_compat_snugbox_cov2d_wp,
+    _compute_tile_rect_wp,
     _conservative_cull_radius_from_cov3d_wp,
     _cov2d_from_scale_rotation_gram_wp,
     _ndc_to_pix_wp,
@@ -232,10 +233,26 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(p_proj_x, image_width)
         point_y = _ndc_to_pix_wp(p_proj_y, image_height)
 
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_a, cov_c, opacities[idx], grid_x, grid_y)
-        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-        if rect_area == 0:
+        cuda_rect = _compute_tile_rect_wp(
+            point_x, point_y, radius, grid_x, grid_y
+        )
+        cuda_rect_area = (
+            (cuda_rect[2] - cuda_rect[0]) * (cuda_rect[3] - cuda_rect[1])
+        )
+        if cuda_rect_area == 0:
             return
+
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point_x,
+            point_y,
+            cov_a,
+            cov_c,
+            opacities[idx],
+            radius,
+            grid_x,
+            grid_y,
+        )
+        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
 
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z
@@ -420,12 +437,26 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(proj_value[0], image_width)
         point_y = _ndc_to_pix_wp(proj_value[1], image_height)
 
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_value[0], cov_value[2], opacities[idx], grid_x, grid_y)
-        rect_area = ( rect[2] - rect[0] ) * ( rect[3] - rect[1] )
-        if rect_area == 0:
+        cuda_rect = _compute_tile_rect_wp(
+            point_x, point_y, radius, grid_x, grid_y
+        )
+        cuda_rect_area = (
+            (cuda_rect[2] - cuda_rect[0]) * (cuda_rect[3] - cuda_rect[1])
+        )
+        if cuda_rect_area == 0:
             return
 
-
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point_x,
+            point_y,
+            cov_value[0],
+            cov_value[2],
+            opacities[idx],
+            radius,
+            grid_x,
+            grid_y,
+        )
+        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
 
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z[idx]
@@ -526,10 +557,26 @@ if wp is not None:
         point_x = _ndc_to_pix_wp(proj_value[0], image_width)
         point_y = _ndc_to_pix_wp(proj_value[1], image_height)
 
-        rect = _compute_tile_rect_snugbox_cov2d_wp(point_x, point_y, cov_value[0], cov_value[2], opacities[idx], grid_x, grid_y)
-        rect_area = ( rect[2] - rect[0] ) * ( rect[3] - rect[1] )
-        if rect_area == 0:
+        cuda_rect = _compute_tile_rect_wp(
+            point_x, point_y, radius, grid_x, grid_y
+        )
+        cuda_rect_area = (
+            (cuda_rect[2] - cuda_rect[0]) * (cuda_rect[3] - cuda_rect[1])
+        )
+        if cuda_rect_area == 0:
             return
+
+        rect = _compute_tile_rect_compat_snugbox_cov2d_wp(
+            point_x,
+            point_y,
+            cov_value[0],
+            cov_value[2],
+            opacities[idx],
+            radius,
+            grid_x,
+            grid_y,
+        )
+        rect_area = (rect[2] - rect[0]) * (rect[3] - rect[1])
 
         point_image = wp.vec2(point_x, point_y)
         depths[idx] = p_view_z[idx]
