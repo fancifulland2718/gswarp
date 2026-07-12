@@ -7,16 +7,25 @@ import math
 import random
 import unittest
 
+import torch
+
 from gswarp._internal.coverage import (
-    FOOTPRINT_APPROXIMATE_SCREEN_CONIC,
+    BASELINE_3DGS_COVERAGE,
+    CONSERVATIVE_COVERAGE,
+    CoverageContract,
     FOOTPRINT_AXIS_ALIGNED,
-    FOOTPRINT_CUSTOM,
-    FOOTPRINT_EXACT_SCREEN_CONIC,
+    SAMPLE_PIXEL_CENTERS,
+    SUPPORT_ALPHA_CUTOFF,
     resolve_tile_coverage_mode,
+    resolve_tile_coverage_mode_id,
     tile_coverage_mode_id,
 )
 from gswarp._internal.backends.warp import binning_kernels, preprocess_kernels
-from gswarp._internal.backends.warp.binning_ops import _depth_sort_payload_layout
+from gswarp._internal.backends.warp.binning_ops import (
+    _depth_sort_payload_layout,
+    _validate_pair_count,
+    _wide_pair_count_if_needed,
+)
 
 
 BLOCK = 16
@@ -164,23 +173,62 @@ class TileCoverageTests(unittest.TestCase):
         self.assertEqual(_depth_sort_payload_layout(1, 1), (0, 0))
         self.assertIsNone(_depth_sort_payload_layout(0, 1))
 
+    def test_pair_count_uses_wide_sum_only_when_static_bound_is_insufficient(self):
+        counts = torch.tensor([1, 2, 3], dtype=torch.int32)
+        self.assertIsNone(_wide_pair_count_if_needed(counts, 3, 10))
+        wide = _wide_pair_count_if_needed(counts, 100_000, 32_400)
+        self.assertIsNotNone(wide)
+        self.assertEqual(int(wide.item()), 6)
+
+    def test_pair_count_rejects_negative_and_positive_int32_wrap_ranges(self):
+        self.assertEqual(_validate_pair_count((1 << 31) - 1), (1 << 31) - 1)
+        for invalid in (-1, 1 << 31, (1 << 32) + 17):
+            with self.assertRaises(OverflowError):
+                _validate_pair_count(invalid)
+
     def test_policy_rejects_exact_culling_for_non_exact_footprints(self):
-        self.assertEqual(resolve_tile_coverage_mode("auto", FOOTPRINT_CUSTOM), "snugbox")
+        axis_aligned = CoverageContract(
+            footprint=FOOTPRINT_AXIS_ALIGNED,
+            support=SUPPORT_ALPHA_CUTOFF,
+            sample_domain=SAMPLE_PIXEL_CENTERS,
+        )
         self.assertEqual(
-            resolve_tile_coverage_mode("auto", FOOTPRINT_AXIS_ALIGNED),
+            resolve_tile_coverage_mode("auto", CONSERVATIVE_COVERAGE),
             "snugbox",
         )
         self.assertEqual(
-            resolve_tile_coverage_mode("snugbox", FOOTPRINT_APPROXIMATE_SCREEN_CONIC),
+            resolve_tile_coverage_mode("auto", axis_aligned),
             "snugbox",
         )
-        with self.assertRaisesRegex(ValueError, "exact_screen_conic"):
-            resolve_tile_coverage_mode("conic_rect", FOOTPRINT_CUSTOM)
+        self.assertEqual(resolve_tile_coverage_mode("snugbox", axis_aligned), "snugbox")
+        with self.assertRaisesRegex(ValueError, "cuda_compat_screen_conic"):
+            resolve_tile_coverage_mode("conic_rect", CONSERVATIVE_COVERAGE)
         self.assertEqual(
-            resolve_tile_coverage_mode("auto", FOOTPRINT_EXACT_SCREEN_CONIC),
+            resolve_tile_coverage_mode("auto", BASELINE_3DGS_COVERAGE),
             "accutile_sweep",
         )
         self.assertEqual(tile_coverage_mode_id("accutile_sweep"), 1)
+        self.assertEqual(
+            resolve_tile_coverage_mode_id("auto", BASELINE_3DGS_COVERAGE),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "resolved"):
+            tile_coverage_mode_id("auto")
+
+    def test_contract_rejects_unknown_semantics(self):
+        with self.assertRaisesRegex(ValueError, "footprint"):
+            CoverageContract(
+                footprint="typo",
+                support=SUPPORT_ALPHA_CUTOFF,
+                sample_domain=SAMPLE_PIXEL_CENTERS,
+            )
+        with self.assertRaisesRegex(ValueError, "CUDA 3-sigma"):
+            CoverageContract(
+                footprint=FOOTPRINT_AXIS_ALIGNED,
+                support=SUPPORT_ALPHA_CUTOFF,
+                sample_domain=SAMPLE_PIXEL_CENTERS,
+                exact_policy=BASELINE_3DGS_COVERAGE.exact_policy,
+            )
 
     def test_kernel_call_routes_all_accept_coverage_mode(self):
         kernels = (

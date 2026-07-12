@@ -9,7 +9,6 @@ from .constants import (
     BLOCK_X,
     BLOCK_Y,
     TILE_COVERAGE_ACCUTILE_SWEEP,
-    TILE_COVERAGE_AUTO,
     TILE_COVERAGE_CONIC_MASK_MAX_TILES,
     TILE_COVERAGE_CONIC_RECT,
     TILE_COVERAGE_SNUGBOX,
@@ -19,7 +18,6 @@ from .math_kernels import (
     _compute_tile_rect_compat_snugbox_cov2d_wp,
     _conic_rect_intersects_tile_wp,
     _count_covered_tiles_wp,
-    _resolve_tile_coverage_mode_wp,
 )
 
 
@@ -86,7 +84,7 @@ if wp is not None:
             grid_y,
         )
         area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-        mode = _resolve_tile_coverage_mode_wp(coverage_mode, rect)
+        mode = coverage_mode
         mask = wp.int64(0)
         if mode == TILE_COVERAGE_CONIC_RECT and area <= TILE_COVERAGE_CONIC_MASK_MAX_TILES:
             if area <= 1:
@@ -153,7 +151,7 @@ if wp is not None:
         span_x = rect[2] - rect[0]
         span_y = rect[3] - rect[1]
         area = span_x * span_y
-        mode = _resolve_tile_coverage_mode_wp(requested_mode, rect)
+        mode = requested_mode
         threshold = 2.0 * wp.log(wp.max(255.0 * conic_opacity[3], 1.0))
         off = offset
 
@@ -246,7 +244,7 @@ if wp is not None:
         span_x = rect[2] - rect[0]
         span_y = rect[3] - rect[1]
         area = span_x * span_y
-        mode = _resolve_tile_coverage_mode_wp(requested_mode, rect)
+        mode = requested_mode
         threshold = 2.0 * wp.log(wp.max(255.0 * conic_opacity[3], 1.0))
         off = offset
 
@@ -347,7 +345,7 @@ if wp is not None:
             off = point_offsets[idx - 1]
 
         coverage_mask = wp.int64(0)
-        if coverage_mode == TILE_COVERAGE_CONIC_RECT or coverage_mode == TILE_COVERAGE_AUTO:
+        if coverage_mode == TILE_COVERAGE_CONIC_RECT:
             coverage_mask = coverage_masks[idx]
         _emit_tile_ids_for_coverage_wp(
             points_xy_image[idx],
@@ -391,7 +389,7 @@ if wp is not None:
         depth_bits = wp.cast(depths[idx], wp.int32)
         depth_key = wp.int64(depth_bits) & wp.int64(4294967295)
         coverage_mask = wp.int64(0)
-        if coverage_mode == TILE_COVERAGE_CONIC_RECT or coverage_mode == TILE_COVERAGE_AUTO:
+        if coverage_mode == TILE_COVERAGE_CONIC_RECT:
             coverage_mask = coverage_masks[idx]
         _emit_packed_keys_for_coverage_wp(
             points_xy_image[idx],
@@ -435,7 +433,7 @@ if wp is not None:
             off = point_offsets[idx - 1]
 
         coverage_mask = wp.int64(0)
-        if coverage_mode == TILE_COVERAGE_CONIC_RECT or coverage_mode == TILE_COVERAGE_AUTO:
+        if coverage_mode == TILE_COVERAGE_CONIC_RECT:
             coverage_mask = coverage_masks[point_id]
         _emit_tile_ids_for_coverage_wp(
             points_xy_image[point_id],

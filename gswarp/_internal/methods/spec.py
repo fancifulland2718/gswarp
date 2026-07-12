@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from gswarp._internal.coverage import FOOTPRINT_CUSTOM
+from gswarp._internal.coverage import CONSERVATIVE_COVERAGE, CoverageContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,7 +17,7 @@ class MethodSpec:
     projection: str = "perspective_3dgs"
     filtering: str = "none"
     appearance: str = "sh_or_rgb"
-    footprint_capability: str = FOOTPRINT_CUSTOM
+    coverage: CoverageContract = CONSERVATIVE_COVERAGE
     pre_adapter: str | None = None
     requires_advanced_warp: bool = False
     required_capabilities: frozenset[str] = frozenset()

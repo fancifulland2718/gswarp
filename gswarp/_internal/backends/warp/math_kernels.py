@@ -14,8 +14,6 @@ from .constants import (
     PREPROCESS_CULL_SIGMA,
     SNUGBOX_PIXEL_PADDING,
     TILE_COVERAGE_ACCUTILE_SWEEP,
-    TILE_COVERAGE_AUTO,
-    TILE_COVERAGE_AUTO_CONIC_RECT_MAX_TILES,
     TILE_COVERAGE_CONIC_RECT,
     TILE_COVERAGE_SNUGBOX,
 )
@@ -196,18 +194,6 @@ if wp is not None:
         )
 
     @wp.func
-    def _resolve_tile_coverage_mode_wp(
-        requested_mode: wp.int32,
-        rect: wp.vec4i,
-    ):
-        if requested_mode != TILE_COVERAGE_AUTO:
-            return requested_mode
-        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-        if area <= TILE_COVERAGE_AUTO_CONIC_RECT_MAX_TILES:
-            return wp.int32(TILE_COVERAGE_CONIC_RECT)
-        return wp.int32(TILE_COVERAGE_ACCUTILE_SWEEP)
-
-    @wp.func
     def _conic_q_wp(
         x: wp.float32,
         y: wp.float32,
@@ -347,7 +333,7 @@ if wp is not None:
         if area <= 1:
             return area
 
-        mode = _resolve_tile_coverage_mode_wp(requested_mode, rect)
+        mode = requested_mode
         if mode == TILE_COVERAGE_SNUGBOX:
             return area
 

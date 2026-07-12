@@ -4,12 +4,14 @@ import torch
 import warp as wp
 
 from ...._stream import set_launch_params
-from ...coverage import tile_coverage_mode_id
+from ...coverage import (
+    BASELINE_3DGS_COVERAGE,
+    resolve_tile_coverage_mode_id,
+)
 from .constants import (
     BINNING_SORT_MODES,
     BLOCK_X,
     BLOCK_Y,
-    TILE_COVERAGE_AUTO,
     TILE_COVERAGE_CONIC_RECT,
     TORCH_SINGLE_SORT_THRESHOLD,
 )
@@ -42,6 +44,8 @@ from .binning_kernels import (
     _unpack_depth_sort_payload_warp_kernel,
 )
 
+_MAX_BINNING_PAIRS = (1 << 31) - 1
+
 
 def _depth_sort_payload_layout(
     point_count: int, tile_count: int
@@ -53,6 +57,28 @@ def _depth_sort_payload_layout(
     if point_bits + count_bits > 31:
         return None
     return point_bits, (1 << point_bits) - 1
+
+
+def _wide_pair_count_if_needed(
+    tiles_touched: torch.Tensor,
+    point_count: int,
+    tile_count: int,
+) -> torch.Tensor | None:
+    """Return an exact device-side total only when int32 safety is not provable."""
+    if tile_count > _MAX_BINNING_PAIRS:
+        raise OverflowError("image tile count exceeds the signed int32 binning limit")
+    if point_count * tile_count <= _MAX_BINNING_PAIRS:
+        return None
+    return torch.sum(tiles_touched, dtype=torch.int64)
+
+
+def _validate_pair_count(value: int) -> int:
+    if value < 0 or value > _MAX_BINNING_PAIRS:
+        raise OverflowError(
+            "binning tile-reference count exceeds signed int32; "
+            "reduce Gaussian footprint or image size"
+        )
+    return value
 
 
 def _build_binning_state(
@@ -73,15 +99,15 @@ def _build_binning_state(
 
         if sort_mode is None:
             sort_mode = _runtime.get_active_binning_sort_mode()
-        coverage_mode = tile_coverage_mode_id(_runtime.get_active_tile_coverage_mode())
+        coverage_mode = resolve_tile_coverage_mode_id(
+            _runtime.get_active_tile_coverage_mode(),
+            BASELINE_3DGS_COVERAGE,
+        )
 
         if sort_mode not in BINNING_SORT_MODES:
             raise ValueError("sort_mode must be one of 'torch', 'warp_radix', or 'warp_depth_stable_tile'")
 
-        if point_count > 0 and coverage_mode in (
-            TILE_COVERAGE_CONIC_RECT,
-            TILE_COVERAGE_AUTO,
-        ):
+        if point_count > 0 and coverage_mode == TILE_COVERAGE_CONIC_RECT:
             coverage_masks = torch.empty(
                 (point_count,), dtype=torch.int64, device=device
             )
@@ -196,6 +222,9 @@ def _build_binning_state(
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
         else:
             point_offsets = _inclusive_scan_i32(tiles_touched) if point_count > 0 else _allocate_scalar_tensor((0,), torch.int32, device)
+        wide_pair_count = _wide_pair_count_if_needed(
+            tiles_touched, point_count, tile_count
+        )
 
         # ----- Prepare data for binning while GPU finishes the scan -----
         # Moving data prep before the .item() sync allows the host to do useful
@@ -213,13 +242,14 @@ def _build_binning_state(
 
         # ----- Read num_rendered via GPU鈫扖PU sync -----
         if point_count > 0:
-            num_rendered = int(point_offsets_i32[-1].item())
+            count_source = (
+                point_offsets_i32[-1]
+                if wide_pair_count is None
+                else wide_pair_count
+            )
+            num_rendered = _validate_pair_count(int(count_source.item()))
         else:
             num_rendered = 0
-        if num_rendered < 0:
-            raise OverflowError(
-                "binning tile-reference count overflowed signed int32; reduce Gaussian footprint or image size"
-            )
 
         if num_rendered == 0:
             return BinningState(
@@ -403,4 +433,10 @@ def _build_binning_state(
 
 build_binning_state = _build_binning_state
 
-__all__ = ["build_binning_state", "_build_binning_state"]
+__all__ = [
+    "build_binning_state",
+    "_build_binning_state",
+    "_depth_sort_payload_layout",
+    "_validate_pair_count",
+    "_wide_pair_count_if_needed",
+]

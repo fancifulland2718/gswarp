@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 from gswarp._stream import execution_context
 from gswarp._internal.backends.warp.runtime import ExecutionOptions, execution_options
-from gswarp._internal.coverage import FOOTPRINT_EXACT_SCREEN_CONIC, resolve_tile_coverage_mode
+from gswarp._internal.coverage import CoverageContract, resolve_tile_coverage_mode
 
 
 def resolve_execution_options(
@@ -14,13 +14,13 @@ def resolve_execution_options(
     raster_settings,
     *,
     flow: bool = False,
-    footprint_capability: str = FOOTPRINT_EXACT_SCREEN_CONIC,
+    coverage_contract: CoverageContract,
 ) -> ExecutionOptions:
     """Merge public defaults and per-call settings into an immutable snapshot."""
     backward_mode = getattr(raster_settings, "backward_mode", None)
     binning_sort_mode = getattr(raster_settings, "binning_sort_mode", None)
     tile_coverage_mode = resolve_tile_coverage_mode(
-        backend.get_tile_coverage_mode(), footprint_capability
+        backend.get_tile_coverage_mode(), coverage_contract
     )
     compute_flow_aux = getattr(raster_settings, "compute_flow_aux", None) if flow else None
     return ExecutionOptions(
@@ -37,16 +37,45 @@ def resolve_execution_options(
 
 
 @contextmanager
-def runtime_overrides(backend, raster_settings, *, flow: bool = False, options: ExecutionOptions | None = None):
+def runtime_overrides(
+    backend,
+    raster_settings,
+    *,
+    flow: bool = False,
+    coverage_contract: CoverageContract | None = None,
+    options: ExecutionOptions | None = None,
+):
     """Bind one immutable option snapshot and the matching CUDA stream."""
-    options = resolve_execution_options(backend, raster_settings, flow=flow) if options is None else options
+    if options is None:
+        if coverage_contract is None:
+            raise ValueError("coverage_contract is required when options are not pre-resolved")
+        options = resolve_execution_options(
+            backend,
+            raster_settings,
+            flow=flow,
+            coverage_contract=coverage_contract,
+        )
     with execution_context(raster_settings.bg.device):
         with execution_options(options):
             yield options
 
 
-def run_with_runtime_overrides(backend, raster_settings, fn, *, flow: bool = False, options: ExecutionOptions | None = None):
-    with runtime_overrides(backend, raster_settings, flow=flow, options=options):
+def run_with_runtime_overrides(
+    backend,
+    raster_settings,
+    fn,
+    *,
+    flow: bool = False,
+    coverage_contract: CoverageContract | None = None,
+    options: ExecutionOptions | None = None,
+):
+    with runtime_overrides(
+        backend,
+        raster_settings,
+        flow=flow,
+        coverage_contract=coverage_contract,
+        options=options,
+    ):
         return fn()
 
 

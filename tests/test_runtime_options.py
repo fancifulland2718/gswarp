@@ -10,7 +10,7 @@ import torch
 
 from gswarp._internal.api.runtime_context import resolve_execution_options, runtime_overrides
 from gswarp._internal.backends.warp import memory, runtime
-from gswarp._internal.coverage import FOOTPRINT_CUSTOM
+from gswarp._internal.coverage import BASELINE_3DGS_COVERAGE, CONSERVATIVE_COVERAGE
 
 
 class _BackendDefaults:
@@ -48,7 +48,9 @@ class RuntimeOptionsTests(unittest.TestCase):
         backend = _BackendDefaults()
         settings = _settings(binning_sort_mode="torch", auto_tune=False, auto_tune_verbose=False)
 
-        options = resolve_execution_options(backend, settings)
+        options = resolve_execution_options(
+            backend, settings, coverage_contract=BASELINE_3DGS_COVERAGE
+        )
 
         self.assertEqual(options.backward_mode, "manual")
         self.assertEqual(options.binning_sort_mode, "torch")
@@ -63,11 +65,15 @@ class RuntimeOptionsTests(unittest.TestCase):
         outer_settings = _settings(binning_sort_mode="torch", auto_tune=False)
         inner_settings = _settings(binning_sort_mode="warp_radix", auto_tune=True)
 
-        with runtime_overrides(backend, outer_settings):
+        with runtime_overrides(
+            backend, outer_settings, coverage_contract=BASELINE_3DGS_COVERAGE
+        ):
             self.assertEqual(runtime.get_active_binning_sort_mode(), "torch")
             self.assertEqual(runtime.get_active_tile_coverage_mode(), "accutile_sweep")
             self.assertEqual(runtime.get_active_auto_tuning_config(), (False, True))
-            with runtime_overrides(backend, inner_settings):
+            with runtime_overrides(
+                backend, inner_settings, coverage_contract=BASELINE_3DGS_COVERAGE
+            ):
                 self.assertEqual(runtime.get_active_binning_sort_mode(), "warp_radix")
                 self.assertEqual(runtime.get_active_auto_tuning_config(), (True, True))
             self.assertEqual(runtime.get_active_binning_sort_mode(), "torch")
@@ -82,7 +88,7 @@ class RuntimeOptionsTests(unittest.TestCase):
         options = resolve_execution_options(
             backend,
             settings,
-            footprint_capability=FOOTPRINT_CUSTOM,
+            coverage_contract=CONSERVATIVE_COVERAGE,
         )
         self.assertEqual(options.tile_coverage_mode, "snugbox")
         with runtime_overrides(backend, settings, options=options):
@@ -93,7 +99,12 @@ class RuntimeOptionsTests(unittest.TestCase):
         backend = _BackendDefaults()
         settings = _settings(compute_flow_aux=False)
 
-        with runtime_overrides(backend, settings, flow=True):
+        with runtime_overrides(
+            backend,
+            settings,
+            flow=True,
+            coverage_contract=BASELINE_3DGS_COVERAGE,
+        ):
             self.assertFalse(runtime.get_active_compute_flow_aux(True))
         self.assertTrue(runtime.get_active_compute_flow_aux(True))
 

@@ -16,7 +16,10 @@ from ...._tuning import (
     FAMILY_WARP_SPECIALIZED,
 )
 from ...._stream import set_launch_params, torch_launch_array
-from ...coverage import tile_coverage_mode_id
+from ...coverage import (
+    BASELINE_3DGS_COVERAGE,
+    resolve_tile_coverage_mode_id,
+)
 
 from .constants import BLOCK_X, BLOCK_Y, NUM_CHANNELS
 from .state import PreprocessBackwardInterop, PreprocessOutputs
@@ -304,7 +307,10 @@ def preprocess_gaussians(
     capture_backward_interop=False,
 ):
         _runtime._require_warp()
-        coverage_mode = tile_coverage_mode_id(_runtime.get_active_tile_coverage_mode())
+        coverage_mode = resolve_tile_coverage_mode_id(
+            _runtime.get_active_tile_coverage_mode(),
+            BASELINE_3DGS_COVERAGE,
+        )
         if means3D.ndim != 2 or means3D.shape[1] != 3:
             raise ValueError("means3D must have dimensions (num_points, 3)")
         if prefiltered:

@@ -22,7 +22,7 @@ def run_typed_forward(plan, raster_settings, args):
         plan.backend,
         raster_settings,
         flow=plan.flow,
-        footprint_capability=plan.spec.footprint_capability,
+        coverage_contract=plan.spec.coverage,
     )
     result = run_with_runtime_overrides(
         plan.backend,

@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import warp as wp
 
 import gswarp._stream as stream_interop
 from gswarp._rasterizer import (
@@ -33,10 +34,46 @@ from gswarp._internal.backends.warp.memory import (
     _C4_LAUNCH_CACHE_RENDER_BWD,
     _C4_LAUNCH_CACHE_SH_V3,
 )
+from gswarp._internal.backends.warp.binning_kernels import (
+    _duplicate_with_keys_warp_kernel,
+    _duplicate_with_packed_keys_warp_kernel,
+)
+from gswarp._internal.backends.warp.constants import TILE_COVERAGE_ACCUTILE_SWEEP
+from gswarp._internal.backends.warp.math_kernels import _count_covered_tiles_wp
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 DEVICE = torch.device("cuda:0")
+
+
+@wp.kernel
+def _count_accutile_tiles_test_kernel(
+    points_xy_image: wp.array(dtype=wp.vec2),
+    radii: wp.array(dtype=wp.int32),
+    conic_opacity: wp.array(dtype=wp.vec4),
+    cov2d: wp.array(dtype=wp.vec3),
+    grid_x: wp.int32,
+    grid_y: wp.int32,
+    counts_out: wp.array(dtype=wp.int32),
+):
+    idx = wp.tid()
+    point = points_xy_image[idx]
+    conic = conic_opacity[idx]
+    cov = cov2d[idx]
+    counts_out[idx] = _count_covered_tiles_wp(
+        point[0],
+        point[1],
+        cov[0],
+        cov[2],
+        conic[0],
+        conic[1],
+        conic[2],
+        conic[3],
+        radii[idx],
+        grid_x,
+        grid_y,
+        TILE_COVERAGE_ACCUTILE_SWEEP,
+    )
 
 
 def _empty() -> torch.Tensor:
@@ -86,6 +123,168 @@ def _inputs(means3d: torch.Tensor, *, scales: torch.Tensor | None = None, covari
 
 @unittest.skipUnless(CUDA_AVAILABLE, "CUDA is required for Warp rasterizer tests")
 class RasterizerCUDAContractTests(unittest.TestCase):
+    def test_accutile_count_and_emit_match_at_numeric_boundaries(self) -> None:
+        below_16 = torch.nextafter(
+            torch.tensor(16.0, dtype=torch.float32),
+            torch.tensor(float("-inf"), dtype=torch.float32),
+        ).item()
+        above_16 = torch.nextafter(
+            torch.tensor(16.0, dtype=torch.float32),
+            torch.tensor(float("inf"), dtype=torch.float32),
+        ).item()
+        cutoff = torch.tensor(1.0 / 255.0, dtype=torch.float32)
+        below_cutoff = torch.nextafter(
+            cutoff, torch.tensor(float("-inf"), dtype=torch.float32)
+        ).item()
+        above_cutoff = torch.nextafter(
+            cutoff, torch.tensor(float("inf"), dtype=torch.float32)
+        ).item()
+
+        points = torch.tensor(
+            [
+                [below_16, below_16],
+                [16.0, 16.0],
+                [above_16, above_16],
+                [31.999, 48.001],
+                [64.0, 63.999],
+                [1.0, 126.0],
+            ],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        covariances = torch.tensor(
+            [
+                [20.0, 8.0, 12.0],
+                [20.0, -8.0, 12.0],
+                [0.5, 0.49, 0.5],
+                [80.0, 0.0, 0.4],
+                [0.4, -0.15, 30.0],
+                [4.0, 1.5, 4.0],
+            ],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        det = (
+            covariances[:, 0] * covariances[:, 2]
+            - covariances[:, 1].square()
+        )
+        conics = torch.stack(
+            (
+                covariances[:, 2] / det,
+                -covariances[:, 1] / det,
+                covariances[:, 0] / det,
+            ),
+            dim=1,
+        )
+        opacities = torch.tensor(
+            [0.8, 0.8, 0.3, 0.5, above_cutoff, below_cutoff],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        conic_opacity = torch.cat((conics, opacities[:, None]), dim=1)
+        trace = covariances[:, 0] + covariances[:, 2]
+        discriminant = torch.clamp(
+            0.25 * trace.square() - det, min=0.0
+        )
+        lambda_max = 0.5 * trace + torch.sqrt(discriminant)
+        radii = torch.ceil(3.0 * torch.sqrt(lambda_max)).to(torch.int32)
+        counts = torch.empty(
+            (points.shape[0],), dtype=torch.int32, device=DEVICE
+        )
+        grid_x = 8
+        grid_y = 8
+
+        wp.launch(
+            _count_accutile_tiles_test_kernel,
+            dim=points.shape[0],
+            inputs=[
+                wp.from_torch(points, dtype=wp.vec2),
+                wp.from_torch(radii, dtype=wp.int32),
+                wp.from_torch(conic_opacity, dtype=wp.vec4),
+                wp.from_torch(covariances, dtype=wp.vec3),
+                grid_x,
+                grid_y,
+            ],
+            outputs=[wp.from_torch(counts, dtype=wp.int32)],
+            device=str(DEVICE),
+        )
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        total = int(offsets[-1].item())
+        self.assertGreater(total, 0)
+        self.assertEqual(int(counts[-1].item()), 0)
+
+        tile_ids = torch.full(
+            (total,), -1, dtype=torch.int32, device=DEVICE
+        )
+        point_list = torch.full(
+            (total,), -1, dtype=torch.int32, device=DEVICE
+        )
+        masks = torch.zeros((1,), dtype=torch.int64, device=DEVICE)
+        wp.launch(
+            _duplicate_with_keys_warp_kernel,
+            dim=points.shape[0],
+            inputs=[
+                wp.from_torch(points, dtype=wp.vec2),
+                wp.from_torch(offsets, dtype=wp.int32),
+                wp.from_torch(radii, dtype=wp.int32),
+                wp.from_torch(conic_opacity, dtype=wp.vec4),
+                wp.from_torch(covariances, dtype=wp.vec3),
+                grid_x,
+                grid_y,
+                TILE_COVERAGE_ACCUTILE_SWEEP,
+                wp.from_torch(masks, dtype=wp.int64),
+            ],
+            outputs=[
+                wp.from_torch(tile_ids, dtype=wp.int32),
+                wp.from_torch(point_list, dtype=wp.int32),
+            ],
+            device=str(DEVICE),
+        )
+
+        packed = torch.full(
+            (total,), -1, dtype=torch.int64, device=DEVICE
+        )
+        packed_points = torch.full(
+            (total,), -1, dtype=torch.int32, device=DEVICE
+        )
+        depths = torch.arange(
+            1, points.shape[0] + 1, dtype=torch.float32, device=DEVICE
+        )
+        wp.launch(
+            _duplicate_with_packed_keys_warp_kernel,
+            dim=points.shape[0],
+            inputs=[
+                wp.from_torch(points, dtype=wp.vec2),
+                wp.from_torch(offsets, dtype=wp.int32),
+                wp.from_torch(radii, dtype=wp.int32),
+                wp.from_torch(conic_opacity, dtype=wp.vec4),
+                wp.from_torch(covariances, dtype=wp.vec3),
+                wp.from_torch(depths, dtype=wp.float32),
+                grid_x,
+                grid_y,
+                TILE_COVERAGE_ACCUTILE_SWEEP,
+                wp.from_torch(masks, dtype=wp.int64),
+            ],
+            outputs=[
+                wp.from_torch(packed, dtype=wp.int64),
+                wp.from_torch(packed_points, dtype=wp.int32),
+            ],
+            device=str(DEVICE),
+        )
+        torch.cuda.synchronize(DEVICE)
+
+        self.assertTrue(torch.all(tile_ids >= 0).item())
+        self.assertTrue(torch.all(tile_ids < grid_x * grid_y).item())
+        torch.testing.assert_close(packed_points, point_list)
+        torch.testing.assert_close((packed >> 32).to(torch.int32), tile_ids)
+        starts = torch.cat(
+            (torch.zeros(1, dtype=torch.int32, device=DEVICE), offsets[:-1])
+        )
+        for point_id, (start, end) in enumerate(zip(starts.tolist(), offsets.tolist())):
+            self.assertTrue(
+                torch.all(point_list[start:end] == point_id).item()
+            )
+
     def setUp(self) -> None:
         clear_standard_caches()
         clear_flow_caches()
