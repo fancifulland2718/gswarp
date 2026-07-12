@@ -20,9 +20,10 @@ from .memory import (
     _allocate_warp_scalar_array,
     _can_use_warp_scalar_alloc,
     _gather_i32_by_index,
+    _get_depth_order_i32_buffer,
+    _get_index_gather_i32_buffer,
     _get_radix_sort_buffers,
     _get_radix_sort_i32_buffers,
-    _get_sequence_buffer,
     _inclusive_scan_i32,
     _pack_binning_sort_keys,
     _warp_radix_sort_i32_pairs_in_place,
@@ -35,8 +36,23 @@ from .binning_kernels import (
     _duplicate_with_packed_keys_warp_kernel,
     _identify_tile_ranges_from_packed_keys_warp_kernel,
     _identify_tile_ranges_warp_kernel,
+    _prepare_depth_sort_payload_warp_kernel,
     _recount_covered_tiles_warp_kernel,
+    _unpack_depth_sort_payload_warp_kernel,
 )
+
+
+def _depth_sort_payload_layout(
+    point_count: int, tile_count: int
+) -> tuple[int, int] | None:
+    if point_count <= 0 or tile_count <= 0:
+        return None
+    point_bits = (point_count - 1).bit_length()
+    count_bits = tile_count.bit_length()
+    if point_bits + count_bits > 31:
+        return None
+    return point_bits, (1 << point_bits) - 1
+
 
 def _build_binning_state(
     preprocess_outputs,
@@ -114,14 +130,68 @@ def _build_binning_state(
             _ds_key_buf, _ds_val_buf, _ds_key_wp, _ds_val_wp = _get_radix_sort_i32_buffers(device, point_count * 2)
             point_depth_keys = _ds_key_buf[:point_count]
             sorted_point_ids = _ds_val_buf[:point_count]
-            point_depth_keys.copy_(depths.view(torch.int32))
-            sorted_point_ids.copy_(_get_sequence_buffer(device, point_count))
+            payload_layout = _depth_sort_payload_layout(
+                point_count, tile_count
+            )
+            use_packed_payload = payload_layout is not None
+            point_bits = 0
+            point_mask = 0
+            if payload_layout is not None:
+                point_bits, point_mask = payload_layout
+            wp.launch(
+                kernel=_prepare_depth_sort_payload_warp_kernel,
+                dim=point_count,
+                inputs=[
+                    wp.from_torch(depths.view(torch.int32), dtype=wp.int32),
+                    wp.from_torch(tiles_touched, dtype=wp.int32),
+                    int(point_bits),
+                    int(use_packed_payload),
+                ],
+                outputs=[
+                    _ds_key_wp
+                    if _ds_key_wp is not None
+                    else wp.from_torch(point_depth_keys, dtype=wp.int32),
+                    _ds_val_wp
+                    if _ds_val_wp is not None
+                    else wp.from_torch(sorted_point_ids, dtype=wp.int32),
+                ],
+                device=str(device),
+            )
             point_depth_keys, sorted_point_ids = _warp_radix_sort_i32_pairs_in_place(
                 _ds_key_buf, _ds_val_buf, point_count, _ds_key_wp, _ds_val_wp
             )
-            sorted_point_ids = sorted_point_ids.clone()
-
-            sorted_tiles_touched = _gather_i32_by_index(tiles_touched, sorted_point_ids)
+            if use_packed_payload:
+                sorted_point_ids, sorted_point_ids_wp = (
+                    _get_depth_order_i32_buffer(device, point_count)
+                )
+                sorted_tiles_touched, sorted_tiles_touched_wp = (
+                    _get_index_gather_i32_buffer(device, point_count)
+                )
+                wp.launch(
+                    kernel=_unpack_depth_sort_payload_warp_kernel,
+                    dim=point_count,
+                    inputs=[
+                        _ds_val_wp
+                        if _ds_val_wp is not None
+                        else wp.from_torch(_ds_val_buf, dtype=wp.int32),
+                        int(point_bits),
+                        int(point_mask),
+                    ],
+                    outputs=[
+                        sorted_point_ids_wp
+                        if sorted_point_ids_wp is not None
+                        else wp.from_torch(sorted_point_ids, dtype=wp.int32),
+                        sorted_tiles_touched_wp
+                        if sorted_tiles_touched_wp is not None
+                        else wp.from_torch(sorted_tiles_touched, dtype=wp.int32),
+                    ],
+                    device=str(device),
+                )
+            else:
+                sorted_point_ids = sorted_point_ids.clone()
+                sorted_tiles_touched = _gather_i32_by_index(
+                    tiles_touched, sorted_point_ids
+                )
             point_offsets = _inclusive_scan_i32(sorted_tiles_touched)
         else:
             point_offsets = _inclusive_scan_i32(tiles_touched) if point_count > 0 else _allocate_scalar_tensor((0,), torch.int32, device)

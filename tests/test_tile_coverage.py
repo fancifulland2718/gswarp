@@ -16,6 +16,7 @@ from gswarp._internal.coverage import (
     tile_coverage_mode_id,
 )
 from gswarp._internal.backends.warp import binning_kernels, preprocess_kernels
+from gswarp._internal.backends.warp.binning_ops import _depth_sort_payload_layout
 
 
 BLOCK = 16
@@ -154,6 +155,15 @@ def _accepted_pixel_tiles(point, conic, opacity, width, height):
 
 
 class TileCoverageTests(unittest.TestCase):
+    def test_depth_sort_payload_layout_is_bounded_and_has_explicit_fallback(self):
+        self.assertEqual(
+            _depth_sort_payload_layout(298_819, 2_500),
+            (19, (1 << 19) - 1),
+        )
+        self.assertIsNone(_depth_sort_payload_layout(300_000, 32_400))
+        self.assertEqual(_depth_sort_payload_layout(1, 1), (0, 0))
+        self.assertIsNone(_depth_sort_payload_layout(0, 1))
+
     def test_policy_rejects_exact_culling_for_non_exact_footprints(self):
         self.assertEqual(resolve_tile_coverage_mode("auto", FOOTPRINT_CUSTOM), "snugbox")
         self.assertEqual(

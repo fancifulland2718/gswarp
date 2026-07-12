@@ -26,6 +26,35 @@ from .math_kernels import (
 if wp is not None:
 
     @wp.kernel
+    def _prepare_depth_sort_payload_warp_kernel(
+        depth_bits: wp.array(dtype=wp.int32),
+        tiles_touched: wp.array(dtype=wp.int32),
+        point_bits: wp.int32,
+        pack_counts: wp.int32,
+        depth_keys_out: wp.array(dtype=wp.int32),
+        payload_out: wp.array(dtype=wp.int32),
+    ):
+        idx = wp.tid()
+        depth_keys_out[idx] = depth_bits[idx]
+        value = wp.int32(idx)
+        if pack_counts != 0:
+            value = value | (tiles_touched[idx] << point_bits)
+        payload_out[idx] = value
+
+    @wp.kernel
+    def _unpack_depth_sort_payload_warp_kernel(
+        payload: wp.array(dtype=wp.int32),
+        point_bits: wp.int32,
+        point_mask: wp.int32,
+        point_ids_out: wp.array(dtype=wp.int32),
+        tiles_touched_out: wp.array(dtype=wp.int32),
+    ):
+        idx = wp.tid()
+        value = payload[idx]
+        point_ids_out[idx] = value & point_mask
+        tiles_touched_out[idx] = value >> point_bits
+
+    @wp.kernel
     def _recount_covered_tiles_warp_kernel(
         points_xy_image: wp.array(dtype=wp.vec2),
         radii: wp.array(dtype=wp.int32),

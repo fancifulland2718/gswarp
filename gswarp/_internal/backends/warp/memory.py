@@ -48,6 +48,7 @@ class _WorkspaceSlot:
     scan_i32: tuple[Any | None, torch.Tensor, int] | None = None
     project_visible: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     sequence: torch.Tensor | None = None
+    depth_order_i32: tuple[Any | None, torch.Tensor] | None = None
 
     @property
     def key(self) -> tuple[str, int]:
@@ -64,6 +65,7 @@ class _WorkspaceSlot:
                 self.scan_i32,
                 self.project_visible,
                 self.sequence,
+                self.depth_order_i32,
             )
         )
 
@@ -118,6 +120,7 @@ def get_warp_cache_report() -> dict[str, Any]:
         "_SCAN_I32_BUFFER_CACHE": "scan_i32",
         "_PROJECT_VISIBLE_BUFFER_CACHE": "project_visible",
         "_SEQUENCE_BUFFER_CACHE": "sequence",
+        "_DEPTH_ORDER_I32_BUFFER_CACHE": "depth_order_i32",
     }
     by_cache = {
         name: {
@@ -510,6 +513,27 @@ def _get_sequence_buffer(device: torch.device, required_count: int):
     sequence = torch.arange(required_count, dtype=torch.int32, device=device)
     slot.sequence = sequence
     return sequence
+
+
+def _get_depth_order_i32_buffer(device: torch.device, required_count: int):
+    slot = _get_workspace_slot(device)
+    cached = slot.depth_order_i32
+    if cached is not None:
+        warp_buffer, tensor_buffer = cached
+        if tensor_buffer.numel() >= required_count:
+            return tensor_buffer[:required_count], warp_buffer
+
+    if _can_use_warp_scalar_alloc(device):
+        warp_buffer, buffer = _allocate_warp_scalar_array(
+            required_count, torch.int32, device
+        )
+    else:
+        warp_buffer = None
+        buffer = torch.empty(
+            (required_count,), dtype=torch.int32, device=device
+        )
+    slot.depth_order_i32 = (warp_buffer, buffer)
+    return buffer, warp_buffer
 
 
 def _inclusive_scan_i32(src: torch.Tensor):

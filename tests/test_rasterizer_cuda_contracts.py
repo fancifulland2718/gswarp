@@ -230,6 +230,30 @@ class RasterizerCUDAContractTests(unittest.TestCase):
             for actual, expected in zip(outputs[mode][2], reference[2]):
                 torch.testing.assert_close(actual, expected, atol=2.0e-5, rtol=2.0e-4)
 
+    def test_depth_sort_payload_fallback_matches_packed_path(self) -> None:
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        inputs = _inputs(
+            torch.tensor(
+                [[-0.2, 0.1, 2.0], [0.25, -0.15, 2.5]],
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+        )
+        settings = _settings(background, image_size=64)
+        packed = rasterize_standard(**inputs, raster_settings=settings)
+        with patch(
+            "gswarp._internal.backends.warp.binning_ops._depth_sort_payload_layout",
+            return_value=None,
+        ):
+            fallback = rasterize_standard(**inputs, raster_settings=settings)
+
+        torch.testing.assert_close(fallback[0], packed[0])
+        torch.testing.assert_close(fallback[1], packed[1])
+        for actual, expected in zip(fallback[2], packed[2]):
+            torch.testing.assert_close(actual, expected)
+
     def test_mark_visible_returns_owned_bool_tensor(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
         rasterizer = StandardRasterizer(_settings(background))
