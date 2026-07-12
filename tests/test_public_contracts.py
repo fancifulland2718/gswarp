@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from gswarp._stream import set_launch_params
+from gswarp._stream import TransientLaunchArrayScope, set_launch_params
 from gswarp._internal.api.validation import normalize_gaussian_inputs
 from gswarp._internal.backends.warp.packing import _pack_forward_aux_buffers, _unpack_forward_aux_buffers
 from gswarp._internal.backends.warp.state import BinningState, PreprocessOutputs
@@ -71,6 +71,28 @@ class LaunchParameterPackingTests(unittest.TestCase):
         set_launch_params(command, [ArrayView(), 4, 2.5])
 
         self.assertEqual(command.values, [marker, 4, 2.5])
+
+
+class TransientLaunchArrayScopeTests(unittest.TestCase):
+    def test_separates_tensor_owner_from_launch_descriptor(self) -> None:
+        import gc
+        import weakref
+
+        tensor = torch.ones(4)
+        tensor_ref = weakref.ref(tensor)
+        scope = TransientLaunchArrayScope()
+        descriptor = scope.array(tensor)
+
+        self.assertEqual(descriptor.data, tensor.data_ptr())
+        self.assertFalse(hasattr(descriptor, "_ref"))
+
+        del tensor
+        gc.collect()
+        self.assertIsNotNone(tensor_ref())
+
+        del scope
+        gc.collect()
+        self.assertIsNone(tensor_ref())
 
 
 class PackedStateContractTests(unittest.TestCase):

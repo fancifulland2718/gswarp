@@ -24,6 +24,26 @@ class ExecutionContext:
     workspace_key: tuple[str, int]
 
 
+class TransientLaunchArrayScope:
+    """Build ownerless array descriptors while retaining inputs until launch."""
+
+    __slots__ = ("_owners",)
+
+    def __init__(self) -> None:
+        self._owners: list[object] = []
+
+    def array(self, tensor: torch.Tensor, dtype=None):
+        owned = wp.from_torch(
+            tensor,
+            dtype=dtype,
+            requires_grad=False,
+            return_ctype=True,
+        )
+        self._owners.append(owned)
+        descriptor_type = type(owned)
+        return descriptor_type.from_buffer_copy(owned)
+
+
 _ACTIVE_EXECUTION_CONTEXT: ContextVar[ExecutionContext | None] = ContextVar(
     "gswarp_active_execution_context", default=None
 )
@@ -247,6 +267,7 @@ def clear_execution_stream_cache(
 
 __all__ = [
     "ExecutionContext",
+    "TransientLaunchArrayScope",
     "current_execution_context",
     "ensure_aligned",
     "execution_context",

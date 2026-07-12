@@ -26,6 +26,11 @@ from gswarp.rasterizer_flow import (
     clear_warp_caches as clear_flow_caches,
     rasterize_gaussians as rasterize_flow,
 )
+from gswarp._internal.backends.warp.memory import (
+    _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS,
+    _C4_LAUNCH_CACHE_RENDER_BWD,
+    _C4_LAUNCH_CACHE_SH_V3,
+)
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -211,6 +216,47 @@ class RasterizerCUDAContractTests(unittest.TestCase):
 
         torch.testing.assert_close(pending_scales.grad, reference_grad)
 
+    def test_retain_graph_repeats_standard_backward(self) -> None:
+        background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
+        scales = torch.full(
+            (8, 3),
+            0.5,
+            dtype=torch.float32,
+            device=DEVICE,
+            requires_grad=True,
+        )
+        inputs = _inputs(
+            torch.tensor(
+                [[-0.2, 0.0, 2.0], [0.2, 0.0, 2.0]] * 4,
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+            scales=scales,
+        )
+        inputs["colors_precomp"] = _empty()
+        inputs["sh"] = torch.randn(
+            (8, 16, 3),
+            dtype=torch.float32,
+            device=DEVICE,
+            requires_grad=True,
+        )
+        color, _, _ = rasterize_standard(
+            **inputs,
+            raster_settings=_settings(background),
+        )
+        loss = color.square().mean()
+
+        loss.backward(retain_graph=True)
+        first_scale_grad = scales.grad.clone()
+        first_sh_grad = inputs["sh"].grad.clone()
+        scales.grad = None
+        inputs["sh"].grad = None
+
+        loss.backward()
+
+        torch.testing.assert_close(scales.grad, first_scale_grad)
+        torch.testing.assert_close(inputs["sh"].grad, first_sh_grad)
+
     def test_standard_backward_does_not_attach_warp_autograd(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
         scales = torch.full(
@@ -248,7 +294,16 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         self.assertLessEqual(len(wrapped.call_args_list), 23)
         for call in wrapped.call_args_list:
             self.assertIs(call.kwargs["requires_grad"], False)
-            self.assertIs(call.kwargs["return_ctype"], False)
+            self.assertIs(call.kwargs["return_ctype"], True)
+
+        for cache in (
+            _C4_LAUNCH_CACHE_RENDER_BWD,
+            _C4_LAUNCH_CACHE_SH_V3,
+            _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS,
+        ):
+            for command in cache.values():
+                for value in command.params:
+                    self.assertFalse(hasattr(value, "_ref"))
 
     def test_raw_forward_backward_compatibility_round_trip(self) -> None:
         background = torch.zeros(3, dtype=torch.float32, device=DEVICE)
