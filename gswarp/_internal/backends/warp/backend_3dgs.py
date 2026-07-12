@@ -20,20 +20,20 @@ from .runtime import (
     get_binning_sort_mode,
     set_binning_sort_mode,
 )
-from .memory import clear_common_warp_caches
+from .memory import clear_common_warp_caches, get_warp_cache_report
 from .packing import _pack_forward_aux_buffers
-from .preprocess_ops import _make_empty_forward_outputs, preprocess_gaussians, mark_visible, reset_preprocess_tracking
+from .preprocess_ops import _make_empty_forward_outputs, preprocess_gaussians, mark_visible
 from .binning_ops import _build_binning_state
 from .render_ops import _render_tiles_warp
-from .backward_ops import rasterize_gaussians_backward
+from .backward_ops import rasterize_gaussians_backward, rasterize_gaussians_backward_typed
+from .state import ForwardResult, ForwardState
 
 
 def clear_warp_caches() -> None:
     clear_common_warp_caches()
-    reset_preprocess_tracking()
 
 
-def rasterize_gaussians(*args: Any):
+def _rasterize_gaussians(*args: Any, pack_compatibility_state: bool):
         _runtime._require_warp()
         (
             _background,
@@ -60,7 +60,14 @@ def rasterize_gaussians(*args: Any):
             raise ValueError("means3D must have dimensions (num_points, 3)")
 
         if means3D.shape[0] == 0:
-            return _make_empty_forward_outputs(means3D, _background, image_height, image_width)
+            outputs = _make_empty_forward_outputs(means3D, _background, image_height, image_width)
+            if pack_compatibility_state:
+                return outputs
+            return ForwardResult(
+                num_rendered=0,
+                color=outputs[1], depth=outputs[2], alpha=outputs[3], radii=outputs[4],
+                proj_2d=outputs[8], conic_2d=outputs[9], conic_2d_inv=outputs[10], state=None,
+            )
 
         feature_ptr = None
 
@@ -114,6 +121,14 @@ def rasterize_gaussians(*args: Any):
                 image_width,
             )
 
+        if not pack_compatibility_state:
+            return ForwardResult(
+                num_rendered=binning_state.num_rendered,
+                color=out_color, depth=out_depth, alpha=out_alpha, radii=preprocess_outputs.radii,
+                proj_2d=preprocess_outputs.proj_2d, conic_2d=preprocess_outputs.conic_2d,
+                conic_2d_inv=preprocess_outputs.conic_2d_inv,
+                state=ForwardState(preprocess_outputs, binning_state, _n_contrib),
+            )
         geom_buffer, binning_buffer, img_buffer = _pack_forward_aux_buffers(preprocess_outputs, binning_state, _n_contrib)
         return (
             binning_state.num_rendered,
@@ -130,8 +145,19 @@ def rasterize_gaussians(*args: Any):
         )
 
 
+def rasterize_gaussians(*args: Any):
+    """Raw compatibility entry point retaining opaque packed buffers."""
+    return _rasterize_gaussians(*args, pack_compatibility_state=True)
+
+
+def rasterize_gaussians_typed(*args: Any) -> ForwardResult:
+    """Normal frontend entry point with typed forward state and no packing copy."""
+    return _rasterize_gaussians(*args, pack_compatibility_state=False)
+
+
 __all__ = [
     "clear_warp_caches",
+    "get_warp_cache_report",
     "get_default_parameter_info",
     "is_available",
     "get_backward_mode",
@@ -143,8 +169,10 @@ __all__ = [
     "initialize_runtime_tuning",
     "preprocess_gaussians",
     "rasterize_gaussians",
+    "rasterize_gaussians_typed",
     "mark_visible",
     "rasterize_gaussians_backward",
+    "rasterize_gaussians_backward_typed",
     "set_runtime_auto_tuning",
     "get_compute_depth",
     "set_compute_depth",

@@ -20,58 +20,122 @@ from .constants import *
 from . import runtime as _runtime
 from .binning_kernels import _gather_i32_by_index_warp_kernel, _pack_binning_keys_warp_kernel
 
-_RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = {}
-_RADIX_SORT_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = {}
-_INDEX_GATHER_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = {}
-_INDEX_GATHER_I64_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = {}
-_SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, int]] = {}
-_PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-_SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = {}
-_DEPTH_SORT_ORDER_CACHE: dict[str, tuple[torch.Tensor, int]] = {}
-_DEPTH_SORT_CHECK_FLAG: dict[str, torch.Tensor] = {}
-_C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_COV3D: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_RENDER_BWD: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_PROJ_MEANS: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_COV2D: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_ACCUM: dict[tuple[str, int, int], Any] = {}
-_C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS: dict[tuple[str, int, int], Any] = {}
-_C4_LAUNCH_CACHE_SH_V3: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_FWD_SH: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_FWD_PREPROCESS: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_FWD_RENDER: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_BINNING_DUPLICATE: dict[tuple[str, int], Any] = {}
-_C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[Any, ...], Any] = {}
-_C4_LAUNCH_CACHE_FLOW_GRAD: dict[tuple[str, int], Any] = {}
-
-def clear_common_warp_caches() -> None:
-    torch.cuda.synchronize()
-    _RADIX_SORT_BUFFER_CACHE.clear()
-    _RADIX_SORT_I32_BUFFER_CACHE.clear()
-    _INDEX_GATHER_I32_BUFFER_CACHE.clear()
-    _INDEX_GATHER_I64_BUFFER_CACHE.clear()
-    _SCAN_I32_BUFFER_CACHE.clear()
-    _PROJECT_VISIBLE_BUFFER_CACHE.clear()
-    _SEQUENCE_BUFFER_CACHE.clear()
-    _DEPTH_SORT_ORDER_CACHE.clear()
-    _DEPTH_SORT_CHECK_FLAG.clear()
-    _C4_LAUNCH_CACHE_SH.clear()
-    _C4_LAUNCH_CACHE_COV3D.clear()
-    _C4_LAUNCH_CACHE_RENDER_BWD.clear()
-    _C4_LAUNCH_CACHE_PROJ_MEANS.clear()
-    _C4_LAUNCH_CACHE_COV2D.clear()
-    _C4_LAUNCH_CACHE_ACCUM.clear()
-    _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS.clear()
-    _C4_LAUNCH_CACHE_SH_V3.clear()
-    _C4_LAUNCH_CACHE_FWD_SH.clear()
-    _C4_LAUNCH_CACHE_FWD_PREPROCESS.clear()
-    _C4_LAUNCH_CACHE_FWD_RENDER.clear()
-    _C4_LAUNCH_CACHE_BINNING_DUPLICATE.clear()
-    _C4_LAUNCH_CACHE_FWD_RENDER_TILED256.clear()
+_MAX_WORKSPACE_CACHE_DEVICES = 4
+_MAX_LAUNCH_CACHE_ENTRIES = 32
 
 
-def clear_flow_warp_caches() -> None:
-    _C4_LAUNCH_CACHE_FLOW_GRAD.clear()
+class _BoundedCache(dict):
+    """Insertion-ordered cache with a fixed number of retained entries."""
+
+    def __init__(self, max_entries: int) -> None:
+        super().__init__()
+        self.max_entries = max_entries
+
+    def __setitem__(self, key, value) -> None:
+        if key not in self and len(self) >= self.max_entries:
+            del self[next(iter(self))]
+        super().__setitem__(key, value)
+
+
+_RADIX_SORT_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_RADIX_SORT_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_INDEX_GATHER_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_INDEX_GATHER_I64_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_SCAN_I32_BUFFER_CACHE: dict[str, tuple[Any | None, torch.Tensor, int]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_PROJECT_VISIBLE_BUFFER_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_SEQUENCE_BUFFER_CACHE: dict[str, torch.Tensor] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_DEPTH_SORT_ORDER_CACHE: dict[str, tuple[torch.Tensor, int]] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_DEPTH_SORT_CHECK_FLAG: dict[str, torch.Tensor] = _BoundedCache(_MAX_WORKSPACE_CACHE_DEVICES)
+_C4_LAUNCH_CACHE_SH: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_COV3D: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_RENDER_BWD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_PROJ_MEANS: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_COV2D: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_ACCUM: dict[tuple[str, int, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS: dict[tuple[str, int, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_SH_V3: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_FWD_SH: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_FWD_PREPROCESS: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_FWD_RENDER: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_BINNING_DUPLICATE: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_FWD_RENDER_TILED256: dict[tuple[Any, ...], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+_C4_LAUNCH_CACHE_FLOW_GRAD: dict[tuple[str, int], Any] = _BoundedCache(_MAX_LAUNCH_CACHE_ENTRIES)
+
+_WORKSPACE_CACHES = (
+    _RADIX_SORT_BUFFER_CACHE, _RADIX_SORT_I32_BUFFER_CACHE, _INDEX_GATHER_I32_BUFFER_CACHE,
+    _INDEX_GATHER_I64_BUFFER_CACHE, _SCAN_I32_BUFFER_CACHE, _PROJECT_VISIBLE_BUFFER_CACHE,
+    _SEQUENCE_BUFFER_CACHE, _DEPTH_SORT_ORDER_CACHE, _DEPTH_SORT_CHECK_FLAG,
+)
+_COMMON_LAUNCH_CACHES = (
+    _C4_LAUNCH_CACHE_SH, _C4_LAUNCH_CACHE_COV3D, _C4_LAUNCH_CACHE_RENDER_BWD,
+    _C4_LAUNCH_CACHE_PROJ_MEANS, _C4_LAUNCH_CACHE_COV2D, _C4_LAUNCH_CACHE_ACCUM,
+    _C4_LAUNCH_CACHE_BWD_FUSED_PREPROCESS, _C4_LAUNCH_CACHE_SH_V3, _C4_LAUNCH_CACHE_FWD_SH,
+    _C4_LAUNCH_CACHE_FWD_PREPROCESS, _C4_LAUNCH_CACHE_FWD_RENDER,
+    _C4_LAUNCH_CACHE_BINNING_DUPLICATE, _C4_LAUNCH_CACHE_FWD_RENDER_TILED256,
+)
+_LAUNCH_CACHES = _COMMON_LAUNCH_CACHES + (_C4_LAUNCH_CACHE_FLOW_GRAD,)
+
+
+def _cached_tensor_bytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, tuple):
+        return sum(_cached_tensor_bytes(item) for item in value)
+    return 0
+
+
+def get_warp_cache_report() -> dict[str, Any]:
+    """Return bounded-cache occupancy without synchronizing the device."""
+    workspace_entries = sum(len(cache) for cache in _WORKSPACE_CACHES)
+    launch_entries = sum(len(cache) for cache in _LAUNCH_CACHES)
+    workspace_bytes = sum(
+        _cached_tensor_bytes(value) for cache in _WORKSPACE_CACHES for value in cache.values()
+    )
+    return {
+        "workspace_entries": workspace_entries,
+        "workspace_tensor_bytes": workspace_bytes,
+        "launch_entries": launch_entries,
+        "workspace_device_limit": _MAX_WORKSPACE_CACHE_DEVICES,
+        "launch_entry_limit": _MAX_LAUNCH_CACHE_ENTRIES,
+        "by_cache": {
+            name: {"entries": len(cache), "tensor_bytes": sum(_cached_tensor_bytes(value) for value in cache.values())}
+            for name, cache in globals().items()
+            if isinstance(cache, _BoundedCache)
+        },
+    }
+
+
+def _clear_cache_entries(caches, device: torch.device | str | None) -> None:
+    if device is None:
+        for cache in caches:
+            cache.clear()
+        return
+    device_key = str(torch.device(device))
+    for cache in caches:
+        for key in tuple(cache):
+            cache_device = key[0] if isinstance(key, tuple) else key
+            if cache_device == device_key:
+                del cache[key]
+
+
+def _synchronize_cache_device(device: torch.device | str | None) -> None:
+    if not torch.cuda.is_available():
+        return
+    if device is None:
+        torch.cuda.synchronize()
+    elif torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def clear_common_warp_caches(device: torch.device | str | None = None) -> None:
+    _synchronize_cache_device(device)
+    _clear_cache_entries(_WORKSPACE_CACHES, device)
+    _clear_cache_entries(_COMMON_LAUNCH_CACHES, device)
+
+
+def clear_flow_warp_caches(device: torch.device | str | None = None) -> None:
+    _synchronize_cache_device(device)
+    _clear_cache_entries((_C4_LAUNCH_CACHE_FLOW_GRAD,), device)
 
 
 

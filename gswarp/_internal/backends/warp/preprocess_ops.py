@@ -23,12 +23,6 @@ from .memory import *
 from .packing import *
 from .preprocess_kernels import *
 
-_PREV_POINT_COUNT: int | None = None
-
-def reset_preprocess_tracking() -> None:
-    global _PREV_POINT_COUNT
-    _PREV_POINT_COUNT = None
-
 def _make_empty_forward_outputs(means3D, background, image_height, image_width):
     point_count = means3D.shape[0]
     background = background.to(device=means3D.device, dtype=torch.float32).reshape(NUM_CHANNELS, 1, 1)
@@ -262,11 +256,6 @@ def preprocess_gaussians(
                 raise ValueError("means3D and computed covariances must have the same number of points")
 
         point_count = means3D.shape[0]
-        # B5: auto-detect pruning (>20% point drop) and clear stale grow-only caches
-        global _PREV_POINT_COUNT
-        if _PREV_POINT_COUNT is not None and point_count < int(_PREV_POINT_COUNT * 0.8):
-            clear_common_warp_caches()
-        _PREV_POINT_COUNT = point_count
         proj_2d = torch.empty((point_count, 2), dtype=torch.float32, device=device)
         conic_2d = torch.empty((point_count, 3), dtype=torch.float32, device=device)
         conic_2d_inv = torch.empty((point_count, 3), dtype=torch.float32, device=device)
@@ -496,4 +485,4 @@ def mark_visible(*args: Any):
     return visible
 
 
-__all__ = ["preprocess_gaussians", "mark_visible", "reset_preprocess_tracking", "_make_empty_forward_outputs", "_compute_cov3d_from_scale_rotation_warp", "_project_visible_points_warp", "_compute_rgb_from_sh_warp"]
+__all__ = ["preprocess_gaussians", "mark_visible", "_make_empty_forward_outputs", "_compute_cov3d_from_scale_rotation_warp", "_project_visible_points_warp", "_compute_rgb_from_sh_warp"]

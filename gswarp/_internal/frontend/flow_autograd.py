@@ -70,35 +70,19 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
         )
 
         execution_options = resolve_execution_options(backend, raster_settings, flow=True)
-        outputs = run_with_runtime_overrides(
+        result = run_with_runtime_overrides(
             backend,
             raster_settings,
-            lambda: backend.rasterize_gaussians(*args),
+            lambda: backend.rasterize_gaussians_typed(*args),
             flow=True,
             options=execution_options,
         )
 
-        (
-            num_rendered,
-            color,
-            depth,
-            alpha,
-            radii,
-            geomBuffer,
-            binningBuffer,
-            imgBuffer,
-            proj_2D,
-            conic_2D,
-            conic_2D_inv,
-            gs_per_pixel,
-            weight_per_gs_pixel,
-            x_mu,
-        ) = outputs
-
         ctx.backend = backend
         ctx.raster_settings = raster_settings
         ctx.execution_options = execution_options
-        ctx.num_rendered = num_rendered
+        ctx.num_rendered = result.num_rendered
+        ctx.forward_state = result.state
         ctx.save_for_backward(
             colors_precomp,
             opacities,
@@ -106,14 +90,20 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             scales,
             rotations,
             cov3Ds_precomp,
-            radii,
+            result.radii,
             sh,
-            geomBuffer,
-            binningBuffer,
-            imgBuffer,
-            alpha,
+            result.alpha,
         )
-        return color, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu
+        return (
+            result.color,
+            result.radii,
+            result.depth,
+            result.alpha,
+            result.proj_2d,
+            result.conic_2d,
+            result.conic_2d_inv,
+            *result.aux,
+        )
 
     @staticmethod
     def backward(
@@ -141,11 +131,10 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             cov3Ds_precomp,
             radii,
             sh,
-            geomBuffer,
-            binningBuffer,
-            imgBuffer,
             alpha,
         ) = ctx.saved_tensors
+
+        empty_buffer = torch.empty((0,), dtype=torch.uint8, device=means3D.device)
 
         args = (
             raster_settings.bg,
@@ -173,10 +162,10 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
             sh,
             raster_settings.sh_degree,
             raster_settings.campos,
-            geomBuffer,
+            empty_buffer,
             num_rendered,
-            binningBuffer,
-            imgBuffer,
+            empty_buffer,
+            empty_buffer,
             alpha,
             raster_settings.enable_flow_grad,
         )
@@ -184,7 +173,9 @@ class _WarpRasterizeGaussians(torch.autograd.Function):
         grads = run_with_runtime_overrides(
             backend,
             raster_settings,
-            lambda: backend.rasterize_gaussians_backward(*args),
+            lambda: backend.rasterize_gaussians_flow_backward_typed(
+                *args, forward_state=ctx.forward_state
+            ),
             flow=True,
             options=ctx.execution_options,
         )

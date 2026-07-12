@@ -13,6 +13,7 @@ from .rasterizer import (  # noqa: F401
     initialize_runtime_tuning,
     get_runtime_tuning_report,
     clear_warp_caches,
+    get_warp_cache_report,
     # Runtime mode controls
     get_backward_mode,
     set_backward_mode,

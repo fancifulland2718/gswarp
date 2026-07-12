@@ -107,6 +107,11 @@ def clear_warp_caches():
     _backend().clear_warp_caches()
 
 
+def get_warp_cache_report():
+    """Return bounded Warp cache occupancy and retained tensor bytes."""
+    return _backend().get_warp_cache_report()
+
+
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
     image_width: int
@@ -177,6 +182,7 @@ __all__ = [
     "initialize_runtime_tuning",
     "get_runtime_tuning_report",
     "clear_warp_caches",
+    "get_warp_cache_report",
     "get_backward_mode",
     "set_backward_mode",
     "get_compute_depth",

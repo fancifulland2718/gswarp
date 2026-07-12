@@ -296,7 +296,7 @@ def _backward_cov2d_warp(
     return grad_means, grad_cov
 
 
-def _rasterize_gaussians_backward_python(*args: Any):
+def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
         (
             _background,
             means3D,
@@ -345,7 +345,16 @@ def _rasterize_gaussians_backward_python(*args: Any):
 
         image_height = grad_color.shape[1]
         image_width = grad_color.shape[2]
-        cached_forward_state = _unpack_forward_aux_buffers(_geomBuffer, _binningBuffer, _imgBuffer, _num_rendered, image_height, image_width)
+        if forward_state is None:
+            cached_forward_state = _unpack_forward_aux_buffers(
+                _geomBuffer, _binningBuffer, _imgBuffer, _num_rendered, image_height, image_width
+            )
+        else:
+            cached_forward_state = (
+                forward_state.preprocess,
+                forward_state.binning,
+                forward_state.n_contrib,
+            )
 
         if cached_forward_state is not None:
             preprocess_outputs, binning_state, n_contrib = cached_forward_state
@@ -584,4 +593,13 @@ def rasterize_gaussians_backward(*args: Any):
     return _rasterize_gaussians_backward_python(*args)
 
 
-__all__ = ["rasterize_gaussians_backward", "_rasterize_gaussians_backward_python"]
+def rasterize_gaussians_backward_typed(*args: Any, forward_state):
+    _runtime._require_warp()
+    return _rasterize_gaussians_backward_python(*args, forward_state=forward_state)
+
+
+__all__ = [
+    "rasterize_gaussians_backward",
+    "rasterize_gaussians_backward_typed",
+    "_rasterize_gaussians_backward_python",
+]

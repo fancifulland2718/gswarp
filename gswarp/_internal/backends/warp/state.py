@@ -34,4 +34,29 @@ class BinningState:
     num_rendered: int
 
 
-__all__ = ["PreprocessOutputs", "BinningState"]
+@dataclass(slots=True)
+class ForwardState:
+    """Typed tensors retained by one normal frontend forward/backward pair."""
+
+    preprocess: PreprocessOutputs
+    binning: BinningState
+    n_contrib: torch.Tensor
+
+
+@dataclass(slots=True)
+class ForwardResult:
+    """Normal frontend result that avoids raw compatibility-buffer packing."""
+
+    num_rendered: int
+    color: torch.Tensor
+    depth: torch.Tensor
+    alpha: torch.Tensor
+    radii: torch.Tensor
+    proj_2d: torch.Tensor
+    conic_2d: torch.Tensor
+    conic_2d_inv: torch.Tensor
+    state: ForwardState | None
+    aux: tuple[torch.Tensor, ...] = ()
+
+
+__all__ = ["PreprocessOutputs", "BinningState", "ForwardState", "ForwardResult"]
