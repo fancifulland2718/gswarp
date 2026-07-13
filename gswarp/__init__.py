@@ -1,6 +1,6 @@
 """gswarp — Pure-Python Warp backend for 3D Gaussian Splatting."""
 
-__version__ = "1.0.5"
+__version__ = "1.1.0"
 
 from .rasterizer import (  # noqa: F401
     # Core rasterizer types

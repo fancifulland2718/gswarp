@@ -263,7 +263,7 @@ except ImportError:
 
 当前数据由本地构建的包复测得到，而非直接从 checkout 导入。CUDA 对照使用原生 `diff_gaussian_rasterization` 扩展；gswarp 被安装到独立目标目录，并在训练前核对源码哈希。该隔离方式避免两个同名包通过 `PYTHONPATH` 相互遮蔽。
 
-**环境。** NVIDIA GeForce RTX 5090（32 GiB，sm_120）、NVIDIA 驱动 610.62、Python 3.14.3、PyTorch 2.11.0+cu130、Warp 1.12.0，以及由当前工作区构建的 gswarp 1.0.5。所有运行均采用原始 3DGS 默认优化参数、`--data_device cpu`、默认 Adam 和 30,000 次迭代。Warp 路径使用 gswarp 光栅化器、fused SSIM 与 KNN；该参考训练的 loss 不消费 depth，因此关闭 Warp depth accumulation。
+**环境。** NVIDIA GeForce RTX 5090（32 GiB，sm_120）、NVIDIA 驱动 610.62、Python 3.14.3、PyTorch 2.11.0+cu130、Warp 1.12.0，以及由当前工作区构建的 gswarp 1.1.0。所有运行均采用原始 3DGS 默认优化参数、`--data_device cpu`、默认 Adam 和 30,000 次迭代。Warp 路径使用 gswarp 光栅化器、fused SSIM 与 KNN；该参考训练的 loss 不消费 depth，因此关闭 Warp depth accumulation。
 
 当前矩阵覆盖全部三个标准评测族：8 个 NeRF Synthetic 场景、2 个 Tanks and Temples 场景和 2 个 Deep Blending 场景。这是完成的 12 场景、30K 迭代套件，而非代表性子集。
 

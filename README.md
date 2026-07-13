@@ -263,7 +263,7 @@ Then switch backends at each usage site using the `GSWARP_AVAILABLE` flag. A ref
 
 The current package artifact was retested from a locally built installation, not from a checkout import. The CUDA reference was the native `diff_gaussian_rasterization` extension; gswarp was installed into a separate target directory and its source hash was checked before training. This prevents either package from shadowing the other through `PYTHONPATH`.
 
-**Environment.** NVIDIA GeForce RTX 5090 (32 GiB, sm_120), NVIDIA driver 610.62, Python 3.14.3, PyTorch 2.11.0+cu130, Warp 1.12.0, and gswarp 1.0.5 built from the current working tree. All runs use original 3DGS default optimization settings, `--data_device cpu`, default Adam, and 30,000 iterations. The Warp run selects the gswarp rasterizer, fused SSIM, and KNN; depth accumulation is disabled because this reference training loss does not consume depth.
+**Environment.** NVIDIA GeForce RTX 5090 (32 GiB, sm_120), NVIDIA driver 610.62, Python 3.14.3, PyTorch 2.11.0+cu130, Warp 1.12.0, and gswarp 1.1.0 built from the current working tree. All runs use original 3DGS default optimization settings, `--data_device cpu`, default Adam, and 30,000 iterations. The Warp run selects the gswarp rasterizer, fused SSIM, and KNN; depth accumulation is disabled because this reference training loss does not consume depth.
 
 The current matrix covers all three standard evaluation families: eight NeRF Synthetic scenes, two Tanks and Temples scenes, and two Deep Blending scenes. This is a completed 12-scene, 30K-iteration suite rather than a representative subset.
 
