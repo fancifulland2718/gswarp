@@ -42,6 +42,7 @@ from gswarp._internal.backends.warp.binning_kernels import (
 )
 from gswarp._internal.backends.warp.constants import TILE_COVERAGE_ACCUTILE_SWEEP
 from gswarp._internal.backends.warp.math_kernels import _count_covered_tiles_wp
+from gswarp._internal.backends.warp.preprocess_ops import preprocess_gaussians
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -363,6 +364,70 @@ class RasterizerCUDAContractTests(unittest.TestCase):
         torch.testing.assert_close(flow_outputs[0], expected)
         torch.testing.assert_close(radii, torch.zeros_like(radii))
         torch.testing.assert_close(flow_outputs[1], torch.zeros_like(flow_outputs[1]))
+
+    def test_precomputed_covariance_preprocess_avoids_host_scalar_readback(self) -> None:
+        means3d = torch.tensor(
+            [[0.0, 0.0, -2.0]], dtype=torch.float32, device=DEVICE
+        )
+        covariances = torch.tensor(
+            [[0.25, 0.0, 0.0, 0.25, 0.0, 0.25]],
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        settings = _settings(torch.zeros(3, device=DEVICE))
+        with stream_interop.execution_context(DEVICE):
+            with patch.object(torch.Tensor, 'item', side_effect=AssertionError):
+                outputs = preprocess_gaussians(
+                    means3d,
+                    settings.viewmatrix,
+                    settings.projmatrix,
+                    settings.image_height,
+                    settings.image_width,
+                    settings.tanfovx,
+                    settings.tanfovy,
+                    cov3D_precomp=covariances,
+                )
+        torch.cuda.synchronize(DEVICE)
+        torch.testing.assert_close(outputs.visible, torch.zeros_like(outputs.visible))
+        torch.testing.assert_close(outputs.radii, torch.zeros_like(outputs.radii))
+        torch.testing.assert_close(
+            outputs.conic_opacity, torch.zeros_like(outputs.conic_opacity)
+        )
+
+    def test_all_culled_precomputed_covariance_has_zero_gradients(self) -> None:
+        background = torch.tensor([0.2, 0.6, 0.3], device=DEVICE)
+        means3d = torch.tensor(
+            [[0.0, 0.0, -2.0]], device=DEVICE, requires_grad=True
+        )
+        covariances = torch.tensor(
+            [[0.25, 0.0, 0.0, 0.25, 0.0, 0.25]],
+            device=DEVICE,
+            requires_grad=True,
+        )
+        colors = torch.full(
+            (1, 3), 0.2, device=DEVICE, requires_grad=True
+        )
+        opacities = torch.full(
+            (1, 1), 0.8, device=DEVICE, requires_grad=True
+        )
+        inputs = _inputs(means3d, scales=_empty(), covariances=covariances)
+        inputs['colors_precomp'] = colors
+        inputs['opacities'] = opacities
+        color, radii, meta = rasterize_standard(
+            **inputs, raster_settings=_settings(background)
+        )
+        color.sum().backward()
+        expected = background[:, None, None].expand(3, 16, 16)
+        torch.testing.assert_close(color, expected)
+        torch.testing.assert_close(radii, torch.zeros_like(radii))
+        torch.testing.assert_close(meta.proj_2D, torch.zeros_like(meta.proj_2D))
+        torch.testing.assert_close(meta.conic_2D, torch.zeros_like(meta.conic_2D))
+        torch.testing.assert_close(means3d.grad, torch.zeros_like(means3d.grad))
+        torch.testing.assert_close(
+            covariances.grad, torch.zeros_like(covariances.grad)
+        )
+        torch.testing.assert_close(colors.grad, torch.zeros_like(colors.grad))
+        torch.testing.assert_close(opacities.grad, torch.zeros_like(opacities.grad))
 
     def test_subthreshold_opacity_preserves_cuda_geometric_visibility(self) -> None:
         background = torch.tensor(

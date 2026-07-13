@@ -445,10 +445,7 @@ def preprocess_gaussians(
         if cov3d_all is None:
             cov3d_all = torch.zeros((point_count, 6), dtype=torch.float32, device=device)
 
-        # F3: E1 fused path processes all points 鈥?skip GPU鈫扖PU sync
-        visible_count = point_count if has_scale_rotation else (int(visible_mask.sum().item()) if point_count > 0 else 0)
-
-        if point_count == 0 or visible_count == 0:
+        if point_count == 0:
             depths.zero_()
             radii.zero_()
             proj_2d.zero_()
@@ -476,6 +473,8 @@ def preprocess_gaussians(
         if has_scale_rotation:
             pass  # E1: preprocess already done by fused kernel
         elif has_precomputed_cov:
+            # The masked kernel initializes every output before testing
+            # visibility, so an all-culled input needs no host-side reduction.
             wp.launch(
                 kernel=_cov2d_preprocess_masked_pack_warp_kernel,
                 dim=point_count,

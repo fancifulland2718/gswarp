@@ -2,7 +2,7 @@
 
 [中文](knn_zh.md) · **English**
 
-This document covers the algorithm, implementation, performance, and correctness of the `gswarp.knn` module.
+This document covers the algorithm, execution model, and correctness of the `gswarp.knn` module.
 
 ---
 
@@ -11,7 +11,6 @@ This document covers the algorithm, implementation, performance, and correctness
 - [Overview](#overview)
 - [Algorithm](#algorithm)
 - [Implementation Details](#implementation-details)
-- [End-to-End Training Impact](#end-to-end-training-impact)
 - [Correctness](#correctness)
 
 ---
@@ -64,40 +63,8 @@ The public contract is explicit for small and invalid inputs: zero points return
 
 ---
 
-## End-to-End Training Impact
-
-> **Historical benchmark pending refresh.** The following ablation used the previous GPU and an earlier code snapshot. CUDA simple-knn and Warp KNN will be rerun together on the new hardware.
-
-> **Benchmark conditions**: The ablation data below was collected with the rasterizer fixed to the Warp backend and SSIM/KNN each taking two values. Python-layer overhead optimizations had not yet been applied. The numbers reflect KNN's isolated contribution to training speed, not the final all-Warp stack performance.
-
-Ablation runs under the same conditions as the SSIM ablation (rasterizer=warp, 30K iters):
-
-**drjohnson (~3.1M Gaussians)**
-
-| SSIM backend | KNN backend | Throughput (it/s) | Wall time (s) | PSNR@30K |
-|-------------|------------|-------------------|--------------|---------|
-| cuda-fused | **cuda** | **30.0** | **853** | **29.504** |
-| cuda-fused | **warp** | **29.9** | **879** | **29.465** |
-
-drjohnson: Warp KNN is ~**0.3% slower** than CUDA KNN (30.0 → 29.9 it/s). The wall-time gap is larger (+26 s), indicating that Warp KNN has higher kernel-launch overhead at very high Gaussian counts (3.1M).
-
-**playroom (~1.9M Gaussians)**
-
-| SSIM backend | KNN backend | Throughput (it/s) | Wall time (s) | PSNR@30K |
-|-------------|------------|-------------------|--------------|---------|
-| cuda-fused | **cuda** | **45.0** | **619** | **30.458** |
-| cuda-fused | **warp** | **46.3** | **620** | **30.326** |
-
-playroom: Warp KNN is ~**2.9% faster** (45.0 → 46.3 it/s), wall time nearly unchanged (+1 s). The playroom Gaussian distribution likely aligns better with Morton-curve locality, improving box-pruning efficiency.
-
-PSNR differences (~±0.1 dB) are within training noise; not attributable to KNN backend choice.
-
----
-
 ## Correctness
 
-> **Historical numeric snapshot pending refresh.** Current contract tests cover empty/singleton behavior and rejection of two- or three-point inputs. CUDA/Warp random-cloud and degenerate-distribution comparisons will be regenerated on the new GPU.
+On the current Train benchmark input, the initialization point cloud contains 182,686 points. Warp KNN and native simple-knn produced bitwise-identical squared distances for every point: maximum, mean, and relative differences were all zero.
 
-Warp KNN and simple-knn CUDA use the same algorithm (same Morton codes, same BOX_SIZE, same box-pruning logic). Outputs agree within floating-point precision on the same point cloud.
-
-The only potential source of difference: float32 `atomic_min/max` concurrent write ordering during box AABB computation can theoretically cause ULP-level differences in box boundaries, which could affect distance-sort tie breaks. No differences were observed in practice on random point clouds from 100K to 3M points.
+Current contract tests also cover empty and singleton inputs and explicitly reject unsupported two- and three-point inputs. Warp KNN follows the same Morton-code, box partition, pruning, and nearest-neighbor semantics as simple-knn. Float32 concurrent box-bound updates can theoretically affect boundary ties, so the measured Train result is reported as a workload-specific result rather than a universal bytewise-identity guarantee.

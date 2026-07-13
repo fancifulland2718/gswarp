@@ -13,10 +13,8 @@ This document covers technical details, implementation differences, performance 
 - [Differences from the CUDA Baseline](#differences-from-the-cuda-baseline)
 - [Python-Layer Overhead Optimization](#python-layer-overhead-optimization)
 - [Correctness](#correctness)
-- [Performance Characteristics (Early Benchmark)](#performance-characteristics-early-benchmark)
-- [Updated Benchmark (bench30k_plots, All-Warp Stack)](#updated-benchmark-bench30k_plots-all-warp-stack)
+- [Current Benchmark](#current-benchmark)
 - [Known Limitations](#known-limitations)
-- [Future Optimization Directions](#future-optimization-directions)
 
 ---
 
@@ -258,341 +256,79 @@ The current implementation reduces this cost through:
 - typed forward state instead of packing normal frontend state into opaque byte buffers
 - stream-owned workspace slots with bounded eviction and explicit cache reporting
 
-These mechanisms do not change the public return schema or the stable sorting policy. Their current-device performance effect is intentionally not stated here; the numeric sections below are historical until CUDA and Warp are rerun on the new GPU.
+These mechanisms do not change the public return schema or the stable sorting policy. Current end-to-end, controlled microbenchmark, and profiler results are reported in [Current Benchmark](#current-benchmark).
 
 ---
 
 ## Correctness
 
-> **Historical numeric snapshot pending refresh.** The values in this section were collected on the previous GPU and earlier code revisions. The current repository has contract tests for empty/all-culled scenes, gradients, retained graphs, stream ownership, and cache lifecycle, but CUDA and Warp numeric comparisons will be regenerated together on the new hardware.
+Current correctness evaluation uses complementary contract, component, and frozen-checkpoint checks:
 
-### Random Particle Correctness (256K–2048K)
+- public API regression tests cover empty and fully culled scenes, manual gradients, retained graphs, stream ownership, cache lifecycle, and CUDA-compatible call behavior
+- current component checks compare SSIM forward/backward values and KNN initialization against their native CUDA counterparts
+- frozen-checkpoint comparisons render identical cameras, Gaussians, and backgrounds through native CUDA and gswarp
 
-Numerical consistency between Native CUDA and Warp backends was verified at 256K–2048K random particle scales using the public API. Test configuration: `backward_mode="manual"`, `binning_sort_mode="warp_depth_stable_tile"`, `auto_tune=True`. Test platform: **NVIDIA RTX 5090D V2**, PyTorch 2.11.0+cu130, Warp 1.12.0.
+The current frozen checks cover Lego, Truck, and Train. Image MAE ranges from 1.79e-7 to 5.10e-7, inter-renderer PSNR ranges from 100.33 dB to 105.54 dB, and visibility is either identical or differs by two one-sided Train decisions across approximately 25.6 million Gaussian-view observations. Detailed values and interpretation are reported in [Current Benchmark](#current-benchmark).
 
-#### Forward: Rendered Color Difference
-
-| Scale | Resolution | Max abs error | Mean abs error |
-|------|--------|------------|------------|
-| 256K | 384×384 | 0.0108 | 4.01e-05 |
-| 512K | 512×512 | 0.0064 | 3.37e-05 |
-| 1024K | 640×640 | 0.0077 | 2.78e-05 |
-| 2048K | 800×800 | 0.0033 | 1.74e-05 |
-
-Max single-pixel error < 0.011 (value range [0,1]), with mean absolute error on the order of 1e-5. Error slightly decreases with increasing scale, indicating the differences arise from sparse outlier pixels rather than systematic bias. The two backends use different tile sorting implementations and floating-point accumulation orders, producing numerically small differences.
-
-#### Backward: Gradient Difference
-
-| Scale | Gradient field | Max abs error | Mean abs error |
-|------|----------|------------|------------|
-| 256K | `grad_means3D` | 35.78 | 0.00114 |
-| | `grad_shs` | 1.75 | 6.68e-05 |
-| | `grad_scales` | 152.56 | 0.00607 |
-| | `grad_rotations` | 12.11 | 3.95e-04 |
-| | `grad_opacities` | 2.38 | 1.56e-04 |
-| 1024K | `grad_means3D` | 89.53 | 5.63e-04 |
-| | `grad_shs` | 6.36 | 4.97e-05 |
-| | `grad_scales` | 1014.70 | 0.00324 |
-| | `grad_rotations` | 64.96 | 2.14e-04 |
-| | `grad_opacities` | 12.29 | 1.00e-04 |
-| 2048K | `grad_means3D` | 43.93 | 2.95e-04 |
-| | `grad_shs` | 3.68 | 2.21e-05 |
-| | `grad_scales` | 461.47 | 0.00173 |
-| | `grad_rotations` | 19.03 | 1.05e-04 |
-| | `grad_opacities` | 1.85 | 5.37e-05 |
-
-The large max absolute errors in backward gradients require context:
-- Gradient values span a very wide range (e.g. `grad_scales` can reach ±10⁴); max absolute errors occur only at a few extreme gradient points.
-- **Mean absolute errors** are tiny (`grad_means3D` < 0.0012, `grad_shs` < 7e-05), indicating the vast majority of per-point gradients are highly consistent.
-- As scale increases from 256K → 2048K, mean absolute errors consistently decrease (e.g. `grad_means3D` drops from 0.00114 to 0.00030), confirming differences arise from sparse outliers rather than systematic bias.
-- Differences stem from different tile sorting orders causing floating-point rounding divergence in alpha blending accumulation, plus non-deterministic ordering of atomic gradient writes.
-
-### End-to-End Training Quality (12 Datasets × 30K Iterations)
-
-> **Benchmark conditions**: The end-to-end training quality data below was collected in an earlier benchmark run: only the rasterizer used the Warp backend; SSIM used cuda-fused; KNN used CUDA simple-knn; Python-layer overhead optimizations had not yet been applied. For all-three-module results, see [Updated Benchmark](#updated-benchmark-bench30k_plots-all-warp-stack) below.
-
-The following data is based on the **default training parameters** from the original 3DGS repository (30,000 iterations), tested on 12 standard datasets. The test platform is **NVIDIA RTX 5090D V2** (24 GiB), PyTorch 2.11.0+cu130, Warp 1.12.0.
-
-**NeRF Synthetic (800×800):**
-
-| Dataset | | PSNR (dB) | SSIM | LPIPS |
-|---------|---|-----------|------|-------|
-| chair | Warp | 35.614 | 0.9871 | 0.0119 |
-| | CUDA | 35.854 | 0.9876 | 0.0116 |
-| drums | Warp | 26.083 | 0.9540 | 0.0371 |
-| | CUDA | 26.173 | 0.9548 | 0.0367 |
-| ficus | Warp | 34.827 | 0.9871 | 0.0119 |
-| | CUDA | 34.901 | 0.9873 | 0.0117 |
-| hotdog | Warp | 37.552 | 0.9849 | 0.0206 |
-| | CUDA | 37.624 | 0.9854 | 0.0200 |
-| lego | Warp | 35.758 | 0.9829 | 0.0154 |
-| | CUDA | 35.903 | 0.9832 | 0.0154 |
-| materials | Warp | 29.998 | 0.9609 | 0.0334 |
-| | CUDA | 30.102 | 0.9616 | 0.0329 |
-| mic | Warp | 35.596 | 0.9916 | 0.0061 |
-| | CUDA | 35.998 | 0.9922 | 0.0057 |
-| ship | Warp | 30.884 | 0.9057 | 0.1054 |
-| | CUDA | 31.062 | 0.9074 | 0.1057 |
-
-**Tanks & Temples / Deep Blending (native resolution per scene):**
-
-| Dataset | | PSNR (dB) | SSIM | LPIPS |
-|---------|---|-----------|------|-------|
-| train | Warp | 22.101 | 0.8183 | 0.1982 |
-| | CUDA | 22.060 | 0.8213 | 0.1962 |
-| truck | Warp | 25.372 | 0.8828 | 0.1445 |
-| | CUDA | 25.479 | 0.8850 | 0.1420 |
-| drjohnson | Warp | 29.383 | 0.9043 | 0.2372 |
-| | CUDA | 29.455 | 0.9053 | 0.2357 |
-| playroom | Warp | 30.150 | 0.9076 | 0.2414 |
-| | CUDA | 30.072 | 0.9091 | 0.2399 |
-
-In most scenes the PSNR gap between Warp and CUDA is within **-0.07 to -0.40 dB**, a negligible difference. Two scenes (train, playroom) show Warp PSNR slightly higher than CUDA. SSIM and LPIPS metrics are similarly close. This difference may come from warp-backend's lower convergence rate.
+Within this measured scope, the results do not indicate a rasterizer formula, public-contract, or systematic-coverage defect. FP32 atomic and reduction order can still produce small residuals and different long-horizon training trajectories; bytewise identity is not the correctness criterion.
 
 ---
 
-## Performance Characteristics (Early Benchmark)
+## Current Benchmark
 
-> **Historical benchmark.** This section is retained for provenance and must not be treated as a current performance claim.
+The current end-to-end matrix is maintained in the [project README](../README.md#benchmarks). It was regenerated with 30K iterations on an RTX 5090 (32 GiB, sm_120), Python 3.14.3, PyTorch 2.11.0+cu130, and Warp 1.12.0. It covers eight NeRF Synthetic scenes, two Tanks and Temples scenes, and two Deep Blending scenes.
 
+### Provenance and Measurement Rules
 
-> **Benchmark conditions**: Data in this section was collected in an earlier benchmark run: only the rasterizer used the Warp backend; SSIM used cuda-fused (not Warp SSIM); KNN used CUDA simple-knn (not Warp KNN); Python-layer overhead optimizations had not yet been applied. For all-three-module Warp results, see [Updated Benchmark](#updated-benchmark-bench30k_plots-all-warp-stack) below.
+The CUDA and Warp packages must be deliberately isolated during a comparison:
 
-### End-to-End Training Performance (12 Datasets × 30K Iterations)
+1. Build the current gswarp source into a dedicated install target and verify the installed source hash.
+2. Expose the native `diff_gaussian_rasterization` extension through a package root containing only that package, so it cannot pull in an unrelated installed gswarp.
+3. Assert the CUDA rasterizer resolves to the native extension and the Warp rasterizer resolves to the dedicated gswarp target before accepting a result.
+4. Record the resolved module and native-extension paths with each run, then evaluate independently trained checkpoints with the original 3DGS render and metrics workflow through the same native CUDA renderer.
 
-The following data was tested on **NVIDIA RTX 5090D V2** (24 GiB, sm_120), **PyTorch 2.11.0+cu130**, **Warp 1.12.0**, using the default training parameters from the original 3DGS repository.
+Both backends use default 3DGS optimization settings, CPU data loading, default Adam, and 30K iterations. Warp selects the gswarp rasterizer, fused SSIM, and KNN. Depth accumulation is disabled only for Warp because the reference loss does not consume depth. Wall time includes final evaluation and checkpoint saving; phase results use CUDA events over iterations 25,000-29,999.
 
-#### Training Speed and Total Training Time
+### Stable Training Phases
 
-| Dataset | | Avg FPS (30K) | Total Time (s) | Peak Mem (MB) |
-|---------|---|-------:|--------:|--------:|
-| chair | CUDA | 139.6 | 215 | 609 |
-| | Stable Tile | 125.5 | 239 | 567 |
-| | Radix | 111.3 | 270 | 566 |
-| | Torch Sort | 117.9 | 255 | 565 |
-| drums | CUDA | 160.9 | 186 | 648 |
-| | Stable Tile | 128.2 | 234 | 607 |
-| | Radix | 120.1 | 250 | 609 |
-| | Torch Sort | 118.4 | 253 | 620 |
-| ficus | CUDA | 214.7 | 140 | 394 |
-| | Stable Tile | 152.9 | 196 | 386 |
-| | Radix | 145.7 | 206 | 387 |
-| | Torch Sort | 147.1 | 204 | 385 |
-| hotdog | CUDA | 124.3 | 241 | 427 |
-| | Stable Tile | 156.1 | 192 | 344 |
-| | Radix | 139.4 | 215 | 345 |
-| | Torch Sort | 141.1 | 213 | 348 |
-| lego | CUDA | 151.6 | 198 | 640 |
-| | Stable Tile | 144.1 | 208 | 565 |
-| | Radix | 130.1 | 231 | 560 |
-| | Torch Sort | 133.2 | 225 | 567 |
-| materials | CUDA | 169.5 | 177 | 512 |
-| | Stable Tile | 162.6 | 184 | 468 |
-| | Radix | 145.2 | 207 | 464 |
-| | Torch Sort | 144.1 | 208 | 467 |
-| mic | CUDA | 154.1 | 195 | 603 |
-| | Stable Tile | 116.7 | 257 | 561 |
-| | Radix | 112.7 | 266 | 568 |
-| | Torch Sort | 110.5 | 271 | 566 |
-| ship | CUDA | 83.8 | 358 | 801 |
-| | Stable Tile | 121.7 | 247 | 642 |
-| | Radix | 120.1 | 250 | 645 |
-| | Torch Sort | 121.3 | 247 | 642 |
-| train | CUDA | 66.5 | 451 | 1,888 |
-| | Stable Tile | 73.6 | 408 | 1,869 |
-| | Radix | 71.6 | 419 | 1,870 |
-| | Torch Sort | 72.7 | 413 | 1,874 |
-| truck | CUDA | 62.9 | 477 | 3,353 |
-| | Stable Tile | 60.6 | 495 | 3,597 |
-| | Radix | 59.3 | 506 | 3,596 |
-| | Torch Sort | 61.7 | 486 | 3,614 |
-| drjohnson | CUDA | 32.9 | 913 | 5,254 |
-| | Stable Tile | 51.2 | 586 | 5,305 |
-| | Radix | 48.8 | 615 | 5,304 |
-| | Torch Sort | 49.4 | 607 | 5,323 |
-| playroom | CUDA | 41.9 | 716 | 3,126 |
-| | Stable Tile | 70.2 | 427 | 3,219 |
-| | Radix | 67.3 | 446 | 3,229 |
-| | Torch Sort | 65.2 | 460 | 3,229 |
+| Scene | Backend | Render ms | Loss ms | Backward ms | Densify ms | Optimizer ms |
+|-------|---------|----------:|--------:|------------:|-----------:|-------------:|
+| Lego | CUDA | 1.789 | 0.503 | 3.509 | 0.001 | 1.130 |
+| Lego | Warp | 1.608 | 0.562 | 3.734 | 0.002 | 1.127 |
+| Train | CUDA | 3.916 | 0.582 | 9.358 | 0.002 | 3.252 |
+| Train | Warp | 3.134 | 0.637 | 7.630 | 0.001 | 3.236 |
+| Truck | CUDA | 4.347 | 0.579 | 9.471 | 0.001 | 5.548 |
+| Truck | Warp | 4.099 | 0.668 | 8.578 | 0.001 | 5.629 |
+| DrJohnson | CUDA | 6.356 | 0.683 | 20.112 | 0.001 | 8.472 |
+| DrJohnson | Warp | 5.143 | 0.749 | 10.278 | 0.001 | 8.458 |
 
-**Key findings:**
-- NeRF Synthetic (small scenes, ~150K–350K Gaussians): CUDA is generally faster. Among the three Warp sort backends, **Stable Tile** is the fastest overall, followed by Torch Sort and Radix.
-- Tanks & Temples / Deep Blending (large scenes, ~1M–3.1M Gaussians): **All three Warp backends clearly outperform CUDA** — e.g. drjohnson: Stable Tile 1.56×, Radix 1.49×, Torch Sort 1.50×; playroom: Stable Tile 1.68×, Radix 1.61×, Torch Sort 1.56×.
-- The three Warp sort backends (Stable Tile, Radix, Torch Sort) show very similar performance: the maximum speed difference among them is typically within 10–15%. **Stable Tile (default) is recommended** as it delivers the best overall throughput.
-- Memory usage: all backends are at the same order of magnitude; Warp variants have lower peak memory on most NeRF Synthetic scenes.
+These four rows show the range hidden by the suite aggregate. On Lego, Warp reduces render by 10.1%, but its loss and backward work are higher; the complete job is 3.5% faster. On Train, Warp reduces render by 20.0% and backward by 18.5%, producing a 17.2% lower wall time. On Truck, Warp reduces render by 5.7% and backward by 9.4%, but its SSIM loss step is higher; wall time is 8.7% lower. On DrJohnson, render is 19.1% lower and backward is 48.9% lower, producing 29.0% lower wall time. Results are deliberately reported as mixed end-to-end outcomes rather than attributed to a single rasterizer kernel.
 
-#### Training Curves
+### Current Controlled Microbenchmarks
 
-The following figure shows the iteration speed (FPS), total loss (log), peak GPU memory, and Gaussian count over 30K training iterations for all 12 datasets across CUDA (blue), Stable Tile (red), Radix (green), and Torch Sort (purple):
+The following measurements use the installed package artifact on the current RTX 5090, not a checkout import. They are controlled kernel-stack measurements and must not be read as complete training throughput.
 
-![Sort Backend Training Overview](../figures/warp%20rasterizer/sort_backend_overview.png)
+| Workload | Native CUDA GPU median | Warp GPU median | CUDA host median | Warp host median |
+|----------|----------------------:|----------------:|----------------:|----------------:|
+| 300K Gaussians, 800x800, SH degree 3, raster backward | 3.809 ms | 1.638 ms | 0.274 ms | 0.530 ms |
 
-### Micro-Benchmarks (Random Particles)
+The synthetic view has 36,842 visible Gaussians. It uses 20 warmups and 100 measured repetitions, with GPU time from CUDA events. The lower Warp GPU time in this deliberately isolated backward workload does not imply lower total Python-side dispatch overhead; its host median is higher. Separate Warp full forward-plus-backward runs with precomputed RGB measured 2.215 ms and 85.8 MiB at 256K Gaussians and 384x384, and 4.733 ms and 345.5 MiB at 1024K Gaussians and 640x640. Repeated-output maximum absolute differences were 5.59e-9 and 5.96e-8 respectively.
 
-The following data comes from random-particle tests. The test platform is **NVIDIA GeForce RTX 5090D** (sm_120, 24 GiB, 170 SMs), **Warp 1.12.0**, and **PyTorch 2.11.0+cu130**.
+### Current Nsight Evidence
 
-Methodology:
+Nsight Systems 2026.1.2 CUDA and NVTX traces and Nsight Compute 2026.1 profiling were collected on the RTX 5090. The traced workload is 300K Gaussians, 800x800, SH degree 3, with the same 36,842 visible Gaussians as the controlled benchmark. Trace kernel durations are used for workload structure only; CUDA-event medians above remain the latency reference because profiler replay and tracing perturb timing.
 
-- **Steady-state runtime**: measured via the public API (`diff_gaussian_rasterization.GaussianRasterizer` and `diff_gaussian_rasterization.warp.GaussianRasterizer`) with dedicated warmup runs first, then a batched CUDA-event timing pass over the measured iterations; the main table reports the mean over the measured runs.
-- **Peak memory**: after warmup, `reset_peak_memory_stats` is called before running a full stage, and the absolute peak `max_memory_allocated` is recorded. Forward peak includes forward only; backward peak includes the full forward+backward flow.
-- **Stage timing / stage memory**: used only for hotspot analysis, measured diagnostically with internal `_warp_backend` helper functions; these stage-wise values are **not guaranteed** to sum strictly to public-API end-to-end time or peak memory item by item.
+For Warp, the backward tile renderer accounts for 57.4% of traced kernel time, with a 1.069 ms mean per traced launch; the tiled forward renderer is 11.2%, at 0.209 ms. Eight radix-sort dispatches occur per repeat, and individual radix-sort launches average 14.0 microseconds. For native CUDA, the primary backward render kernel accounts for 73.8% of traced kernel time, at 3.339 ms per traced launch; forward render is 7.2%, at 0.327 ms. Its sort launches average 49.4 microseconds, with six sort passes per repeat.
 
-For the 256K / 512K / 1024K / 2048K cases, the evaluation uses **4+8 / 3+6 / 3+6 / 2+4** (warmup count + measured count), respectively.
+Nsight Compute reports no local or shared-memory spilling in the Warp backward tile kernel. It reports 50.0% theoretical occupancy, 31.14% achieved occupancy, 29.23% issue-slot utilization, 96.91% L2 hit rate, 43.38% L1 hit rate, and 0.8% DRAM-throughput utilization. The launch has 4.9 waves per SM, for which the report estimates a tail effect near 20%. For this measured workload, occupancy, issue efficiency, and work distribution are more relevant than DRAM bandwidth. These values characterize one RTX 5090 workload and are not a cross-device performance claim.
 
-### Public API Steady-State Runtime
+### Numerical Interpretation
 
-| Points | Resolution | `num_rendered` | Native FW | Warp FW | FW ratio | Native BW | Warp BW | BW ratio |
-|------|--------|----------------|----------|-----------|----------|----------|-----------|----------|
-| 262,144 | 384×384 | 265,106 | 0.315 ms | 0.999 ms | 3.17× | 1.772 ms | 1.012 ms | 0.57× |
-| 524,288 | 512×512 | 874,049 | 0.461 ms | 1.101 ms | 2.39× | 3.252 ms | 1.632 ms | 0.50× |
-| 1,048,576 | 640×640 | 2,556,549 | 0.857 ms | 1.594 ms | 1.86× | 5.363 ms | 2.464 ms | 0.46× |
-| 2,097,152 | 800×800 | 7,644,361 | 2.695 ms | 2.697 ms | 1.00× | 8.839 ms | 4.418 ms | 0.50× |
+The README reports independent-training quality and frozen-checkpoint CUDA/Warp comparison separately because they answer different questions. Independent 30K runs measure the outcome of the complete training stack. Frozen checkpoints isolate rasterization by supplying identical camera, Gaussian, and background inputs to both renderers.
 
-At the 256K–2048K scale, Warp forward is still slower than native (1.00×–3.17×) due to Python-level orchestration overhead (tensor allocation, kernel launch, inter-stage data passing), but the gap narrows rapidly as particle count grows and GPU compute dominates—at 2048K the forward ratio reaches **1.00×** (parity with native). **On the backward side, Warp is faster than native at all scales** (ratio 0.46×–0.57×), thanks to the computational efficiency of the `_backward_render_tiles_warp32` kernel's warp shuffle (block_dim=32) fast path at large `num_rendered` volumes.
+Across Lego, Truck, and Train, the frozen-checkpoint image MAE is between 1.79e-7 and 5.10e-7, and inter-renderer PSNR is between 100.33 dB and 105.54 dB. Lego and Truck have identical visible sets. Train has a visibility Jaccard score of 0.99999992, corresponding to two one-sided decisions across approximately 25.6 million Gaussian-view observations; both outputs have the same 20.955083 dB global PSNR against ground truth to the shown precision. Atomic accumulation order leaves small pixel residuals, so bytewise identity is neither expected nor required.
 
-### Public API Peak Memory
-
-| Points | Resolution | Native FW peak | Native BW peak | Warp FW peak | Warp BW peak |
-|------|--------|------------|------------|-------------|-------------|
-| 262,144 | 384×384 | 128.61 MiB | 205.67 MiB | 145.63 MiB | 336.08 MiB |
-| 524,288 | 512×512 | 274.00 MiB | 427.51 MiB | 285.69 MiB | 662.50 MiB |
-| 1,048,576 | 640×640 | 587.75 MiB | 891.75 MiB | 570.97 MiB | 1324.02 MiB |
-| 2,097,152 | 800×800 | 1300.70 MiB | 1910.72 MiB | 1149.20 MiB | 2645.05 MiB |
-
-> **Note**: These are absolute peak values (`max_memory_allocated`), including input tensors, model parameters, forward intermediates, and autograd saved tensors. Backward peak includes the full forward+backward flow.
-
-Warp forward peak is about 1.13× higher than native at 256K, but from 1024K onward, Warp forward peak (571 MiB) is actually **lower** than native (588 MiB); at 2048K it is 0.88× of native. Backward peak for Warp is about 1.4×–1.6× of native (2645 vs 1911 MiB at 2048K), mainly due to Warp's additional intermediate tensors (depth, alpha, projected coordinates, per-pixel weights, etc.).
-
-### Internal Stage Hotspots
-
-| Points | Resolution | Preprocess | Binning | Render | Backward Render | Selected Sort Mode |
-|------|--------|--------|------|------|----------|--------------|
-| 262,144 | 384×384 | 0.335 ms | 0.495 ms | 0.221 ms | 0.386 ms | `warp_depth_stable_tile` |
-| 524,288 | 512×512 | 0.390 ms | 0.492 ms | 0.248 ms | 0.430 ms | `warp_depth_stable_tile` |
-| 1,048,576 | 640×640 | 0.580 ms | 0.583 ms | 0.249 ms | 0.561 ms | `warp_depth_stable_tile` |
-| 2,097,152 | 800×800 | 0.944 ms | 1.275 ms | 0.323 ms | 0.790 ms | `warp_depth_stable_tile` |
-
-### Internal Stage Cumulative Peak Memory (diagnostic only)
-
-| Points | Resolution | After preprocess | After preprocess+binning | After full forward | After forward+backward |
-|------|--------|-------------|-----------------|-------------|-------------------|
-| 262,144 | 384×384 | 134.76 MiB | 137.76 MiB | 138.76 MiB | 136.07 MiB |
-| 524,288 | 512×512 | 264.67 MiB | 271.01 MiB | 270.83 MiB | 266.01 MiB |
-| 1,048,576 | 640×640 | 529.08 MiB | 541.08 MiB | 540.08 MiB | 526.71 MiB |
-| 2,097,152 | 800×800 | 1053.43 MiB | 1076.07 MiB | 1076.07 MiB | 1052.18 MiB |
-
-> **Note**: Each column is the absolute peak from `empty_cache()` through completion of that stage. Due to temporary tensor release and reuse between stages, "after forward+backward" may be slightly lower than "after full forward".
-
-Looking at the internal stages, preprocess and binning grow near-linearly with particle count and are the scalability bottleneck; render and backward render remain under 1 ms even at 2048K, indicating good pure-GPU-compute efficiency in the Warp tile kernels. Preprocess is the main memory consumer (1053 MiB peak after preprocess at 2048K); binning adds only about 23 MiB on top (at 2048K), and render adds virtually no extra peak.
-
-### Kernel-Level Profiling (Nsight Systems)
-
-> **Note**: This GPU SKU (RTX 5090D V2) does not support Nsight Compute hardware performance counter collection (`ERR_NVGPU`). The following data was captured via **Nsight Systems 2025.6** timeline tracing at **256K@384×384** and **1024K@640×640** scales. Each run: 5 warmup + 3 NVTX-annotated profiled iterations (forward+backward), sort mode `warp_depth_stable_tile`.
-
-#### Per-Iteration End-to-End Breakdown (NVTX)
-
-| Scale | Forward (NVTX) | Backward (NVTX) | Iteration total |
-|------|------------|------------|-----------|
-| 256K@384×384 | 1.42 ms | 1.37 ms | 2.79 ms |
-| 1024K@640×640 | 2.84 ms | 1.36 ms | 4.20 ms |
-
-#### Kernel Hotspots by GPU Time
-
-The table below lists per-iteration average GPU time for each kernel across the full pipeline (forward + backward) at 256K and 1024K scales, based on nsys timeline statistics (per-instance mean over 8 iterations).
-
-| Kernel | Calls/iter | 256K avg time | 1024K avg time | Pipeline stage |
-|--------|---------|-------------|--------------|----------|
-| `_backward_render_tiles_warp32` | 1 | 230.0 µs | 423.2 µs | Backward Render |
-| `_render_tiles_fast_warp` | 1 | 93.6 µs | 127.7 µs | Forward Render |
-| `_backward_rgb_from_sh_v3` | 1 | 59.4 µs | 408.5 µs | Backward Preprocess |
-| `_forward_rgb_from_sh_v3` | 1 | 48.6 µs | 227.9 µs | Forward Preprocess (SH→RGB) |
-| CUB `DeviceRadixSort` (Onesweep) | 8 | 7.4 µs × 8 | 12.5 µs × 8 | Binning (sort) |
-| `_duplicate_with_keys_from_order` | 1 | 34.7 µs | 129.9 µs | Binning (overlap expansion) |
-| `_fused_project_cov3d_cov2d_preprocess_sr` | 1 | 25.2 µs | 131.2 µs | Forward Preprocess (proj+cov) |
-| `_fused_backward_preprocess_accumulate` | 1 | 24.2 µs | 102.3 µs | Backward Preprocess |
-| PyTorch `elementwise_copy` | ~3 | 41.5 µs × 3 | 366.5 µs × 3 | PyTorch tensor copy |
-| PyTorch `fill` / `zero_` | ~10 | 3.6 µs × 10 | 18.8 µs × 10 | PyTorch initialization |
-| `_identify_tile_ranges` | 1 | 1.4 µs | 6.9 µs | Binning |
-| `_gather_i32_by_index` | 1 | 1.7 µs | 5.9 µs | Binning |
-
-#### CPU vs GPU Overhead Breakdown
-
-| Metric | 256K@384×384 | 1024K@640×640 |
-|------|-------------|--------------|
-| Wall-clock per iteration | 2.79 ms | 4.20 ms |
-| Warp kernel GPU time | 578 µs (20.7%) | 1,664 µs (39.6%) |
-| PyTorch kernel GPU time | 186 µs (6.7%) | 1,383 µs (32.9%) |
-| **GPU total** | **764 µs (27.4%)** | **3,047 µs (72.5%)** |
-| **CPU overhead (remainder)** | **2,026 µs (72.6%)** | **1,153 µs (27.5%)** |
-
-CPU overhead breakdown (from nsys CUDA API Summary):
-
-| CUDA API call | Calls per iter (approx.) | Median latency | Per-iter total |
-|---------------|---------------------|---------|-----------|
-| `cudaLaunchKernel` (PyTorch side) | ~38 | 5.8 µs | ~220 µs |
-| `cuLaunchKernel` (Warp side) | ~9 | 15.4 µs | ~139 µs |
-| `cudaMemsetAsync` | ~15 | 4.6 µs | ~69 µs |
-| `cudaMemcpyAsync` | ~4 | 18.8 µs | ~75 µs |
-| `cudaMallocAsync` | ~5 | 4.3 µs | ~22 µs |
-| `cudaFreeAsync` | ~6 | 2.3 µs | ~14 µs |
-| **CUDA API total** | | | **~539 µs** |
-| **Python/Warp runtime (tensor creation, attribute lookup, dispatch)** | | | **~1,487 µs** |
-
-#### Key Analysis
-
-1. **CPU overhead is approximately constant**: whether at 256K or 1024K, CPU-side overhead is about 1.2–2.0 ms/iteration. At 256K, CPU accounts for 73%; at 1024K it drops to 28%. At 2048K, GPU compute grows further, reducing the CPU ratio even more—explaining why the 2048K forward ratio reaches 1.00×.
-2. **Backward render is the largest GPU hotspot**: `_backward_render_tiles_warp32` (block_dim=32, warp shuffle fast path) takes 230 µs at 256K and 423 µs at 1024K, accounting for 25%–40% of Warp kernel GPU time.
-3. **SH color computation scales linearly with N**: `_forward_rgb_from_sh_v3` + `_backward_rgb_from_sh_v3` total 636 µs at 1024K, making them the second largest hotspot after backward render. At SH degree=3, each point requires 16 coefficients × 3 channels of read/write bandwidth.
-4. **PyTorch `elementwise_copy` grows sharply with data size**: 42 µs at 256K, 367 µs at 1024K per call. These are PyTorch autograd tensor copy/type-conversion operations (not Warp kernels), accounting for 33% of GPU time at 1024K.
-5. **Actual CUDA API calls account for only ~26% of CPU overhead** (539 µs / 2026 µs at 256K). The remaining ~74% is pure-CPU work under the Python GIL: object creation, Warp runtime dispatch, PyTorch autograd graph construction. This is an inherent cost of the Warp-on-Python architecture, only mitigable via CUDA Graphs or reducing the number of pipeline stages.
-
----
-
-## Updated Benchmark (bench30k\_plots, All-Warp Stack)
-
-> **Historical benchmark pending replacement.** CUDA and Warp must both be rerun on the new GPU before this section is considered current.
-
-> **Benchmark conditions**: Rasterizer, SSIM, and KNN all use Warp backends; Python-layer
-> overhead optimizations applied; 12 datasets × 30K iterations. See [SSIM docs](ssim.md#end-to-end-training-impact)
-> and [KNN docs](knn.md#end-to-end-training-impact) for per-module contributions.Attention, the result differs a lot from all-warp version as different test scripts were used.
-
-**Platform**: NVIDIA RTX 5090D V2 (24 GiB, sm_120), PyTorch 2.11.0+cu130, Warp 1.12.0.
-Default 3DGS training hyperparameters.
-
-### Training Throughput and Total Time
-
-| Dataset | Scene type | CUDA (it/s) | Warp (it/s) | Speedup | CUDA time | Warp time | Final Gaussians |
-|---------|-----------|------------|------------|---------|-----------|-----------|----------------|
-| chair | NeRF Synthetic | 103.6 | 113.1 | ×1.09 | 4.7 min | 4.3 min | ~300K |
-| drums | NeRF Synthetic | 103.0 | 115.3 | ×1.12 | 4.6 min | 4.2 min | ~330K |
-| ficus | NeRF Synthetic | 139.5 | 148.2 | ×1.06 | 3.5 min | 3.3 min | ~190K |
-| hotdog | NeRF Synthetic | 144.5 | 156.5 | ×1.08 | 3.6 min | 3.2 min | ~170K |
-| lego | NeRF Synthetic | 117.5 | 126.5 | ×1.08 | 4.2 min | 3.9 min | ~300K |
-| materials | NeRF Synthetic | 134.0 | 144.9 | ×1.08 | 3.7 min | 3.4 min | ~240K |
-| mic | NeRF Synthetic | 95.4 | 105.1 | ×1.10 | 4.9 min | 4.5 min | ~300K |
-| ship | NeRF Synthetic | 107.0 | 113.2 | ×1.06 | 4.5 min | 4.2 min | ~350K |
-| train | Tanks&Temples | 55.6 | 58.3 | ×1.05 | 8.7 min | 8.2 min | ~1.1M |
-| truck | Tanks&Temples | 39.4 | 40.1 | ×1.02 | 11.7 min | 11.3 min | ~2.1M |
-| drjohnson | Deep Blending | 30.8 | 32.0 | ×1.04 | 14.3 min | 13.8 min | ~3.1M |
-| playroom | Deep Blending | 46.9 | 47.5 | ×1.01 | 9.9 min | 9.7 min | ~1.9M |
-
-**Summary**:
-- NeRF Synthetic (small scenes, 150K–350K Gaussians): Warp averages **~8% faster**, driven by backward-render warp shuffle reduction and compact AABB binning.
-- Large scenes (1M–3.1M Gaussians): speedup narrows to 1–5%; Adam optimizer becomes the bottleneck and Warp's render/backward gains contribute proportionally less.
-
-### Per-Phase Timing Breakdown (last 5K iter average, ms)
-
-| Phase | chair CUDA | chair Warp | drjohnson CUDA | drjohnson Warp |
-|-------|-----------|-----------|---------------|---------------|
-| render | 1.85 | 1.63 | 6.11 | 5.79 |
-| loss (SSIM+L1) | 0.29 | 0.35 | 0.31 | 0.38 |
-| backward | 4.88 | 4.27 | 11.21 | 10.60 |
-| densify | 0.48 | 0.44 | 1.48 | 1.44 |
-| optim | 0.98 | 0.98 | 8.24 | 8.14 |
-
-Render and backward are the phases with the largest Warp advantage. The optimizer (Adam) is
-controlled by PyTorch and is near-identical for both backends. The loss phase is slightly slower
-with Warp SSIM at some resolutions — see [SSIM docs](ssim.md) for details.
+This evidence does not indicate a rasterizer formula, public-contract, or systematic-coverage defect in the measured scope. In particular, the frozen Train result does not reproduce the -0.2677 dB difference between independently trained checkpoints. Controlled component checks also found bitwise-identical KNN initialization distances on Train, while CUDA fused SSIM and Warp SSIM have small FP32 gradient differences despite matching formula and padding semantics. The observed 30K difference is therefore consistent with numerical trajectory sensitivity in non-convex optimization and densification, not with a frozen-renderer quality loss. See the [SSIM documentation](ssim.md) for the controlled numerical and training-path measurements.
 
 ---
 
@@ -626,12 +362,6 @@ Reusable workspaces are bounded by device and stream count, and launch caches ha
 
 ### 6. Advanced Warp Backends
 
-The resolver can gate optional implementations by Warp version and required public capabilities. The current advanced modules are placeholders and are not executable; automatic selection therefore uses the stable backend.
+The resolver can gate optional implementations by Warp version and required public capabilities. No optional high-version backend is currently distributed, so automatic selection uses the stable backend.
 
 ---
-
-## Future Optimization Directions
-
-Optimization priorities will be rewritten only after paired CUDA/Warp profiling on the new GPU. The next benchmark must separate full-training and full-inference lifecycle time from individual kernel duration, and must report fixed host overhead, synchronization, allocation, and retained-cache behavior.
-
-Support for additional Gaussian methods and any executable advanced-Warp backend will be designed in separate plans. The current baseline keeps the stage executor and capability gate ready without adding an external plugin API or unvalidated backend placeholders.

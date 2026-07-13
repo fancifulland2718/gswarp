@@ -19,8 +19,7 @@ gswarp is a pure-Python **NVIDIA Warp** backend for 3D Gaussian Splatting, reimp
   - [SSIM](#ssim)
   - [KNN](#knn)
   - [Recommended: Replace All at Once](#recommended-replace-all-at-once)
-- [Performance](#performance)
-- [Quality Metrics](#quality-metrics)
+- [Benchmarks](#benchmarks)
 - [Detailed Documentation](#detailed-documentation)
 - [Acknowledgements](#acknowledgements)
 
@@ -260,62 +259,80 @@ Then switch backends at each usage site using the `GSWARP_AVAILABLE` flag. A ref
 
 ---
 
-## Performance
+## Benchmarks
 
-> **Historical results pending refresh.** The tables below describe an earlier code snapshot and the previous GPU. They are retained for provenance, not as a performance claim for the current release. CUDA and Warp will be rerun on the new GPU before these figures are replaced.
+The current package artifact was retested from a locally built installation, not from a checkout import. The CUDA reference was the native `diff_gaussian_rasterization` extension; gswarp was installed into a separate target directory and its source hash was checked before training. This prevents either package from shadowing the other through `PYTHONPATH`.
 
-Results from full 30K-step training on 12 standard 3DGS datasets. Hardware: RTX 5090D V2 (sm_120, 24 GiB), Python 3.14, PyTorch 2.11.0+cu130, Warp 1.12.0. **All three modules use the Warp backend**, with Python-layer overhead optimizations applied.
+**Environment.** NVIDIA GeForce RTX 5090 (32 GiB, sm_120), NVIDIA driver 610.62, Python 3.14.3, PyTorch 2.11.0+cu130, Warp 1.12.0, and gswarp 1.0.5 built from the current working tree. All runs use original 3DGS default optimization settings, `--data_device cpu`, default Adam, and 30,000 iterations. The Warp run selects the gswarp rasterizer, fused SSIM, and KNN; depth accumulation is disabled because this reference training loss does not consume depth.
 
-| Dataset | CUDA (it/s) | Warp (it/s) | Speedup |
-|---------|------------|------------|---------|
-| chair | 103.6 | 113.1 | ×1.09 |
-| drums | 103.0 | 115.3 | ×1.12 |
-| ficus | 139.5 | 148.2 | ×1.06 |
-| hotdog | 144.5 | 156.5 | ×1.08 |
-| lego | 117.5 | 126.5 | ×1.08 |
-| materials | 134.0 | 144.9 | ×1.08 |
-| mic | 95.4 | 105.1 | ×1.10 |
-| ship | 107.0 | 113.2 | ×1.06 |
-| train | 55.6 | 58.3 | ×1.05 |
-| truck | 39.4 | 40.1 | ×1.02 |
-| drjohnson | 30.8 | 32.0 | ×1.04 |
-| playroom | 46.9 | 47.5 | ×1.01 |
+The current matrix covers all three standard evaluation families: eight NeRF Synthetic scenes, two Tanks and Temples scenes, and two Deep Blending scenes. This is a completed 12-scene, 30K-iteration suite rather than a representative subset.
 
-**NeRF Synthetic (8 scenes)**: average ×1.08 speedup. **Tanks & Temples / Deep Blending (4 large scenes)**: average ×1.03 speedup. The smaller gains on large scenes (drjohnson, playroom) are explained by the higher Gaussian counts diluting the rasterizer kernel advantage — see the [rasterizer documentation](docs/rasterizer.md) for a per-phase breakdown.
+### End-to-End Training
 
----
+Wall throughput includes the complete training loop, final evaluation, and checkpoint saving. Stable GPU throughput is derived from CUDA events over iterations 25,000-29,999, excluding final evaluation and saving. Peak memory is PyTorch peak allocated memory after the training script resets its counter.
 
-## Quality Metrics
+| Scene | Family | CUDA min | Warp min | Wall ratio | CUDA stable it/s | Warp stable it/s | CUDA/Warp final Gaussians | CUDA/Warp peak MiB |
+|-------|--------|---------:|---------:|-----------:|----------------:|----------------:|--------------------------:|-------------------:|
+| chair | NeRF Synthetic | 6.95 | 6.69 | 1.04x | 73.33 | 73.32 | 298,936 / 297,746 | 616 / 778 |
+| drums | NeRF Synthetic | 6.58 | 6.61 | 1.00x | 77.61 | 74.90 | 319,786 / 319,116 | 649 / 797 |
+| ficus | NeRF Synthetic | 5.60 | 5.93 | 0.95x | 90.87 | 84.89 | 177,831 / 177,639 | 401 / 563 |
+| hotdog | NeRF Synthetic | 7.40 | 6.02 | 1.23x | 73.45 | 83.88 | 157,488 / 157,839 | 433 / 529 |
+| lego | NeRF Synthetic | 6.78 | 6.54 | 1.04x | 76.70 | 75.82 | 298,102 / 299,285 | 648 / 770 |
+| materials | NeRF Synthetic | 6.27 | 6.07 | 1.03x | 82.93 | 82.57 | 238,715 / 236,993 | 520 / 670 |
+| mic | NeRF Synthetic | 6.58 | 6.92 | 0.95x | 76.49 | 70.99 | 277,299 / 276,471 | 606 / 730 |
+| ship | NeRF Synthetic | 9.31 | 6.80 | 1.37x | 61.01 | 73.29 | 309,749 / 310,845 | 811 / 789 |
+| train | Tanks and Temples | 11.22 | 9.29 | 1.21x | 44.88 | 50.35 | 1,094,613 / 1,089,398 | 1,902 / 2,108 |
+| truck | Tanks and Temples | 12.47 | 11.38 | 1.10x | 39.89 | 41.49 | 2,051,896 / 2,052,183 | 3,351 / 3,696 |
+| drjohnson | Deep Blending | 23.34 | 16.58 | 1.41x | 21.34 | 27.93 | 3,109,310 / 3,109,155 | 5,270 / 5,639 |
+| playroom | Deep Blending | 18.31 | 20.38 | 0.90x | 28.12 | 37.85 | 1,842,952 / 1,842,580 | 3,149 / 3,474 |
 
-> **Historical results pending refresh.** These values were produced by the same earlier benchmark campaign. Current correctness gates cover public contracts and deterministic micro-scenes, but end-to-end CUDA/Warp quality must be regenerated on the new hardware before release claims are updated.
+Across the complete suite, CUDA takes 120.81 minutes and all-Warp takes 109.23 minutes, a 1.106x wall-clock ratio. This is a suite aggregate, not an arithmetic mean of per-scene ratios. Warp is faster in 8 of 12 complete jobs and in 6 of 12 stable iteration windows. Training peak allocated memory is usually higher on Warp; this is a measured tradeoff, not a memory-reduction claim. The [rasterizer documentation](docs/rasterizer.md) reports phase splits and current Nsight evidence.
 
-Test-set evaluation after 30K training steps:
+### Warm Inference
 
-**NeRF Synthetic (8-scene average)**
+For a frozen Warp-trained 30K checkpoint, three warmed full-test-view passes were measured and the median CUDA-event time is reported. Each pass warms 100 views first. This is the actual integration configuration, including depth disabled on Warp when the caller does not consume it.
 
-| Metric | CUDA | Warp | Δ |
-|--------|------|------|---|
-| PSNR (dB) | 33.31 | 33.33 | +0.02 |
-| SSIM | 0.9692 | 0.9693 | +0.0001 |
-| LPIPS | 0.0303 | 0.0302 | −0.0001 |
+| Scene | Backend | GPU ms/view | Warp/CUDA ratio | Peak allocated |
+|-------|---------|------------:|----------------:|---------------:|
+| Lego | CUDA | 1.8224 | 1.00x | 290 MiB |
+| Lego | Warp | 1.6382 | 1.11x | 206 MiB |
+| Truck | CUDA | 4.2975 | 1.00x | 1,317 MiB |
+| Truck | Warp | 4.0478 | 1.06x | 1,207 MiB |
 
-**Tanks & Temples (2-scene average)**
+### Independent Training Quality
 
-| Metric | CUDA | Warp | Δ |
-|--------|------|------|---|
-| PSNR (dB) | 23.74 | 23.79 | +0.04 |
-| SSIM | 0.8512 | 0.8515 | +0.0003 |
-| LPIPS | 0.1711 | 0.1707 | −0.0004 |
+The following test-image metrics come from the original 3DGS `render.py` and `metrics.py` workflow after separately training CUDA and all-Warp configurations for 30K steps. Both configurations use the same optimization settings and the same native CUDA renderer for final evaluation. Their training gradients are not required to be bitwise identical: floating-point reduction order can change optimizer and densification decisions over a non-convex trajectory. These values therefore measure end-to-end training outcomes, not pixelwise renderer equivalence.
 
-**Deep Blending (2-scene average)**
+| Scene | CUDA PSNR | Warp PSNR | Delta PSNR | CUDA SSIM | Warp SSIM | CUDA LPIPS | Warp LPIPS |
+|-------|----------:|----------:|-----------:|----------:|----------:|-----------:|-----------:|
+| chair | 35.6934 | 35.7688 | +0.0754 | 0.987447 | 0.987523 | 0.011773 | 0.011646 |
+| drums | 26.1614 | 26.1687 | +0.0073 | 0.954811 | 0.954778 | 0.036494 | 0.036379 |
+| ficus | 34.8947 | 34.9049 | +0.0102 | 0.987307 | 0.987330 | 0.011735 | 0.011737 |
+| hotdog | 37.6701 | 37.7385 | +0.0684 | 0.985379 | 0.985416 | 0.019953 | 0.019955 |
+| lego | 35.9071 | 35.9231 | +0.0161 | 0.983264 | 0.983284 | 0.015307 | 0.015234 |
+| materials | 30.1175 | 30.1108 | -0.0066 | 0.961664 | 0.961612 | 0.032918 | 0.032874 |
+| mic | 35.8806 | 35.6974 | -0.1832 | 0.992079 | 0.991871 | 0.005762 | 0.005878 |
+| ship | 31.0945 | 31.0405 | -0.0540 | 0.907392 | 0.907365 | 0.105282 | 0.105641 |
+| train | 22.2565 | 21.9888 | -0.2677 | 0.821652 | 0.820027 | 0.195832 | 0.196647 |
+| truck | 25.5052 | 25.5192 | +0.0141 | 0.884745 | 0.884810 | 0.142212 | 0.142430 |
+| drjohnson | 29.3829 | 29.4829 | +0.1000 | 0.904947 | 0.905391 | 0.236216 | 0.235705 |
+| playroom | 30.1062 | 30.1593 | +0.0531 | 0.909675 | 0.908975 | 0.241131 | 0.240396 |
 
-| Metric | CUDA | Warp | Δ |
-|--------|------|------|---|
-| PSNR (dB) | 29.77 | 30.01 | +0.04 |
-| SSIM | 0.9062 | 0.9063 | +0.0001 |
-| LPIPS | 0.2390 | 0.2388 | −0.0002 |
+Warp has higher PSNR in 8 of 12 independently trained scenes. The largest negative delta is train at -0.2677 dB, and the largest positive delta is drjohnson at +0.1000 dB. The suite does not show a uniform quality direction. Scene-level deltas must be interpreted together with the frozen-checkpoint and module-level checks below.
 
-The historical campaign reported per-scene PSNR differences within ±0.25 dB and SSIM differences below 0.001. These archived values must not be treated as a current CUDA-equivalence claim.
+### Frozen-Checkpoint Equivalence
+
+To isolate the rasterizer from training dynamics, the same Warp-trained checkpoint was rendered through both the native CUDA extension and gswarp. The comparison uses identical camera, Gaussian, and background inputs for each view.
+
+| Scene | Test views | Image MAE | CUDA/Warp PSNR | Visibility Jaccard | Max abs. error |
+|-------|-----------:|----------:|---------------:|-------------------:|---------------:|
+| Lego | 200 | 1.79e-7 | 105.54 dB | 1.000000 | 0.00996 |
+| Truck | 32 | 4.64e-7 | 100.43 dB | 1.000000 | 0.01326 |
+| Train | 38 | 5.10e-7 | 100.33 dB | 0.99999992 | 0.00478 |
+
+Lego and Truck have identical visible-Gaussian sets. On Train, the Jaccard difference from 1.0 corresponds to two one-sided visibility decisions across approximately 25.6 million Gaussian-view observations; the native CUDA and Warp images also have the same 20.955083 dB global PSNR against ground truth to the shown precision. The CUDA/Warp PSNR column measures agreement between the two renderer outputs, not reconstruction quality against ground truth.
+
+These results support rasterizer equivalence within the measured FP32 tolerance and do not indicate systematic missed coverage. They do not imply that independently trained, non-convex trajectories must converge to identical checkpoints. For the phase timing, provenance rules, and interpretation limits, see [docs/rasterizer.md](docs/rasterizer.md); for controlled SSIM gradient and training-path evidence, see [docs/ssim.md](docs/ssim.md).
 
 ---
 
@@ -325,7 +342,7 @@ The historical campaign reported per-scene PSNR differences within ±0.25 dB and
 |----------|----------|
 | [docs/rasterizer.md](docs/rasterizer.md) | Architecture, CUDA implementation differences, micro-benchmarks, correctness, known limitations |
 | [docs/ssim.md](docs/ssim.md) | SSIM kernel optimizations, performance analysis, correctness |
-| [docs/knn.md](docs/knn.md) | KNN algorithm, Morton sorting, performance analysis |
+| [docs/knn.md](docs/knn.md) | KNN algorithm, Morton sorting, execution model, correctness |
 
 ---
 
