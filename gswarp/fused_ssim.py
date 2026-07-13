@@ -56,6 +56,11 @@ G08 = wp.constant(wp.float32(0.036000773310661316))
 G09 = wp.constant(wp.float32(0.0075987582094967365))
 G10 = wp.constant(wp.float32(0.001028380123898387))
 
+_SSIM_TILE_W = 32
+_SSIM_TILE_H = 8
+_SSIM_TILE_ROWS = _SSIM_TILE_H + 10
+_SSIM_TILE_THREADS = _SSIM_TILE_W * _SSIM_TILE_H
+
 
 @wp.func
 def _gw(i: wp.int32) -> wp.float32:
@@ -157,6 +162,14 @@ class _SSIMPlan:
         shared_buf = torch.empty(4 * N, dtype=torch.float32, device=device)
         w_h = [torch_launch_array(shared_buf[i * N:(i + 1) * N]) for i in range(4)]
         w_t = [torch_launch_array(shared_buf[i * N:(i + 1) * N]) for i in range(3)]
+        planes = B * CH
+        w_h_3d = [
+            torch_launch_array(
+                shared_buf[i * N:(i + 1) * N].view(planes, H, W)
+            )
+            for i in range(4)
+        ]
+        w_t_3d = w_h_3d[:3]
 
         # dm workspace (3 x N) - written by fwd_v, read by bwd_h
         dm_buf = torch.empty(3 * N, dtype=torch.float32, device=device)
@@ -198,12 +211,15 @@ class _SSIMPlan:
                         H, W, Hv, Wv, float(C1), float(C2)],
                 device=dev, record_cmd=True, block_dim=bd_fwd_v)
         else:
+            tiles_x = (W + _SSIM_TILE_W - 1) // _SSIM_TILE_W
+            tiles_y = (H + _SSIM_TILE_H - 1) // _SSIM_TILE_H
+            tiled_dim = planes * tiles_x * tiles_y * _SSIM_TILE_THREADS
             self._cmd_fwd_v = wp.launch(
-                kernel=_fwd_v_train, dim=N,
-                inputs=[w_h[0], w_h[1], w_h[2], w_h[3],
+                kernel=_fwd_v_train_tiled, dim=tiled_dim,
+                inputs=[w_h_3d[0], w_h_3d[1], w_h_3d[2], w_h_3d[3],
                         w_ssim, w_dm[0], w_dm[1], w_dm[2],
-                        H, W, float(C1), float(C2)],
-                device=dev, record_cmd=True, block_dim=bd_fwd_v)
+                        H, W, tiles_x, tiles_y, float(C1), float(C2)],
+                device=dev, record_cmd=True, block_dim=_SSIM_TILE_THREADS)
 
         # BWD_H: only upstream param changes
         if valid:
@@ -227,10 +243,17 @@ class _SSIMPlan:
             self._bwd_h_up_idx = 8
 
         # BWD_V: params [0]=img1, [1]=img2 change each call
-        self._cmd_bwd_v = wp.launch(
-            kernel=_bwd_v, dim=N,
-            inputs=[ph, ph, w_t[0], w_t[1], w_t[2], w_h[3], H, W],
-            device=dev, record_cmd=True, block_dim=bd_bwd_v)
+        if valid:
+            self._cmd_bwd_v = wp.launch(
+                kernel=_bwd_v, dim=N,
+                inputs=[ph, ph, w_t[0], w_t[1], w_t[2], w_h[3], H, W],
+                device=dev, record_cmd=True, block_dim=bd_bwd_v)
+        else:
+            self._cmd_bwd_v = wp.launch(
+                kernel=_bwd_v_tiled, dim=tiled_dim,
+                inputs=[ph, ph, w_t_3d[0], w_t_3d[1], w_t_3d[2],
+                        w_h[3], H, W, tiles_x, tiles_y],
+                device=dev, record_cmd=True, block_dim=_SSIM_TILE_THREADS)
 
         # Keep references to prevent GC of backing torch buffers
         # (Warp arrays hold raw CUDA pointers, not Python refs)
@@ -496,75 +519,123 @@ def _fwd_h(
 
 
 @wp.kernel
-def _fwd_v_train(
-    h0: wp.array(dtype=wp.float32),
-    h1: wp.array(dtype=wp.float32),
-    h2: wp.array(dtype=wp.float32),
-    h3: wp.array(dtype=wp.float32),
+def _fwd_v_train_tiled(
+    h0: wp.array3d(dtype=wp.float32),
+    h1: wp.array3d(dtype=wp.float32),
+    h2: wp.array3d(dtype=wp.float32),
+    h3: wp.array3d(dtype=wp.float32),
     ssim_out: wp.array(dtype=wp.float32),
     dm0: wp.array(dtype=wp.float32),
     dm1: wp.array(dtype=wp.float32),
     dm2: wp.array(dtype=wp.float32),
     H: wp.int32,
     W: wp.int32,
+    tiles_x: wp.int32,
+    tiles_y: wp.int32,
     C1: wp.float32,
     C2: wp.float32,
 ):
     tid = wp.tid()
-    y = (tid / W) % H
-    col = tid - y * W
+    block_id = tid // _SSIM_TILE_THREADS
+    lane = tid % _SSIM_TILE_THREADS
+    tile_x = block_id % tiles_x
+    tile_plane_y = block_id // tiles_x
+    tile_y = tile_plane_y % tiles_y
+    plane = tile_plane_y // tiles_y
 
-    a0 = wp.float32(0.0)
-    a1 = wp.float32(0.0)
-    a2 = wp.float32(0.0)
-    a3 = wp.float32(0.0)
+    start_x = tile_x * _SSIM_TILE_W
+    start_y = tile_y * _SSIM_TILE_H
 
-    # Gaussian symmetry: w[k] == w[10-k] for k=0..4
-    for k in range(5):
-        nt = y + k - 5
-        nb = y + 5 - k
-        g = _gw(k)
-        if nt >= 0 and nt < H:
-            it = col + nt * W
-            a0 = a0 + g * h0[it]
-            a1 = a1 + g * h1[it]
-            a2 = a2 + g * h2[it]
-            a3 = a3 + g * h3[it]
-        if nb >= 0 and nb < H:
-            ib = col + nb * W
-            a0 = a0 + g * h0[ib]
-            a1 = a1 + g * h1[ib]
-            a2 = a2 + g * h2[ib]
-            a3 = a3 + g * h3[ib]
+    load_y = start_y - 5
+    if load_y < 0:
+        load_y = 0
 
-    # Center row (k=5)
-    ic = col + y * W
-    a0 = a0 + G05 * h0[ic]
-    a1 = a1 + G05 * h1[ic]
-    a2 = a2 + G05 * h2[ic]
-    a3 = a3 + G05 * h3[ic]
+    # Warp rejects the bottom/right overhang, but tile offsets themselves must
+    # stay non-negative. Edge taps retain the scalar path's bounds checks.
+    s0 = wp.tile_load(
+        h0,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+    s1 = wp.tile_load(
+        h1,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+    s2 = wp.tile_load(
+        h2,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+    s3 = wp.tile_load(
+        h3,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
 
-    mu1 = a0
-    mu2 = a1
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1mu2 = mu1 * mu2
+    local_y = lane // _SSIM_TILE_W
+    local_x = lane % _SSIM_TILE_W
+    x = start_x + local_x
+    y = start_y + local_y
 
-    Av = mu1_sq + mu2_sq + C1
-    Bv = a2 - mu1_sq - mu2_sq + C2
-    Cv = wp.float32(2.0) * mu1mu2 + C1
-    Dv = wp.float32(2.0) * (a3 - mu1mu2) + C2
+    if x < W and y < H:
+        a0 = wp.float32(0.0)
+        a1 = wp.float32(0.0)
+        a2 = wp.float32(0.0)
+        a3 = wp.float32(0.0)
 
-    rA = wp.float32(1.0) / Av
-    rB = wp.float32(1.0) / Bv
-    rAB = rA * rB
+        for k in range(5):
+            top = y + k - 5
+            bottom = y + 5 - k
+            g = _gw(k)
 
-    m = Cv * Dv * rAB
-    ssim_out[tid] = m
+            if top >= 0 and top < H:
+                tile_row = top - load_y
+                a0 = a0 + g * s0[0, tile_row, local_x]
+                a1 = a1 + g * s1[0, tile_row, local_x]
+                a2 = a2 + g * s2[0, tile_row, local_x]
+                a3 = a3 + g * s3[0, tile_row, local_x]
 
-    dm0[tid] = wp.float32(2.0) * (mu2 * (Dv - Cv) * rAB + mu1 * m * (rB - rA))
-    dm1[tid] = -m * rB
-    dm2[tid] = wp.float32(2.0) * Cv * rAB
+            if bottom >= 0 and bottom < H:
+                tile_row = bottom - load_y
+                a0 = a0 + g * s0[0, tile_row, local_x]
+                a1 = a1 + g * s1[0, tile_row, local_x]
+                a2 = a2 + g * s2[0, tile_row, local_x]
+                a3 = a3 + g * s3[0, tile_row, local_x]
+
+        center = y - load_y
+        a0 = a0 + G05 * s0[0, center, local_x]
+        a1 = a1 + G05 * s1[0, center, local_x]
+        a2 = a2 + G05 * s2[0, center, local_x]
+        a3 = a3 + G05 * s3[0, center, local_x]
+
+        mu1 = a0
+        mu2 = a1
+        mu1_sq = mu1 * mu1
+        mu2_sq = mu2 * mu2
+        mu1mu2 = mu1 * mu2
+
+        Av = mu1_sq + mu2_sq + C1
+        Bv = a2 - mu1_sq - mu2_sq + C2
+        Cv = wp.float32(2.0) * mu1mu2 + C1
+        Dv = wp.float32(2.0) * (a3 - mu1mu2) + C2
+
+        rA = wp.float32(1.0) / Av
+        rB = wp.float32(1.0) / Bv
+        rAB = rA * rB
+
+        m = Cv * Dv * rAB
+        output_idx = plane * H * W + y * W + x
+        ssim_out[output_idx] = m
+        dm0[output_idx] = wp.float32(2.0) * (
+            mu2 * (Dv - Cv) * rAB + mu1 * m * (rB - rA)
+        )
+        dm1[output_idx] = -m * rB
+        dm2[output_idx] = wp.float32(2.0) * Cv * rAB
 
 
 @wp.kernel
@@ -908,6 +979,92 @@ def _bwd_v(
     a2 = a2 + G05 * t2[ic]
 
     dL_dimg1[tid] = a0 + wp.float32(2.0) * pix1 * a1 + pix2 * a2
+
+
+@wp.kernel
+def _bwd_v_tiled(
+    img1: wp.array(dtype=wp.float32),
+    img2: wp.array(dtype=wp.float32),
+    t0: wp.array3d(dtype=wp.float32),
+    t1: wp.array3d(dtype=wp.float32),
+    t2: wp.array3d(dtype=wp.float32),
+    dL_dimg1: wp.array(dtype=wp.float32),
+    H: wp.int32,
+    W: wp.int32,
+    tiles_x: wp.int32,
+    tiles_y: wp.int32,
+):
+    tid = wp.tid()
+    block_id = tid // _SSIM_TILE_THREADS
+    lane = tid % _SSIM_TILE_THREADS
+    tile_x = block_id % tiles_x
+    tile_plane_y = block_id // tiles_x
+    tile_y = tile_plane_y % tiles_y
+    plane = tile_plane_y // tiles_y
+
+    start_x = tile_x * _SSIM_TILE_W
+    start_y = tile_y * _SSIM_TILE_H
+    load_y = start_y - 5
+    if load_y < 0:
+        load_y = 0
+
+    s0 = wp.tile_load(
+        t0,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+    s1 = wp.tile_load(
+        t1,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+    s2 = wp.tile_load(
+        t2,
+        shape=(1, _SSIM_TILE_ROWS, _SSIM_TILE_W),
+        offset=(plane, load_y, start_x),
+        storage="shared",
+    )
+
+    local_y = lane // _SSIM_TILE_W
+    local_x = lane % _SSIM_TILE_W
+    x = start_x + local_x
+    y = start_y + local_y
+
+    if x < W and y < H:
+        a0 = wp.float32(0.0)
+        a1 = wp.float32(0.0)
+        a2 = wp.float32(0.0)
+
+        for k in range(5):
+            top = y + k - 5
+            bottom = y + 5 - k
+            g = _gw(k)
+
+            if top >= 0 and top < H:
+                tile_row = top - load_y
+                a0 = a0 + g * s0[0, tile_row, local_x]
+                a1 = a1 + g * s1[0, tile_row, local_x]
+                a2 = a2 + g * s2[0, tile_row, local_x]
+
+            if bottom >= 0 and bottom < H:
+                tile_row = bottom - load_y
+                a0 = a0 + g * s0[0, tile_row, local_x]
+                a1 = a1 + g * s1[0, tile_row, local_x]
+                a2 = a2 + g * s2[0, tile_row, local_x]
+
+        center = y - load_y
+        a0 = a0 + G05 * s0[0, center, local_x]
+        a1 = a1 + G05 * s1[0, center, local_x]
+        a2 = a2 + G05 * s2[0, center, local_x]
+
+        output_idx = plane * H * W + y * W + x
+        pix1 = img1[output_idx]
+        pix2 = img2[output_idx]
+        dL_dimg1[output_idx] = (
+            a0 + wp.float32(2.0) * pix1 * a1 + pix2 * a2
+        )
 
 
 # ---------------------------------------------------------------------------
