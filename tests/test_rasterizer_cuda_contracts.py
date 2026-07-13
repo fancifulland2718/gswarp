@@ -19,9 +19,11 @@ from gswarp.rasterizer import (
     GaussianRasterizer as StandardRasterizer,
     GaussianRasterizationSettings as StandardSettings,
     clear_warp_caches as clear_standard_caches,
+    get_compute_depth,
     get_warp_cache_report as get_standard_cache_report,
     get_tile_coverage_mode,
     rasterize_gaussians as rasterize_standard,
+    set_compute_depth,
     set_tile_coverage_mode,
 )
 from gswarp.rasterizer_flow import (
@@ -123,6 +125,53 @@ def _inputs(means3d: torch.Tensor, *, scales: torch.Tensor | None = None, covari
 
 @unittest.skipUnless(CUDA_AVAILABLE, "CUDA is required for Warp rasterizer tests")
 class RasterizerCUDAContractTests(unittest.TestCase):
+    def test_depth_disable_preserves_color_and_returns_zero_depth(self) -> None:
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device=DEVICE
+        )
+        inputs = _inputs(
+            torch.tensor(
+                [[-0.2, 0.1, 2.0], [0.25, -0.15, 2.5]],
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+        )
+        settings = _settings(background, image_size=64)
+        original = get_compute_depth()
+        try:
+            set_compute_depth(True)
+            with_depth = rasterize_standard(
+                **inputs, raster_settings=settings
+            )
+            flow_with_depth = rasterize_flow(
+                **inputs, raster_settings=_settings(background, image_size=64, flow=True)
+            )
+            set_compute_depth(False)
+            without_depth = rasterize_standard(
+                **inputs, raster_settings=settings
+            )
+            flow_without_depth = rasterize_flow(
+                **inputs, raster_settings=_settings(background, image_size=64, flow=True)
+            )
+            torch.cuda.synchronize(DEVICE)
+        finally:
+            set_compute_depth(original)
+
+        torch.testing.assert_close(without_depth[0], with_depth[0])
+        torch.testing.assert_close(without_depth[1], with_depth[1])
+        torch.testing.assert_close(without_depth[2].alpha, with_depth[2].alpha)
+        torch.testing.assert_close(
+            without_depth[2].depth,
+            torch.zeros_like(without_depth[2].depth),
+        )
+        torch.testing.assert_close(flow_without_depth[0], flow_with_depth[0])
+        torch.testing.assert_close(flow_without_depth[1], flow_with_depth[1])
+        torch.testing.assert_close(flow_without_depth[3], flow_with_depth[3])
+        torch.testing.assert_close(
+            flow_without_depth[2],
+            torch.zeros_like(flow_without_depth[2]),
+        )
+
     def test_accutile_count_and_emit_match_at_numeric_boundaries(self) -> None:
         below_16 = torch.nextafter(
             torch.tensor(16.0, dtype=torch.float32),

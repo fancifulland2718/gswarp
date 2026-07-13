@@ -106,11 +106,24 @@ if wp is not None:
 
             my_xy = points_xy_image[my_id]
             my_co = conic_opacity[my_id]
+            my_feature = wp.vec3(0.0, 0.0, 0.0)
+            my_depth = float(0.0)
+            if progress < n_gs:
+                feat_base = my_id * NUM_CHANNELS
+                my_feature = wp.vec3(
+                    features_flat[feat_base + 0],
+                    features_flat[feat_base + 1],
+                    features_flat[feat_base + 2],
+                )
+                if compute_depth != 0:
+                    my_depth = depths[my_id]
 
-            # 2A: vec2/vec4 tiles 鈥?fewer tile_extract calls (3 vs 7)
+            # Broadcast each Gaussian payload once to all pixels in the tile.
             t_id = wp.tile(my_id)
             t_xy = wp.tile(my_xy, preserve_type=True)
             t_co = wp.tile(my_co, preserve_type=True)
+            t_feature = wp.tile(my_feature, preserve_type=True)
+            t_depth = wp.tile(my_depth)
 
             # ---- Inner loop: all 256 pixels process the batch ----
             batch_count = wp.min(256, n_gs - i * 256)
@@ -135,13 +148,14 @@ if wp is not None:
                                 done = 1
                             else:
                                 contribution = alpha * T
-                                feat_base = coll_id * NUM_CHANNELS
-                                color0 = color0 + features_flat[feat_base + 0] * contribution
-                                color1 = color1 + features_flat[feat_base + 1] * contribution
-                                color2 = color2 + features_flat[feat_base + 2] * contribution
+                                feature_j = wp.tile_extract(t_feature, j)
+                                color0 = color0 + feature_j[0] * contribution
+                                color1 = color1 + feature_j[1] * contribution
+                                color2 = color2 + feature_j[2] * contribution
                                 weight = weight + contribution
                                 if compute_depth != 0:
-                                    depth_acc = depth_acc + depths[coll_id] * contribution
+                                    depth_j = wp.tile_extract(t_depth, j)
+                                    depth_acc = depth_acc + depth_j * contribution
                                 # Flow aux: record up to top_k successful contributors.
                                 if write_aux != 0 and n_success < top_k:
                                     aux_idx = n_success * total_pixels + pixel_id
