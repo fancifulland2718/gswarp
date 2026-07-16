@@ -60,6 +60,7 @@ class PreprocessOutputs:
     conic_opacity: torch.Tensor
     cov3d_all: torch.Tensor
     backward_interop: PreprocessBackwardInterop | None = None
+    cov2d_filter_variance: float = 0.0
 
 
 @dataclass(slots=True)

@@ -332,6 +332,7 @@ def _backward_cov2d_warp(
     grad_conic,
     grad_conic_2d,
     grad_conic_2d_inv,
+    cov2d_filter_variance=0.0,
 ):
     grad_means = torch.zeros(means3D.shape, dtype=means3D.dtype, device=means3D.device)
     grad_cov = torch.zeros(cov3D.shape, dtype=cov3D.dtype, device=cov3D.device)
@@ -351,6 +352,7 @@ def _backward_cov2d_warp(
         float(tanfovy),
         float(focal_x),
         float(focal_y),
+        float(cov2d_filter_variance),
         torch_launch_array(grad_conic.contiguous().reshape(-1), dtype=wp.float32),
         torch_launch_array(grad_conic_2d.contiguous().reshape(-1), dtype=wp.float32),
         torch_launch_array(grad_conic_2d_inv.contiguous().reshape(-1), dtype=wp.float32),
@@ -477,6 +479,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                 n_contrib = _imgBuffer.view(torch.int32).reshape(image_height, image_width)
             else:
                 n_contrib = None
+        cov2d_filter_variance = float(getattr(preprocess_outputs, "cov2d_filter_variance", 0.0))
 
         # Unified: preprocess_gaussians already stores the correct rgb
         # (colors_precomp when provided, SH-evaluated colors otherwise).
@@ -646,6 +649,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                     float(_tan_fovy),
                     float(focal_x),
                     float(focal_y),
+                    float(cov2d_filter_variance),
                     _dynamic_array(render_grad_conic_opacity, dtype=wp.vec4),
                     _dynamic_array(_grad_conic_2d_flat, dtype=wp.float32),
                     _dynamic_array(_grad_conic_2d_inv_flat, dtype=wp.float32),
@@ -694,6 +698,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                     render_grad_conic_opacity[:, :3],
                     grad_conic_2d_active,
                     grad_conic_2d_inv_active,
+                    cov2d_filter_variance,
                 )
 
                 # C3: Fused accumulation 鈥?replaces 2 torch.zeros + 3 torch.add + 1 slice-assign

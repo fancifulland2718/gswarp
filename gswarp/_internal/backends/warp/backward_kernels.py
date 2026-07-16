@@ -65,6 +65,7 @@ if wp is not None:
         tanfovy: wp.float32,
         focal_x: wp.float32,
         focal_y: wp.float32,
+        cov2d_filter_variance: wp.float32,
         grad_conic_opacity: wp.array(dtype=wp.vec4),
         grad_conic_2d_flat: wp.array(dtype=wp.float32),
         grad_conic_2d_inv_flat: wp.array(dtype=wp.float32),
@@ -172,9 +173,9 @@ if wp is not None:
             vt1y = v01 * t01 + v11 * t11 + v12 * t21
             vt1z = v02 * t01 + v12 * t11 + v22 * t21
 
-            aa = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3
+            aa = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3 + cov2d_filter_variance
             bb = t00 * vt1x + t10 * vt1y + t20 * vt1z
-            cc = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3
+            cc = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3 + cov2d_filter_variance
             denom = aa * cc - bb * bb
             denom2inv = _conic_denom2inv_wp(denom)
 
@@ -715,6 +716,7 @@ if wp is not None:
         tanfovy: wp.float32,
         focal_x: wp.float32,
         focal_y: wp.float32,
+        cov2d_filter_variance: wp.float32,
         grad_conic_flat: wp.array(dtype=wp.float32),
         grad_conic_2d_flat: wp.array(dtype=wp.float32),
         grad_conic_2d_inv_flat: wp.array(dtype=wp.float32),
@@ -783,9 +785,9 @@ if wp is not None:
         vt1y = v01 * t01 + v11 * t11 + v12 * t21
         vt1z = v02 * t01 + v12 * t11 + v22 * t21
 
-        a = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3
+        a = t00 * vt0x + t10 * vt0y + t20 * vt0z + 0.3 + cov2d_filter_variance
         b = t00 * vt1x + t10 * vt1y + t20 * vt1z
-        c = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3
+        c = t01 * vt1x + t11 * vt1y + t21 * vt1z + 0.3 + cov2d_filter_variance
         denom = a * c - b * b
         denom2inv = _conic_denom2inv_wp(denom)
 

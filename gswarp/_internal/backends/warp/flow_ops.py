@@ -416,6 +416,7 @@ def _rasterize_gaussians_backward_python(*args: Any, forward_state=None):
                     float(_tan_fovy),
                     float(focal_x),
                     float(focal_y),
+                    float(0.0),
                     wp.from_torch(render_grad_conic_opacity, dtype=wp.vec4),
                     wp.from_torch(_grad_conic_2d_flat, dtype=wp.float32),
                     wp.from_torch(_grad_conic_2d_inv_flat, dtype=wp.float32),
