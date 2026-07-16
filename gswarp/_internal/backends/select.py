@@ -11,6 +11,7 @@ from typing import Any
 
 from gswarp._internal.api.outputs import pack_flow_outputs, pack_standard_outputs
 from gswarp._internal.methods.registry import get_method
+from gswarp._internal.methods.contracts import resolve_input_adapter
 from gswarp._internal.methods.spec import MethodPlan, MethodSpec, MethodStages
 
 
@@ -136,6 +137,7 @@ def build_method_plan(
     return MethodPlan(
         spec=spec,
         backend=backend,
+        input_adapter=resolve_input_adapter(spec.pre_adapter),
         stages=MethodStages(**defaults),
         output_adapter=_flow_output_adapter if profile["flow"] else _standard_output_adapter,
         state_schema=getattr(backend, "ForwardState"),

@@ -2,48 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
-import torch
-
 from gswarp._internal.backends.warp.state import ForwardResult, RenderStageResult
-
-
-@dataclass(frozen=True, slots=True)
-class RasterPipelineInputs:
-    """Normalized CUDA-GS-compatible arguments for one typed forward call."""
-
-    background: torch.Tensor
-    means3d: torch.Tensor
-    colors: torch.Tensor
-    opacities: torch.Tensor
-    scales: torch.Tensor
-    rotations: torch.Tensor
-    scale_modifier: float
-    cov3d_precomp: torch.Tensor
-    viewmatrix: torch.Tensor
-    projmatrix: torch.Tensor
-    tan_fovx: float
-    tan_fovy: float
-    image_height: int
-    image_width: int
-    sh: torch.Tensor
-    degree: int
-    campos: torch.Tensor
-    prefiltered: bool
-
-    @classmethod
-    def from_compatibility_args(cls, args: tuple[Any, ...]) -> "RasterPipelineInputs":
-        if len(args) != 18:
-            raise TypeError(f"rasterizer forward expects 18 arguments, received {len(args)}")
-        return cls(*args)
+from gswarp._internal.methods.contracts import RasterPipelineInputs
 
 
 def execute_typed_forward(plan, args: tuple[Any, ...]) -> ForwardResult:
     """Execute one method plan without bypassing its replaceable stages."""
 
-    inputs = RasterPipelineInputs.from_compatibility_args(args)
+    inputs = plan.input_adapter(args)
     if inputs.means3d.ndim != 2 or inputs.means3d.shape[1] != 3:
         raise ValueError("means3D must have dimensions (num_points, 3)")
     if inputs.means3d.shape[0] == 0:

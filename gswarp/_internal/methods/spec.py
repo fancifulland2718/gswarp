@@ -45,6 +45,7 @@ class MethodPlan:
     backend: Any
     stages: MethodStages
     output_adapter: Callable[..., Any]
+    input_adapter: Callable[[tuple[Any, ...]], Any]
     state_schema: type[Any]
     capabilities: frozenset[str]
     flow: bool
