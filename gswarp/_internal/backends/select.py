@@ -20,6 +20,7 @@ _STABLE_BACKENDS = {
     "warp_3dgs_flow": "gswarp._internal.backends.warp.backend_3dgs_flow",
     "warp_generated_3dgs": "gswarp._internal.backends.warp.backend_generated_3dgs",
     "warp_mip_3dgs": "gswarp._internal.backends.warp.backend_mip_3dgs",
+    "warp_2dgs": "gswarp._internal.backends.warp.backend_2dgs",
 }
 
 _STAGE_PROFILES = {
@@ -75,6 +76,21 @@ _STAGE_PROFILES = {
         "filtering": "mip",
         "appearance": "sh_or_rgb",
         "pre_adapter": "mip_3dgs",
+        "flow": False,
+        "empty_forward_name": "empty_forward_stage",
+        "preprocess_name": "preprocess_stage",
+        "features_name": "feature_stage",
+        "render_name": "render_stage",
+        "build_state_name": "build_state_stage",
+        "backward_name": "rasterize_gaussians_backward_typed",
+    },
+    "warp_2dgs": {
+        "output_mode": "twodgs",
+        "primitive": "gaussian_2d",
+        "projection": "ray_splat",
+        "filtering": "none",
+        "appearance": "sh_or_rgb",
+        "pre_adapter": "twodgs",
         "flow": False,
         "empty_forward_name": "empty_forward_stage",
         "preprocess_name": "preprocess_stage",
